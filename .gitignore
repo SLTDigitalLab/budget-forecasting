@@ -1,0 +1,40 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/build/
+npm-debug.log*
+
+# IDE / local tools
+.cursor/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local / temporary files
+*.log
+project_structure.txt
+~$*.xlsx
+
+# Dataset files that should not be committed
+backend/model_training_engine/dataset/original_actual_data.xlsx
+
+# Runtime uploaded datasets
+backend/data/dataset_files/*
+!backend/data/dataset_files/.gitkeep

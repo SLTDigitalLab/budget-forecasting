@@ -1,0 +1,23 @@
+{
+  "name": "ai-budget-forecasting-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test src/utils/forecastPeriod.test.js src/utils/analyticsForecast.test.js src/utils/analyticsPage.test.js src/utils/forecastComparison.test.js src/utils/budgetTrend.test.js src/utils/forecastDistribution.test.js src/utils/forecastSummary.test.js src/utils/forecastReport.test.js src/utils/budgetCodeForecast.test.js src/utils/forecastCategory.test.js src/utils/forecastCoverage.test.js src/utils/forecastHistoryBaseline.test.js src/utils/chartTooltipPlacement.test.js src/utils/microsoftAuth.test.js src/utils/historicalDataManagement.test.js src/utils/sidebarProfile.test.js src/utils/overviewHistorical.test.js src/utils/overviewLayout.test.js src/utils/overviewDashboard.test.js src/utils/overflowLayout.test.js src/utils/chartLayout.test.js src/utils/authRouting.test.js src/utils/retrainWorkflow.test.js src/utils/settingsActionAuth.test.js"
+  },
+  "dependencies": {
+    "lucide-react": "^0.503.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.5.1",
+    "recharts": "^2.15.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11"
+  }
+}
