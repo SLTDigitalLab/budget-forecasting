@@ -11,7 +11,6 @@ from app.config import (
     ALL_ACCOUNT_SCHEMA_VERSION,
     ALLOWED_FORECAST_TYPES,
     CANDIDATE_ARTIFACT_PATH,
-    DEPLOYED_IS_ARTIFACT_PATH,
     EXPECTED_ACCOUNT_COUNT,
     EXPECTED_FORECAST_TYPE,
     FORECAST_ARTIFACT_PATH,
@@ -70,11 +69,6 @@ def resolve_forecast_artifact_path() -> Path:
 def resolve_all_budget_artifact_path() -> Path:
     """Return the all-budget artifact path (same as the active production path)."""
     return CANDIDATE_ARTIFACT_PATH.resolve()
-
-
-def resolve_deployed_is_artifact_path() -> Path:
-    """Return the previous International Settlement pickle. Do not overwrite it."""
-    return DEPLOYED_IS_ARTIFACT_PATH.resolve()
 
 
 def reset_model_cache() -> None:

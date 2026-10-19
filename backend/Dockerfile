@@ -37,8 +37,6 @@ COPY model_training_engine /app/model_training_engine
 
 RUN test -f /app/model_training_engine/output/all_budget_code_models.pkl \
     || (echo "ERROR: all_budget_code_models.pkl is missing from the backend image." && exit 1)
-RUN test -f /app/model_training_engine/output/international_settlement_top12_models.pkl \
-    || (echo "ERROR: international_settlement_top12_models.pkl is missing from the backend image." && exit 1)
 
 # Bounded Prophet smoke at build time (synthetic; no production artifacts).
 RUN python - <<'PY'

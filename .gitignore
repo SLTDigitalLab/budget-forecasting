@@ -57,3 +57,5 @@ docker-compose.qa.yml
 
 # Retraining candidate models
 backend/model_training_engine/output/retrain_candidates/
+# Retired legacy International Settlement model
+backend/model_training_engine/output/international_settlement_top12_models.pkl
