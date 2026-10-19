@@ -102,11 +102,11 @@ TRAINING_README_NAME = "README.md"
 ENGINE_README_PATH = ENGINE_DIR / TRAINING_README_NAME
 ARTIFACT_SCHEMA_VERSION = "all_account_per_budget_code_v1"
 RUNTIME_DEPENDENCIES_MARKDOWN = """\
-`all_budget_code_models.pkl` is the live Generate Forecast production artifact.
-It uses the same runtime bundle schema as the protected legacy file
-`international_settlement_top12_models.pkl`. Loaders and forecast services read
-pickle fields directly. This README is an evaluation report only and is not a
-runtime data source. Retraining must not overwrite the protected IS top-12 file.
+`all_budget_code_models.pkl` is the sole production forecasting artifact for every
+category, including International Settlement. Loaders and forecast services read
+its pickle fields directly. This README is an evaluation report only and is not a
+runtime data source. Retraining and Save Models must not overwrite the retired
+legacy filename `international_settlement_top12_models.pkl`.
 """
 PER_BUDGET_CODE_FORECAST_TYPE = "PER_BUDGET_CODE_BEST_MODELS"
 PER_BUDGET_CODE_ALGORITHM = "PER_BUDGET_CODE"
@@ -520,10 +520,10 @@ def write_training_readme(readme_path: Path, payload: dict) -> Path:
         "",
         "## Pickle contract",
         "",
-        f"`{CANDIDATE_ARTIFACT_NAME}` is a runtime forecast bundle with the same load/predict",
-        "schema as `international_settlement_top12_models.pkl`, covering every eligible budget code.",
-        "It is a metadata dictionary (not a bare `{code: model}` map) and includes model records,",
-        "account identities, production statuses, conformal quantiles, coverage, and monthly/annual tables.",
+        f"`{CANDIDATE_ARTIFACT_NAME}` is the sole production forecasting artifact for every",
+        "category, including International Settlement. It is a metadata dictionary (not a bare",
+        "`{code: model}` map) and includes model records, account identities, production statuses,",
+        "conformal quantiles, coverage, and monthly/annual tables.",
         "",
         "ZERO_POLICY, unresolved, invalid, insufficient-history, and FIT_FAILED accounts are stored",
         "as explicit records. Each fitted account keeps its own local winning algorithm.",

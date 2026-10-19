@@ -4,10 +4,10 @@ This file is documentation only. The backend must not load it as a runtime data 
 
 ## Pickle contract
 
-`all_budget_code_models.pkl` is a runtime forecast bundle with the same load/predict
-schema as `international_settlement_top12_models.pkl`, covering every eligible budget code.
-It is a metadata dictionary (not a bare `{code: model}` map) and includes model records,
-account identities, production statuses, conformal quantiles, coverage, and monthly/annual tables.
+`all_budget_code_models.pkl` is the sole production forecasting artifact for every
+category, including International Settlement. It is a metadata dictionary (not a bare
+`{code: model}` map) and includes model records, account identities, production statuses,
+conformal quantiles, coverage, and monthly/annual tables.
 
 ZERO_POLICY, unresolved, invalid, insufficient-history, and FIT_FAILED accounts are stored
 as explicit records. Each fitted account keeps its own local winning algorithm.
@@ -15,13 +15,12 @@ Do not copy stale top-12 account lists or `feature_selection_results`.
 
 ## Runtime dependencies that cannot live in this pickle
 
-`all_budget_code_models.pkl` uses the same runtime bundle schema as
-`international_settlement_top12_models.pkl`. Loaders and forecast services read
-those pickle fields directly. This README is an evaluation report only and is
-not a runtime data source.
+Loaders and forecast services read `all_budget_code_models.pkl` fields directly.
+This README is an evaluation report only and is not a runtime data source.
 
-The live Generate Forecast path loads `all_budget_code_models.pkl`.
-`international_settlement_top12_models.pkl` is a protected legacy artifact and is not overwritten by all-account retraining.
+The live Generate Forecast path loads only `all_budget_code_models.pkl`.
+The retired legacy filename `international_settlement_top12_models.pkl` is not used at
+runtime; retrain and Save Models must not overwrite that name.
 
 
 ## Latest training run

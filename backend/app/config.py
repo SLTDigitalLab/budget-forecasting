@@ -8,10 +8,8 @@ FORECAST_ARTIFACT_NAME = "all_budget_code_models.pkl"
 FORECAST_ARTIFACT_PATH = (
     BACKEND_DIR / "model_training_engine" / "output" / FORECAST_ARTIFACT_NAME
 )
+# Legacy filename kept only so retrain/Save Models refuse to overwrite it.
 DEPLOYED_IS_ARTIFACT_NAME = "international_settlement_top12_models.pkl"
-DEPLOYED_IS_ARTIFACT_PATH = (
-    BACKEND_DIR / "model_training_engine" / "output" / DEPLOYED_IS_ARTIFACT_NAME
-)
 ORIGINAL_ACTUALS_PATH = Path(
     os.getenv(
         "ORIGINAL_ACTUALS_PATH",

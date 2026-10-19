@@ -40,3 +40,22 @@ backend/data/dataset_files/*
 
 # Isolated local QA snapshot: database dump, datasets, and model copies
 qa-data/
+
+# Backend and model training tests
+backend/app/tests/
+backend/model_training_engine/tests/
+
+# Frontend tests
+frontend/src/**/*.test.js
+frontend/src/**/*.test.jsx
+frontend/src/**/*.spec.js
+frontend/src/**/*.spec.jsx
+
+# QA files and reports
+qa_reports/
+docker-compose.qa.yml
+
+# Retraining candidate models
+backend/model_training_engine/output/retrain_candidates/
+# Retired legacy International Settlement model
+backend/model_training_engine/output/international_settlement_top12_models.pkl
