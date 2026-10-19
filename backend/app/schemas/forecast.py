@@ -8,6 +8,7 @@ class MonthlyForecastRequest(BaseModel):
     start_month: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
     end_month: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
     forecast_months: Optional[int] = Field(default=None, ge=1, le=60)
+    period_type: Optional[str] = Field(default=None)
     account_codes: Optional[list[str]] = None
     category: Optional[str] = None
 
@@ -22,6 +23,12 @@ class MonthlyForecastRequest(BaseModel):
                 raise ValueError("start_month and end_month must be provided together.")
         elif self.forecast_months is None:
             raise ValueError("Provide start_month and end_month, or forecast_months.")
+        if self.period_type is not None:
+            allowed = {"specific_month", "remaining_year", "financial_years"}
+            if self.period_type not in allowed:
+                raise ValueError(
+                    "period_type must be one of: specific_month, remaining_year, financial_years."
+                )
         return self
 
 
@@ -98,14 +105,17 @@ class MonthlyForecastResponse(BaseModel):
     historical_actuals: list[HistoricalActualItem]
     historical_monthly_average: Optional[float] = None
     historical_month_count: int = 0
-    overall_total: float
-    monthly_average: float
-    minimum_monthly_forecast: float
-    maximum_monthly_forecast: float
+    overall_total: Optional[float] = None
+    monthly_average: Optional[float] = None
+    minimum_monthly_forecast: Optional[float] = None
+    maximum_monthly_forecast: Optional[float] = None
     generated_at: datetime
     interval_method: Optional[str] = None
     interval_coverage: Optional[float] = None
     forecast_coverage: Optional[dict] = None
+    coverage: Optional[dict] = None
+    unavailable_accounts: Optional[list[dict]] = None
+    coverage_only: bool = False
 
 
 class AccountListItem(BaseModel):
@@ -127,6 +137,10 @@ class AccountListResponse(BaseModel):
     accounts: list[AccountListItem]
     categories: list[ForecastCategoryItem] = Field(default_factory=list)
     missing_category_codes: list[dict] = Field(default_factory=list)
+    history_end: Optional[str] = None
+    min_forecast_month: Optional[str] = None
+    max_forecast_end: Optional[str] = None
+    forecast_bounds_error: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -134,11 +148,14 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     forecast_type: Optional[str] = None
     history_end: Optional[str] = None
-    max_forecast_end: Optional[str] = "2030-12"
+    min_forecast_month: Optional[str] = None
+    max_forecast_end: Optional[str] = None
+    forecast_bounds_error: Optional[str] = None
     category: Optional[str] = None
     overall_best_algorithm: Optional[str] = None
     selected_account_count: Optional[int] = None
     categories: Optional[list[str]] = None
+    historical_actual_policy: Optional[dict] = None
 
 
 class ForecastRecordSummary(BaseModel):
@@ -151,10 +168,10 @@ class ForecastRecordSummary(BaseModel):
     forecast_month_count: int
     selected_account_count: int
     amount_unit: str
-    overall_total: float
-    monthly_average: float
-    minimum_monthly_forecast: float
-    maximum_monthly_forecast: float
+    overall_total: Optional[float] = None
+    monthly_average: Optional[float] = None
+    minimum_monthly_forecast: Optional[float] = None
+    maximum_monthly_forecast: Optional[float] = None
 
 
 class ForecastHistoryListResponse(BaseModel):

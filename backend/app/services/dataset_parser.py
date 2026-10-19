@@ -17,6 +17,11 @@ ENGINE_DIR = BACKEND_DIR / "model_training_engine"
 if str(ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(ENGINE_DIR))
 
+from app.services.submission_state import (  # noqa: E402
+    SUPPLIED_CELL_MESSAGE,
+    classify_supplied_upload_cell,
+    classify_upload_cell,
+)
 from preprocessing import (  # noqa: E402
     KIND_INVALID,
     KIND_MISSING,
@@ -117,6 +122,84 @@ def _is_blank(value: Any) -> bool:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return True
     return str(value).strip() == ""
+
+
+def _is_formula(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("=")
+
+
+def _cached_financial_value(value: Any) -> Any:
+    """Return a formula cache the upload validator can classify.
+
+    A finite number, including zero and negatives, and '-' are kept exactly.
+    An empty or whitespace-only result is kept as a blank for strict validation.
+    Excel errors (#N/A, #VALUE!, …) and a missing cache are omitted so they
+    cannot replace a stored actual or be mistaken for an unresolved blank cell.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number != number or number in {float("inf"), float("-inf")}:
+            return None
+        return number
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return ""
+        if text == "-":
+            return "-"
+        if text.startswith("#"):
+            return None
+    return None
+
+
+def _resolve_month_formulas(
+    path: Path,
+    sheet_name: str,
+    header_row_idx: int,
+    month_columns: list[str],
+) -> tuple[dict[tuple[int, str], Any], set[tuple[int, str]]]:
+    """Read calculated values stored beside monthly formulas.
+
+    A finite number, including zero and negatives, and a standalone '-' are kept
+    exactly. An empty formula result is kept as a blank. Excel errors and a
+    formula with no usable cache are omitted so they cannot replace a stored
+    actual.
+    """
+    resolved: dict[tuple[int, str], Any] = {}
+    omitted: set[tuple[int, str]] = set()
+    if not month_columns:
+        return resolved, omitted
+    formula_book = load_workbook(path, read_only=True, data_only=False)
+    value_book = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in formula_book.sheetnames or sheet_name not in value_book.sheetnames:
+            return resolved, omitted
+        formula_rows = formula_book[sheet_name].iter_rows(min_row=header_row_idx + 1)
+        value_rows = value_book[sheet_name].iter_rows(min_row=header_row_idx + 1)
+        header = [normalize_label(cell.value) for cell in next(formula_rows)]
+        next(value_rows)
+        col_index = {label: idx for idx, label in enumerate(header) if label}
+        targets = [column for column in month_columns if column in col_index]
+        for excel_row, (formula_row, value_row) in enumerate(
+            zip(formula_rows, value_rows),
+            start=header_row_idx + 2,
+        ):
+            for column in targets:
+                idx = col_index[column]
+                if idx >= len(formula_row) or not _is_formula(formula_row[idx].value):
+                    continue
+                cached = value_row[idx].value if idx < len(value_row) else None
+                usable = _cached_financial_value(cached)
+                if usable is None:
+                    omitted.add((excel_row, column))
+                else:
+                    resolved[(excel_row, column)] = usable
+    finally:
+        formula_book.close()
+        value_book.close()
+    return resolved, omitted
 
 
 def _workbook_formula_errors(path: Path, sheet_name: str, header_row_idx: int, columns: list[str]) -> list[dict]:
@@ -236,7 +319,13 @@ def _read_tabular(path: Path, filename: str, sheet_name: str | None) -> dict[str
     }
 
 
-def parse_historical_dataset(path: Path, filename: str, sheet_name: str | None = None) -> dict[str, Any]:
+def parse_historical_dataset(
+    path: Path,
+    filename: str,
+    sheet_name: str | None = None,
+    *,
+    strict_supplied_cells: bool = True,
+) -> dict[str, Any]:
     loaded = _read_tabular(path, filename, sheet_name)
     if loaded.get("needs_sheet_selection"):
         return {
@@ -310,7 +399,7 @@ def parse_historical_dataset(path: Path, filename: str, sheet_name: str | None =
             }
         )
     if loaded["kind"] == "xlsx":
-        inspect_columns = [column for column in [code_col, name_col, category_col, *month_columns] if column]
+        inspect_columns = [column for column in [code_col, name_col] if column]
         errors.extend(_workbook_formula_errors(path, sheet, header_row_idx, inspect_columns))
 
     if errors and (not code_col or not name_col or not month_columns):
@@ -326,6 +415,12 @@ def parse_historical_dataset(path: Path, filename: str, sheet_name: str | None =
             "selected_sheet": sheet,
             "filename": filename,
         }
+
+    formula_values: dict[tuple[int, str], Any] = {}
+    omitted_formulas: set[tuple[int, str]] = set()
+    if loaded["kind"] == "xlsx":
+        formula_values, omitted_formulas = _resolve_month_formulas(path, sheet, header_row_idx, month_columns)
+    omitted_formula_cells = 0
 
     working = df.copy()
     working[code_col] = working[code_col].map(clean_account_code)
@@ -350,29 +445,51 @@ def parse_historical_dataset(path: Path, filename: str, sheet_name: str | None =
             continue
         code = record.get(code_col)
         description = str(record.get(name_col) or "").strip()
+        if _is_blank(code) and not description:
+            continue
         category = str(record.get("category") or "").strip()
         amounts: dict[str, Any] = {}
         raw_amounts: dict[str, Any] = {}
         missing_months: list[str] = []
+        declared_months: list[str] = []
         invalid_months: list[str] = []
         invalid_amounts = []
         all_amounts_blank = True
+        classifier = classify_supplied_upload_cell if strict_supplied_cells else classify_upload_cell
         for column, timestamp in zip(month_columns, month_dates):
             raw_value = record.get(column)
             month = iso_month(timestamp)
+            formula_key = (excel_row, column)
+            if formula_key in omitted_formulas or (_is_formula(raw_value) and formula_key not in formula_values):
+                omitted_formula_cells += 1
+                continue
+            if formula_key in formula_values:
+                raw_value = formula_values[formula_key]
             raw_amounts[month] = None if _is_blank(raw_value) else raw_value
-            parsed_cell = parse_amount_cell(raw_value)
-            if parsed_cell["kind"] == KIND_MISSING:
+            parsed_cell = classifier(raw_value)
+            if parsed_cell["kind"] == "declared_missing":
                 amounts[month] = None
-                missing_months.append(month)
+                declared_months.append(month)
+                all_amounts_blank = False
+                continue
+            if parsed_cell["kind"] == "blank":
+                amounts[month] = None
+                if strict_supplied_cells:
+                    # Strict uploads: blanks are unresolved (invalid), not declared-missing.
+                    invalid_months.append(month)
+                    invalid_amounts.append(
+                        (excel_row, column, month, raw_value, parsed_cell.get("message") or SUPPLIED_CELL_MESSAGE)
+                    )
+                else:
+                    missing_months.append(month)
+                continue
+            if parsed_cell["kind"] == "invalid":
+                amounts[month] = None
+                invalid_months.append(month)
+                invalid_amounts.append((excel_row, column, month, raw_value, parsed_cell.get("message")))
                 continue
             all_amounts_blank = False
-            if parsed_cell["kind"] == KIND_INVALID:
-                invalid_months.append(month)
-                invalid_amounts.append((excel_row, column, month, raw_value))
-                amounts[month] = None
-            else:
-                amounts[month] = float(parsed_cell["value"])
+            amounts[month] = float(parsed_cell["value"])
         blank_row = _is_blank(code) and not description and not category and all_amounts_blank
         if blank_row:
             continue
@@ -409,16 +526,22 @@ def parse_historical_dataset(path: Path, filename: str, sheet_name: str | None =
                     "budget_code": code_text,
                 }
             )
-        for row_number, column, month, raw_value in invalid_amounts:
+        for row_number, column, month, raw_value, supplied_message in invalid_amounts:
+            message = supplied_message or (
+                f"Budget code {code_text} has a non-numeric amount for {month} "
+                f"in column {column} on row {row_number}."
+            )
+            if supplied_message:
+                message = (
+                    f"Budget code {code_text}, {month}, row {row_number}, column {column}: {SUPPLIED_CELL_MESSAGE}"
+                )
             errors.append(
                 {
                     "sheet": sheet,
                     "row": row_number,
                     "column": column,
-                    "message": (
-                        f"Budget code {code_text} has a non-numeric amount for {month} "
-                        f"in column {column} on row {row_number}."
-                    ),
+                    "month": month,
+                    "message": message,
                     "budget_code": code_text,
                 }
             )
@@ -432,6 +555,7 @@ def parse_historical_dataset(path: Path, filename: str, sheet_name: str | None =
                 "amounts": amounts,
                 "raw_amounts": raw_amounts,
                 "missing_months": missing_months,
+                "declared_months": declared_months,
                 "invalid_months": invalid_months,
             }
         )
@@ -487,6 +611,7 @@ def parse_historical_dataset(path: Path, filename: str, sheet_name: str | None =
         "can_confirm": not blocking and bool(parsed_rows),
         "selected_sheet": sheet,
         "filename": filename,
+        "omitted_formula_cells": omitted_formula_cells,
         "header_row_idx": header_row_idx,
         "code_column": code_col,
         "name_column": name_col,

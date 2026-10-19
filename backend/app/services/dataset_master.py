@@ -12,7 +12,7 @@ from openpyxl import Workbook, load_workbook
 
 from app.config import BACKEND_DIR, DATASET_STORAGE_DIR, HISTORICAL_MASTER_DATASET_PATH, MANAGED_MASTER_FILENAME
 from app.services.dataset_parser import actuals_header_for_month, iso_month
-from app.services.dataset_repository import list_historical_actuals, load_master_identity, master_version
+from app.services.dataset_repository import list_declarations, list_historical_actuals, load_master_identity, master_version
 from app.services.dataset_storage import ensure_storage_dir
 from app.services.dataset_workflow import merge_budget_codes
 
@@ -28,6 +28,8 @@ def fingerprint_master_state(state: dict) -> str:
                 "budget_code": str(item.get("budget_code")),
                 "description": item.get("description") or "",
                 "category": item.get("category") or "",
+                "effective_from": item.get("effective_from") or None,
+                "effective_to": item.get("effective_to") or None,
             }
         )
     records = []
@@ -44,9 +46,37 @@ def fingerprint_master_state(state: dict) -> str:
         "version": int(state.get("version") or 0),
         "earliest_month": state.get("earliest_month"),
         "latest_month": state.get("latest_month"),
-        "budget_codes": sorted(codes, key=lambda item: item["budget_code"]),
+        "budget_codes": sorted(
+            [
+                {
+                    "budget_code": item["budget_code"],
+                    "description": item["description"],
+                    "category": item["category"],
+                }
+                for item in codes
+            ],
+            key=lambda item: item["budget_code"],
+        ),
         "records": sorted(records),
     }
+    declarations = sorted(
+        (str(item.get("budget_code")), str(item.get("month")))
+        for item in (state.get("declarations") or [])
+        if item.get("budget_code") and item.get("month")
+    )
+    bounds = sorted(
+        (item["budget_code"], item.get("effective_from") or None, item.get("effective_to") or None)
+        for item in codes
+        if item.get("effective_from") or item.get("effective_to")
+    )
+    if declarations:
+        payload["declarations"] = declarations
+    if bounds:
+        payload["applicability"] = bounds
+    _import_engine()
+    from preprocessing import HISTORICAL_ACTUAL_POLICY_VERSION
+
+    payload["historical_actual_policy"] = HISTORICAL_ACTUAL_POLICY_VERSION
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -71,6 +101,7 @@ def load_master_state() -> dict:
             latest = numeric_months[-1]
         return {
             "records": stored,
+            "declarations": list_declarations(),
             "budget_codes": merge_budget_codes(identity["budget_codes"], [], stored),
             "earliest_month": earliest,
             "latest_month": latest,
@@ -78,7 +109,7 @@ def load_master_state() -> dict:
             "source": "database",
         }
     workbook = master_identity_from_workbook_path(authoritative_workbook_path())
-    return {**workbook, "version": version, "source": "production_workbook"}
+    return {**workbook, "declarations": [], "version": version, "source": "production_workbook"}
 
 
 def master_identity_from_workbook_path(path: Path) -> dict:
@@ -127,6 +158,7 @@ def master_identity_from_workbook_path(path: Path) -> dict:
         raise MasterSnapshotError(f"The historical workbook has no budget codes: {path}")
     return {
         "records": records,
+        "declarations": [],
         "budget_codes": codes,
         "earliest_month": months[0],
         "latest_month": months[-1],
@@ -193,6 +225,7 @@ def export_training_snapshot(
     budget_codes: list[dict] | None = None,
     earliest_month: str | None = None,
     latest_month: str | None = None,
+    declarations: list[dict] | None = None,
 ) -> Path:
     """Write the database master to the managed workbook and prove training can read it."""
     try:
@@ -201,6 +234,7 @@ def export_training_snapshot(
             budget_codes=budget_codes,
             earliest_month=earliest_month,
             latest_month=latest_month,
+            declarations=declarations,
         )
     except Exception as error:
         raise MasterSnapshotError(
@@ -222,6 +256,7 @@ def prepare_managed_master(
     budget_codes: list[dict] | None = None,
     earliest_month: str | None = None,
     latest_month: str | None = None,
+    declarations: list[dict] | None = None,
 ) -> Path:
     grouped: dict[str, dict] = {}
     months: set[str] = set()
@@ -260,6 +295,18 @@ def prepare_managed_master(
         month = str(item["month"])
         months.add(month)
         bucket["amounts"][month] = float(item["amount"])
+    for item in declarations or []:
+        code = str(item.get("budget_code") or "").strip()
+        month = str(item.get("month") or "").strip()
+        if not code or not month:
+            continue
+        bucket = grouped.setdefault(
+            code,
+            {"description": "", "category": "", "amounts": {}},
+        )
+        if month not in bucket["amounts"]:
+            bucket["amounts"][month] = "-"
+            months.add(month)
     if not grouped or not months:
         raise ValueError("The historical master has no numeric actuals to export.")
     ordered_months = _training_months(sorted(months))
@@ -321,6 +368,223 @@ def managed_master_path() -> Path:
     return Path(DATASET_STORAGE_DIR) / MANAGED_MASTER_FILENAME
 
 
+def scan_workbook_explicit_hyphens(path: Path) -> dict:
+    """Read stored cell values. A displayed accounting dash is not a declaration."""
+    from openpyxl import load_workbook
+
+    from app.services.dataset_parser import iso_month
+
+    _import_engine()
+    from preprocessing import (  # noqa: WPS433
+        clean_account_code,
+        is_excluded_actuals_column,
+        normalize_label,
+        parse_month_header,
+    )
+
+    workbook = load_workbook(path, data_only=False, read_only=True)
+    try:
+        worksheet = workbook[workbook.sheetnames[0]]
+        header = None
+        header_index = None
+        for index, row in enumerate(worksheet.iter_rows()):
+            if any(isinstance(cell.value, str) and "ACT CODE" in cell.value.upper() for cell in row):
+                header = row
+                header_index = index
+                break
+        if header is None:
+            return {"hyphen_pairs": [], "numeric_zero_dash_format": 0}
+        headers = [normalize_label(cell.value) for cell in header]
+        code_index = next(index for index, label in enumerate(headers) if label.upper() == "ACT CODE" or "ACT CODE" in label.upper())
+        month_indexes: list[tuple[int, str]] = []
+        for index, label in enumerate(headers):
+            if not label or is_excluded_actuals_column(label):
+                continue
+            timestamp = parse_month_header(label)
+            if pd_notna(timestamp):
+                month_indexes.append((index, iso_month(timestamp)))
+        pairs: list[tuple[str, str]] = []
+        zero_dash = 0
+        for row in worksheet.iter_rows(min_row=header_index + 2):
+            code = clean_account_code(row[code_index].value)
+            if not isinstance(code, str) or not code.strip():
+                continue
+            for index, month in month_indexes:
+                cell = row[index]
+                value = cell.value
+                if isinstance(value, str) and value.strip() == "-":
+                    pairs.append((str(code), month))
+                elif value == 0 or value == 0.0:
+                    if "-" in str(cell.number_format or ""):
+                        zero_dash += 1
+        return {"hyphen_pairs": pairs, "numeric_zero_dash_format": zero_dash}
+    finally:
+        workbook.close()
+
+
+def pd_notna(value) -> bool:
+    try:
+        import pandas as pd
+    except ImportError:
+        return value == value
+    return bool(pd.notna(value))
+
+
+def extract_original_baseline(path: Path) -> dict:
+    """Read the approved original workbook. Blanks in supplied months become declarations.
+
+    This does not apply to uploads. The source file is not modified.
+    """
+    import hashlib
+
+    from openpyxl import load_workbook
+
+    from app.services.dataset_parser import iso_month
+    from app.services.submission_state import SUBMISSION_DECLARED_MISSING, SUBMISSION_NUMERIC, classify_baseline_stored_cell
+
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    _import_engine()
+    from preprocessing import (
+        KIND_NUMBER,
+        _load_original_excel,
+        assign_categories,
+        clean_account_code,
+        normalize_label,
+        parse_amount_cell,
+    )
+
+    loaded = _load_original_excel(str(path))
+    assigned = assign_categories(loaded["df"], loaded["account_code_col"], loaded["account_name_col"])
+    header_row = loaded["header_row_idx"] + 1
+
+    def _sheet_rows(data_only: bool) -> tuple[list, list]:
+        book = load_workbook(path, data_only=data_only, read_only=True)
+        try:
+            sheet = book[loaded["sheet_name"]]
+            rows = list(sheet.iter_rows(min_row=header_row))
+        finally:
+            book.close()
+        if not rows:
+            return [], []
+        return rows[0], rows[1:]
+
+    stored_header, stored_rows = _sheet_rows(False)
+    cached_header, cached_rows = _sheet_rows(True)
+    stored_headers = [normalize_label(cell.value) for cell in stored_header]
+    column_index = {label: index for index, label in enumerate(stored_headers)}
+    month_positions = []
+    for column, timestamp in zip(loaded["monthly_columns"], loaded["month_dates"]):
+        label = normalize_label(column)
+        if label not in column_index:
+            continue
+        month_positions.append((column_index[label], iso_month(timestamp)))
+    del cached_header
+    skip_labels = {"total", "grand total", "subtotal"}
+    records = []
+    declarations = []
+    ambiguous = []
+    codes = []
+    seen = set()
+    numeric_pairs: set[tuple[str, str]] = set()
+    code_column = loaded["account_code_col"]
+    name_column = loaded["account_name_col"]
+    index_by_month = {month: index for index, month in month_positions}
+    for _, row in assigned.iterrows():
+        if bool(row.get("is_category_row")):
+            continue
+        code = clean_account_code(row.get(code_column))
+        if not isinstance(code, str) or not code.strip() or code.casefold() in skip_labels:
+            continue
+        description = "" if row.get(name_column) is None else str(row.get(name_column)).strip()
+        if description.lower() == "nan":
+            description = ""
+        category = "" if row.get("category") is None else str(row.get("category")).strip()
+        if category.lower() == "nan":
+            category = ""
+        if description.casefold() in skip_labels:
+            continue
+        source_row = int(row["_source_row"])
+        offset = source_row - (loaded["header_row_idx"] + 2)
+        if code not in seen:
+            seen.add(code)
+            codes.append(
+                {
+                    "budget_code": code,
+                    "description": description,
+                    "category": category,
+                    "effective_from": None,
+                    "effective_to": None,
+                }
+            )
+        for column, timestamp in zip(loaded["monthly_columns"], loaded["month_dates"]):
+            month = iso_month(timestamp)
+            parsed = parse_amount_cell(row.get(column))
+            if parsed["kind"] == KIND_NUMBER:
+                amount = float(parsed["value"])
+                records.append(
+                    {
+                        "budget_code": code,
+                        "month": month,
+                        "amount": amount,
+                        "description": description,
+                        "category": category,
+                    }
+                )
+                numeric_pairs.add((code, month))
+                continue
+            index = index_by_month.get(month)
+            stored_value = None
+            cached_value = None
+            if index is None or offset < 0 or offset >= len(stored_rows):
+                ambiguous.append(
+                    {
+                        "budget_code": code,
+                        "month": month,
+                        "reason": "supplied month column was not readable",
+                    }
+                )
+                continue
+            stored_row = stored_rows[offset]
+            cached_row = cached_rows[offset] if offset < len(cached_rows) else ()
+            stored_value = stored_row[index].value if index < len(stored_row) else None
+            cached_value = cached_row[index].value if index < len(cached_row) else None
+            classified = classify_baseline_stored_cell(stored_value, cached_value)
+            if classified["kind"] == SUBMISSION_NUMERIC and (code, month) not in numeric_pairs:
+                records.append(
+                    {
+                        "budget_code": code,
+                        "month": month,
+                        "amount": float(classified["value"]),
+                        "description": description,
+                        "category": category,
+                    }
+                )
+                numeric_pairs.add((code, month))
+            elif classified["kind"] == SUBMISSION_DECLARED_MISSING and (code, month) not in numeric_pairs:
+                declarations.append({"budget_code": code, "month": month})
+            elif (code, month) not in numeric_pairs:
+                ambiguous.append(
+                    {
+                        "budget_code": code,
+                        "month": month,
+                        "reason": classified.get("reason") or "ambiguous baseline cell",
+                    }
+                )
+    months = [iso_month(timestamp) for timestamp in loaded["month_dates"]]
+    return {
+        "baseline_hash": digest,
+        "records": records,
+        "declarations": declarations,
+        "budget_codes": codes,
+        "ambiguous": ambiguous,
+        "earliest_month": months[0] if months else None,
+        "latest_month": months[-1] if months else None,
+        "numeric_count": len(records),
+        "declaration_count": len(declarations),
+        "budget_code_count": len(codes),
+    }
+
+
 def authoritative_workbook_path() -> Path:
     """Workbook used before historical actuals are stored in the database."""
     dataset_dir = ENGINE_DIR / "dataset"
@@ -344,6 +608,7 @@ def resolve_training_snapshot() -> dict:
             budget_codes=state["budget_codes"],
             earliest_month=state["earliest_month"],
             latest_month=state["latest_month"],
+            declarations=state.get("declarations") or [],
         )
         summary = {
             "budget_code_count": len(state["budget_codes"]),

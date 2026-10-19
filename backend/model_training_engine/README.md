@@ -20,8 +20,8 @@ Do not copy stale top-12 account lists or `feature_selection_results`.
 those pickle fields directly. This README is an evaluation report only and is
 not a runtime data source.
 
-The live Generate Forecast path still loads `international_settlement_top12_models.pkl`
-until the all-budget artifact is explicitly activated.
+The live Generate Forecast path loads `all_budget_code_models.pkl`.
+`international_settlement_top12_models.pkl` is a protected legacy artifact and is not overwritten by all-account retraining.
 
 
 ## Latest training run

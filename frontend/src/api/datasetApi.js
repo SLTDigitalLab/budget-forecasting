@@ -45,18 +45,28 @@ export function previewDataset(file, sheetName, token) {
   return datasetRequest("/api/datasets/preview", { method: "POST", body, token });
 }
 
-export function confirmDataset(previewId, token) {
+export function confirmDataset(previewId, token, signal) {
   return datasetRequest("/api/datasets/confirm", {
     method: "POST",
     token,
+    signal,
     body: JSON.stringify({ preview_id: previewId }),
   });
 }
 
-export function stageDatasetPreview(previewId, body, token) {
+export function getPreviewConfirmation(previewId, token, signal) {
+  return datasetRequest(`/api/datasets/previews/${encodeURIComponent(previewId)}/confirmation`, {
+    method: "GET",
+    token,
+    signal,
+  });
+}
+
+export function stageDatasetPreview(previewId, body, token, signal) {
   return datasetRequest(`/api/datasets/previews/${encodeURIComponent(previewId)}/stage`, {
     method: "POST",
     token,
+    signal,
     body: JSON.stringify(body),
   });
 }
@@ -135,6 +145,56 @@ export async function downloadDatasetFile(fileId, fallbackName) {
   link.remove();
   URL.revokeObjectURL(url);
   return filename;
+}
+
+export function listBookEntries(search = "", category = "", name = "") {
+  const params = new URLSearchParams();
+  if (search) params.set("search", search);
+  if (name) params.set("name", name);
+  if (category) params.set("category", category);
+  const query = params.toString();
+  return datasetRequest(`/api/datasets/book-entries${query ? `?${query}` : ""}`);
+}
+
+export function lookupBookEntry(budgetCode) {
+  const params = new URLSearchParams({ budget_code: budgetCode });
+  return datasetRequest(`/api/datasets/book-entries/lookup?${params.toString()}`);
+}
+
+export function createBookEntry(payload, token) {
+  return datasetRequest("/api/datasets/book-entries", {
+    method: "POST",
+    token,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateBookEntry(budgetCode, payload, token) {
+  return datasetRequest(`/api/datasets/book-entries/${encodeURIComponent(budgetCode)}`, {
+    method: "PUT",
+    token,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteBookEntry(budgetCode, token) {
+  return datasetRequest(`/api/datasets/book-entries/${encodeURIComponent(budgetCode)}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+export async function downloadBookEntryWorkbook() {
+  const response = await datasetRequest("/api/datasets/book-entries/workbook");
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "Book entry accounts.xlsx";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 export function saveDatasetEdits(fileId, payload, token) {

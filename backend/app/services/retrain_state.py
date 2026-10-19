@@ -373,6 +373,10 @@ def authorize(state: dict[str, Any], job_id: str, identity) -> dict[str, Any]:
     return job
 
 
+_PROGRESS_LOG_LIMIT = 2000
+_UNSET = object()
+
+
 def append_progress(
     job: dict[str, Any],
     message: str,
@@ -380,20 +384,26 @@ def append_progress(
     current: int | None,
     total: int | None,
     now: datetime,
-    budget_code: str | None = None,
+    budget_code: Any = _UNSET,
+    algorithm: Any = _UNSET,
+    fold: Any = _UNSET,
 ) -> None:
     if message:
         lines = [line for line in str(job.get("logs") or "").splitlines() if line != ""]
         lines.append(message)
-        job["logs"] = "\n".join(lines[-400:])
+        job["logs"] = "\n".join(lines[-_PROGRESS_LOG_LIMIT:])
     if stage:
         job["progress_stage"] = stage
     if current is not None:
         job["progress_current"] = int(current)
     if total is not None:
         job["progress_total"] = int(total)
-    if budget_code:
-        job["progress_budget_code"] = str(budget_code)
+    if budget_code is not _UNSET:
+        job["progress_budget_code"] = str(budget_code) if budget_code else None
+    if algorithm is not _UNSET:
+        job["progress_algorithm"] = str(algorithm) if algorithm else None
+    if fold is not _UNSET:
+        job["progress_fold"] = str(fold) if fold else None
     job["heartbeat_at"] = now
     job["updated_at"] = now
 
@@ -478,6 +488,8 @@ def public_view(state: dict[str, Any], identity, now: datetime) -> dict[str, Any
         "can_manage": can_manage,
         "progress_stage": job.get("progress_stage") if job else None,
         "progress_budget_code": job.get("progress_budget_code") if job else None,
+        "progress_algorithm": job.get("progress_algorithm") if job else None,
+        "progress_fold": job.get("progress_fold") if job else None,
         "progress_current": job.get("progress_current") if job else None,
         "progress_total": job.get("progress_total") if job else None,
         "legacy_unverified": bool(job and locked and not job.get("initiator_oid")),
@@ -516,11 +528,14 @@ _JOB_COLUMNS = (
     "earliest_month",
     "latest_month",
     "budget_code_count",
+    "training_scope_codes",
+    "book_entry_excluded_codes",
     "candidate_path",
     "candidate_sha256",
     "candidate_validated",
     "progress_stage",
     "progress_budget_code",
+    "progress_algorithm",
     "progress_current",
     "progress_total",
     "logs",
@@ -539,6 +554,20 @@ _JOB_COLUMNS = (
 )
 
 
+_state_preparer: Callable[[dict[str, Any]], None] | None = None
+
+
+def set_state_preparer(fn: Callable[[dict[str, Any]], None] | None) -> None:
+    """Apply in-memory progress after a job is loaded and before the mutation runs."""
+    global _state_preparer
+    _state_preparer = fn
+
+
+def _prepare_state(state: dict[str, Any]) -> None:
+    if _state_preparer is not None:
+        _state_preparer(state)
+
+
 class MemoryBackend:
     def __init__(self):
         self._lock = threading.Lock()
@@ -546,6 +575,7 @@ class MemoryBackend:
 
     def mutate(self, fn: Callable[[dict[str, Any]], Any]) -> Any:
         with self._lock:
+            _prepare_state(self.state)
             return fn(self.state)
 
 
@@ -562,6 +592,7 @@ class PostgresBackend:
                 )
                 connection.execute("SELECT id FROM system_coordination WHERE id = 1 FOR UPDATE")
                 state = _load_state(connection)
+                _prepare_state(state)
                 result = fn(state)
                 _save_state(connection, state)
                 return result
@@ -650,6 +681,13 @@ def _load_state(connection) -> dict[str, Any]:
         job = {column: row[column] for column in _JOB_COLUMNS}
         job["candidate_validated"] = bool(job.get("candidate_validated"))
         job["logs"] = job.get("logs") or ""
+        for json_column in ("training_scope_codes", "book_entry_excluded_codes"):
+            value = job.get(json_column)
+            if isinstance(value, str):
+                import json
+
+                value = json.loads(value or "[]")
+            job[json_column] = list(value or []) if value is not None else None
         jobs[job["id"]] = job
     return {
         "coordination": {
@@ -689,6 +727,12 @@ def _save_state(connection, state: dict[str, Any]) -> None:
         payload["candidate_validated"] = bool(payload.get("candidate_validated"))
         payload["publication_status"] = payload.get("publication_status") or "not_published"
         payload["manage_token_hash"] = payload.get("manage_token_hash") or ""
+        for json_column in ("training_scope_codes", "book_entry_excluded_codes"):
+            value = payload.get(json_column)
+            if value is None:
+                payload[json_column] = None
+            else:
+                payload[json_column] = Jsonb(list(value))
         connection.execute(
             f"""
             INSERT INTO retrain_jobs ({columns})

@@ -1,17 +1,33 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import SummaryCard from "./SummaryCard";
-import { cellClass, confirmationBlocked, displayAmount } from "../utils/historicalWorkflow";
+import {
+  cellClass,
+  confirmationBlocked,
+  reviewConfirmationState,
+  displayAmount,
+  unresolvedPreviewCells,
+  previewCellDisplay,
+} from "../utils/historicalWorkflow";
+import { SAVE_UNKNOWN_MESSAGE, confirmButtonPresentation } from "../utils/settingsFlow";
 
 function amountText(value) {
+  if (value === "DECLARED_MISSING" || value === "-") {
+    return "-";
+  }
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
   return displayAmount(value);
 }
 
-export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, saving, staging, busy }) {
+export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, saving, savePhase, staging, busy, onCheckStatus }) {
   const [rows, setRows] = useState(preview.rows || []);
-  const [removed, setRemoved] = useState([]);
+  const [removed, setRemoved] = useState(preview.removed_stage_ids || []);
   const [editing, setEditing] = useState("");
-  const [missingDecisions, setMissingDecisions] = useState([]);
-  const [metadataDecisions, setMetadataDecisions] = useState([]);
+  const [dirty, setDirty] = useState(false);
+  const [cellFilter, setCellFilter] = useState("unresolved");
+  const [missingDecisions, setMissingDecisions] = useState(preview.missing_decisions || []);
+  const [metadataDecisions, setMetadataDecisions] = useState(preview.metadata_decisions || []);
   const summary = preview.summary || {};
 
   useEffect(() => {
@@ -19,24 +35,71 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
     setRemoved(preview.removed_stage_ids || []);
     setMissingDecisions(preview.missing_decisions || []);
     setMetadataDecisions(preview.metadata_decisions || []);
+    setDirty(false);
   }, [preview]);
 
   function updateRow(stageId, patch) {
+    setDirty(true);
     setRows((current) => current.map((row) => (row.stage_id === stageId ? { ...row, ...patch } : row)));
   }
 
-  async function saveChanges() {
-    await onStage({
+  function updateCell(stageId, month, value) {
+    setDirty(true);
+    setRows((current) =>
+      current.map((row) => {
+        if (row.stage_id !== stageId) {
+          return row;
+        }
+        const raw_amounts = { ...(row.raw_amounts || row.amounts || {}), [month]: value };
+        return { ...row, raw_amounts };
+      })
+    );
+  }
+
+  function reviewBody() {
+    return {
       rows,
       removed_stage_ids: removed,
       missing_decisions: missingDecisions,
       metadata_decisions: metadataDecisions,
-    });
+    };
   }
+
+  async function saveChanges() {
+    await onStage(reviewBody());
+    setDirty(false);
+  }
+
+  const problemCells = useMemo(() => unresolvedPreviewCells({ ...preview, rows }), [preview, rows]);
+  const filteredCells = useMemo(() => {
+    if (cellFilter === "all") {
+      return problemCells;
+    }
+    if (cellFilter === "invalid") {
+      return problemCells.filter((cell) => cell.kind === "invalid");
+    }
+    return problemCells.filter((cell) => cell.kind === "unresolved_blank");
+  }, [problemCells, cellFilter]);
+
+  const reviewState = reviewConfirmationState(preview, {
+    missingDecisions,
+    metadataDecisions,
+    removed,
+    dirty,
+  });
+  const confirmPresentation = confirmButtonPresentation({
+    phase: savePhase,
+    blocked: reviewState.disabled || dirty || preview.can_confirm !== true,
+    saving,
+  });
 
   return (
     <div className="settings-preview">
       <p className="muted">{preview.forecast_note}</p>
+      <p className="muted">
+        Blank cells need a number, zero, a negative amount, or a standalone &quot;-&quot; for declared missing. Months left out of
+        the file stay unchanged on the master. &quot;-&quot; is not a negative number.
+      </p>
       <h3>Validation summary</h3>
       <div className="summary-grid settings-summary-grid">
         <SummaryCard label="File Structure" value={summary.file_structure || (confirmationBlocked(preview) ? "Needs correction" : "Valid")} />
@@ -46,10 +109,18 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
         <SummaryCard label="New Budget Codes" value={summary.new_budget_codes ?? "—"} />
         <SummaryCard label="Categories Represented" value={summary.categories_represented ?? "—"} />
         <SummaryCard label="Valid Numeric Values" value={summary.valid_numeric_values ?? "—"} />
-        <SummaryCard label="Missing Values" value={summary.missing_values ?? "—"} />
+        <SummaryCard label="Unresolved Blanks" value={summary.unresolved_blank_cells ?? preview.unresolved_blank_count ?? 0} />
+        <SummaryCard
+          label="Declared Missing (-)"
+          value={summary.declared_missing_cells ?? summary.missing_values ?? 0}
+        />
         <SummaryCard label="Invalid Values" value={summary.invalid_values ?? preview.invalid_count ?? "—"} />
         <SummaryCard label="Duplicate Conflicts" value={summary.duplicate_conflicts ?? preview.duplicate_conflicts?.length ?? 0} />
       </div>
+      <p className="muted">
+        Missing Values means explicit &quot;-&quot; declarations in this upload only. Unresolved blanks and invalid text are counted
+        separately and must be corrected before Confirm &amp; Save.
+      </p>
       <h3>Master impact</h3>
       <div className="summary-grid settings-summary-grid">
         <SummaryCard label="Current Budget Codes" value={summary.current_budget_codes ?? "—"} />
@@ -60,19 +131,96 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
         <SummaryCard label="Updated Values" value={summary.updated_values ?? preview.changed_count ?? 0} />
         <SummaryCard label="Unchanged Values" value={summary.unchanged_values ?? preview.unchanged_count ?? 0} />
       </div>
-      {preview.errors?.length || preview.structural_errors?.length ? (
+      {summary.unresolved_formula_cells ? (
+        <p className="muted">
+          {summary.unresolved_formula_cells} formula cells had no calculated number, including Excel #N/A. They were not imported, so the stored master value for each of those months stays unchanged.
+        </p>
+      ) : null}
+      {preview.errors?.length || preview.structural_errors?.length || preview.cell_errors?.length ? (
         <div className="settings-ops-alert" role="alert">
           <p>Validation failed. Blocking issues must be resolved before Confirm & Save.</p>
           <ul>
-            {(preview.structural_errors?.length ? preview.structural_errors : preview.errors).slice(0, 20).map((item, index) => (
-              <li key={`${item.row}-${item.message}-${index}`}>{item.message}</li>
-            ))}
+            {[...(preview.errors || []), ...(preview.structural_errors || []), ...(preview.cell_errors || [])]
+              .slice(0, 20)
+              .map((item, index) => (
+                <li key={`${item.row}-${item.message}-${index}`}>{item.message}</li>
+              ))}
           </ul>
+        </div>
+      ) : null}
+      {problemCells.length ? (
+        <div className="settings-preview-fix-panel">
+          <div className="settings-preview-fix-toolbar">
+            <h3>Correct unresolved cells ({problemCells.length})</h3>
+            <div className="settings-preview-fix-filters">
+              <button
+                type="button"
+                className={cellFilter === "unresolved" ? "master-filter-button is-selected" : "master-filter-button"}
+                onClick={() => setCellFilter("unresolved")}
+              >
+                Unresolved blanks
+              </button>
+              <button
+                type="button"
+                className={cellFilter === "invalid" ? "master-filter-button is-selected" : "master-filter-button"}
+                onClick={() => setCellFilter("invalid")}
+              >
+                Invalid
+              </button>
+              <button
+                type="button"
+                className={cellFilter === "all" ? "master-filter-button is-selected" : "master-filter-button"}
+                onClick={() => setCellFilter("all")}
+              >
+                All issues
+              </button>
+            </div>
+          </div>
+          <p className="muted">
+            Edit here, then Save Changes to revalidate. Pending edits stay while you filter or scroll. Confirm stays disabled
+            until the staged revision has no unresolved or invalid cells.
+          </p>
+          <div className="settings-preview-fix-scroll">
+            <table className="settings-preview-fix-table">
+              <thead>
+                <tr>
+                  <th>Budget Code</th>
+                  <th>Month</th>
+                  <th>Issue</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredCells.map((cell) => {
+                  const row = rows.find((item) => item.stage_id === cell.stage_id);
+                  const current = previewCellDisplay(row?.raw_amounts?.[cell.month] ?? "");
+                  return (
+                    <tr
+                      key={`${cell.stage_id}-${cell.month}`}
+                      className={cell.kind === "invalid" ? "settings-cell-invalid" : "settings-cell-unresolved"}
+                    >
+                      <td>{cell.budget_code}</td>
+                      <td>{cell.month}</td>
+                      <td>{cell.kind === "invalid" ? "Invalid" : "Unresolved blank"}</td>
+                      <td>
+                        <input
+                          aria-label={`${cell.budget_code} ${cell.month}`}
+                          value={current}
+                          placeholder="number or -"
+                          onChange={(event) => updateCell(cell.stage_id, cell.month, event.target.value)}
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       ) : null}
       {preview.duplicate_conflicts?.length ? (
         <div className="settings-ops-alert" role="alert">
-          <p>Duplicate Budget Code and month conflicts are blocking confirmation. Edit or Remove a staged row, then Save Changes.</p>
+          <p>Duplicate Budget Code and month conflicts are blocking confirmation. Edit or Remove a staged row. Confirm & Save sends those decisions and does not change the master until you confirm.</p>
           {preview.duplicate_conflicts.map((conflict) => (
             <div key={`${conflict.budget_code}-${conflict.month}`}>
               <p>
@@ -95,6 +243,7 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
                         if (!allowed) {
                           return;
                         }
+                        setDirty(true);
                         setRemoved((current) => (current.includes(record.stage_id) ? current : [...current, record.stage_id]));
                       });
                     }}
@@ -115,10 +264,10 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
               <span>
                 {item.budget_code}: master {item.current_category} / {item.current_description}; upload {item.uploaded_category} / {item.uploaded_description}
               </span>
-              <button type="button" className="export-button-secondary" onClick={() => setMetadataDecisions((current) => [...current.filter((entry) => entry.budget_code !== item.budget_code), { budget_code: item.budget_code, action: "keep_master" }])}>
+              <button type="button" className="export-button-secondary" onClick={() => { setDirty(true); setMetadataDecisions((current) => [...current.filter((entry) => entry.budget_code !== item.budget_code), { budget_code: item.budget_code, action: "keep_master" }]); }}>
                 Keep master
               </button>
-              <button type="button" className="export-button-secondary" onClick={() => setMetadataDecisions((current) => [...current.filter((entry) => entry.budget_code !== item.budget_code), { budget_code: item.budget_code, action: "accept_upload" }])}>
+              <button type="button" className="export-button-secondary" onClick={() => { setDirty(true); setMetadataDecisions((current) => [...current.filter((entry) => entry.budget_code !== item.budget_code), { budget_code: item.budget_code, action: "accept_upload" }]); }}>
                 Accept upload
               </button>
             </div>
@@ -127,7 +276,8 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
       ) : null}
       {preview.missing_conflicts?.length ? (
         <div className="settings-ops-alert" role="alert">
-          <p>A missing upload value would erase an existing master actual. Choose what to keep.</p>
+          <p>A blank upload cell overlaps a stored value. A blank does not declare the value missing.</p>
+          <p className="muted">Keep existing keeps the stored number or declaration. Clear stored value removes the number and any declaration, so the code/month is not submitted. Declare missing records an explicit missing declaration and removes the number. Remove drops this blank cell and leaves the master unchanged.</p>
           {preview.missing_conflicts.map((item) => (
             <div key={`${item.budget_code}-${item.month}`} className="settings-upload-row">
               <span>
@@ -137,7 +287,10 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
                 Keep existing
               </button>
               <button type="button" className="export-button-secondary" onClick={() => setMissingDecisions((current) => [...current.filter((entry) => entry.budget_code !== item.budget_code || entry.month !== item.month), { budget_code: item.budget_code, month: item.month, action: "clear" }])}>
-                Replace with missing
+                Clear stored value
+              </button>
+              <button type="button" className="export-button-secondary" onClick={() => setMissingDecisions((current) => [...current.filter((entry) => entry.budget_code !== item.budget_code || entry.month !== item.month), { budget_code: item.budget_code, month: item.month, action: "declare_missing" }])}>
+                Declare missing
               </button>
               <button
                 type="button"
@@ -202,12 +355,13 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
         </div>
       ) : null}
       <div className="settings-upload-row">
-        <button type="button" className="export-button-secondary" onClick={saveChanges} disabled={staging || busy}>
-          {staging ? "Saving..." : "Save Changes"}
+        <button type="button" className="generate-button" onClick={saveChanges} disabled={staging || busy || !dirty}>
+          {staging ? "Revalidating..." : dirty ? "Save Changes & Revalidate" : "No pending edits"}
         </button>
         <button type="button" className="export-button-secondary" onClick={() => setEditing("")}>
-          Cancel
+          Cancel row edit
         </button>
+        {dirty ? <span className="muted">Staged edits are not confirmed until Save Changes succeeds.</span> : null}
       </div>
       {preview.merge_preview?.length ? (
         <div className="table-wrap data-scroll">
@@ -235,9 +389,42 @@ export function PreviewWorkspace({ preview, onStage, onConfirm, onAuthorize, sav
           </table>
         </div>
       ) : null}
-      <button type="button" className="generate-button" onClick={onConfirm} disabled={confirmationBlocked(preview) || saving || busy}>
-        {saving ? "Saving..." : "Confirm & Save"}
-      </button>
+      {reviewState.visible ? (
+        <div className="settings-confirm-bar">
+          <h3>Save to historical master</h3>
+          {savePhase === "unknown" ? (
+            <p className="settings-confirm-note" role="status">{SAVE_UNKNOWN_MESSAGE}</p>
+          ) : reviewState.disabled && savePhase !== "saved" && savePhase !== "saving" ? (
+            <div className="settings-confirm-note" role="status">
+              <p>Confirm & Save is disabled until every decision below is resolved. The historical master has not been changed.</p>
+              <ul>
+                {reviewState.reasons.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          ) : savePhase === "saved" ? (
+            <p className="settings-confirm-note" role="status">Changes saved to the historical master successfully.</p>
+          ) : (
+            <p className="settings-confirm-note">
+              Review the changes above. Confirm & Save writes them to the historical master once. Preview does not change the master.
+            </p>
+          )}
+          <button
+            type="button"
+            className="generate-button"
+            onClick={() => onConfirm(reviewBody())}
+            disabled={confirmPresentation.disabled || busy}
+          >
+            {confirmPresentation.label}
+          </button>
+          {confirmPresentation.checkStatus ? (
+            <button type="button" className="export-button-secondary" onClick={() => onCheckStatus()}>
+              Check save status
+            </button>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -256,7 +443,7 @@ function MasterToolbar({ onView, onEdit, busy, activeFilter, onFilter, selectedC
       <button type="button" className="master-mode-button" onClick={onView}>
         View Master Dataset
       </button>
-      <button type="button" className="master-mode-button" onClick={onEdit} disabled={busy}>
+      <button type="button" className="master-mode-button" onClick={() => onEdit()} disabled={busy}>
         Edit Master Dataset
       </button>
       {onFilter
@@ -287,6 +474,13 @@ export function MasterSection({ master, editing, draft, onView, onEdit, onDraft,
   }
   return (
     <div>
+      {editing ? (
+        <p className="muted">
+          Leave a cell blank to clear the stored value. That does not declare it missing. Type - to declare it missing.
+        </p>
+      ) : (
+        <p className="muted">{master.actuals_display_label || "Historical actuals are shown with their original sign. Stored values are unchanged."}</p>
+      )}
       <MasterToolbar
         onView={onView}
         onEdit={onEdit}
@@ -312,17 +506,24 @@ export function MasterSection({ master, editing, draft, onView, onEdit, onDraft,
                 <td>{row.budget_code}</td>
                 <td>{row.category}</td>
                 {(master.months || []).map((month) => {
-                  const value = row.amounts?.[month];
+                  const stored = row.raw_amounts?.[month] ?? row.amounts?.[month];
+                  const display = row.display_amounts?.[month] ?? stored;
+                  const declared = row.submissions?.[month] === "declared_missing";
+                  const shown = declared ? "-" : (editing ? (stored ?? "") : (display ?? ""));
                   const highlight = row.highlights?.[month];
+                  const storedTitle = !editing && stored != null && Number(stored) < 0 ? `Stored value ${stored}` : undefined;
                   return (
-                    <td key={month} className={cellClass(highlight)}>
+                    <td key={month} className={cellClass(highlight)} title={storedTitle}>
                       {editing ? (
                         <input
-                          value={draft[`${row.budget_code}|${month}`] ?? (value ?? "")}
+                          value={draft[`${row.budget_code}|${month}`] ?? shown}
                           onChange={(event) => onDraft(row, month, event.target.value)}
+                          aria-label={`${row.budget_code} ${month}`}
                         />
+                      ) : declared ? (
+                        "-"
                       ) : (
-                        amountText(value)
+                        amountText(display)
                       )}
                     </td>
                   );
@@ -345,10 +546,10 @@ export function MasterSection({ master, editing, draft, onView, onEdit, onDraft,
       </div>
       {editing ? (
         <div className="settings-upload-row">
-          <button type="button" className="export-button-secondary" onClick={onPreview} disabled={busy}>
+          <button type="button" className="export-button-secondary" onClick={() => onPreview()} disabled={busy}>
             Save Changes
           </button>
-          <button type="button" className="generate-button" onClick={onConfirm} disabled={!preview?.can_confirm || confirming || busy}>
+          <button type="button" className="generate-button" onClick={() => onConfirm()} disabled={!preview?.can_confirm || confirming || busy}>
             {confirming ? "Saving..." : "Confirm Changes"}
           </button>
           <button type="button" className="export-button-secondary" onClick={onView}>
@@ -405,7 +606,7 @@ export function RollbackDialog({ revision, reason, onReason, review, onReview, o
         <label htmlFor="rollback-reason">Reason for rollback *</label>
         <textarea id="rollback-reason" value={reason} onChange={(event) => onReason(event.target.value)} required />
         <div className="settings-upload-row">
-          <button type="button" className="export-button-secondary" onClick={onReview} disabled={!reason.trim() || reviewing}>
+          <button type="button" className="export-button-secondary" onClick={() => onReview()} disabled={!reason.trim() || reviewing}>
             Review Rollback
           </button>
           <button type="button" className="export-button-secondary" onClick={onCancel}>
@@ -445,7 +646,7 @@ export function RollbackDialog({ revision, reason, onReason, review, onReview, o
                 </tbody>
               </table>
             </div>
-            <button type="button" className="generate-button" onClick={onConfirm} disabled={!review.safe?.length || reviewing}>
+            <button type="button" className="generate-button" onClick={() => onConfirm()} disabled={!review.safe?.length || reviewing}>
               Confirm Rollback
             </button>
           </div>

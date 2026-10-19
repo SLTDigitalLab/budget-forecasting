@@ -43,10 +43,12 @@ export function aggregateMonthlyAmounts(rows, amountKey) {
 }
 
 /**
- * Dataset-level completeness.
- * Historical rows are already monthly totals (one amount per calendar month, summed across
- * Budget Codes or categories). A month counts only when that total is a finite number,
- * including zero. A year qualifies only when months 01 through 12 are all present.
+ * Client-side helper for aggregated monthly totals only.
+ * Live Overview/Settings/Analytics use API `latest_complete_year` from
+ * `coverage_report`, which requires every applicable Budget Code (including Book Entry)
+ * to have a numeric actual or explicit missing declaration for all Jan–Dec months.
+ * This helper only checks that each calendar month has a finite combined total
+ * (zero counts; null does not). It must not invent a complete year from one month.
  * Missing months are not filled. Forecast rows must not be passed in.
  */
 export function latestCompleteActualYear(rows) {
@@ -69,6 +71,46 @@ export function latestCompleteActualYear(rows) {
     return null;
   }
   return Math.max(...complete);
+}
+
+export const DECLARED_MISSING_TOTAL_NOTE = "Declared missing values are submitted but are not included in totals.";
+
+export function latestCompleteYearLabel(year) {
+  if (year == null || year === "") {
+    return "Latest complete year: unavailable";
+  }
+  return `Latest complete year: ${year}`;
+}
+
+export function overviewLatestYearLabel(year) {
+  if (year == null || year === "") {
+    return "Latest Year: unavailable";
+  }
+  return `Latest Year: ${year}`;
+}
+
+export function overviewCompleteYearUnavailableMessage(historical) {
+  const year = historical?.latest_complete_year;
+  if (year != null && year !== "") {
+    return "";
+  }
+  if (historical?.historical_observations_exist) {
+    return "No complete year available. Historical actuals exist, but no calendar year has a numeric actual or explicit missing declaration for every applicable Budget Code in all twelve months.";
+  }
+  return "No complete year available.";
+}
+
+export function latestAvailableDataValue(source) {
+  const month = source?.latest_available_month;
+  if (!month) {
+    return "Unavailable";
+  }
+  const status = source.latest_available_status === "complete" ? "Complete" : "Partial";
+  const submitted = Number(source.latest_available_submitted) || 0;
+  const applicable = Number(source.latest_available_applicable) || 0;
+  const declared = Number(source.latest_available_declared_missing) || 0;
+  const declaredNote = declared > 0 ? `, ${declared} declared missing` : "";
+  return `${month} — ${status}, ${submitted}/${applicable} submitted${declaredNote}`;
 }
 
 const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -250,6 +292,20 @@ export function actualYearSeries(rows, year) {
   });
 }
 
+export function sliceTooltipDetails(entry) {
+  const source = entry?.payload?.budget_code ? entry.payload : entry;
+  const budgetCode = String(source?.budget_code || "").trim();
+  if (!budgetCode) {
+    return null;
+  }
+  return {
+    budget_code: budgetCode,
+    account_name: String(source.account_name || ""),
+    amount: source.amount,
+    percent: source.percent,
+  };
+}
+
 export function shareDistribution(rows, amountKey) {
   const items = (Array.isArray(rows) ? rows : [])
     .map((row) => ({
@@ -259,12 +315,15 @@ export function shareDistribution(rows, amountKey) {
     }))
     .filter((row) => row.budget_code && row.amount != null);
   const total = items.reduce((sum, row) => sum + row.amount, 0);
+  const magnitude = items.reduce((sum, row) => sum + Math.abs(row.amount), 0);
   return items
     .sort((left, right) => right.amount - left.amount || left.budget_code.localeCompare(right.budget_code))
     .map((row) => ({
       ...row,
-      percent: total === 0 ? 0 : row.amount / total,
+      // Signed percent of absolute magnitude; keep signed amounts for bar charts.
+      percent: magnitude === 0 ? 0 : row.amount / magnitude,
       total,
+      magnitude,
     }));
 }
 

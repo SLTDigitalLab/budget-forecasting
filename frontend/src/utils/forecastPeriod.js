@@ -1,4 +1,4 @@
-import { addMonths, earliestForecastIso, inclusiveMonthCount, isoToLabel } from "./months.js";
+import { earliestForecastIso, inclusiveMonthCount, isoToLabel } from "./months.js";
 
 export const MONTH_OPTIONS = [
   { number: 1, value: "01", label: "January" },
@@ -15,9 +15,7 @@ export const MONTH_OPTIONS = [
   { number: 12, value: "12", label: "December" },
 ];
 
-export const FUTURE_YEAR_COUNT = 10;
 export const MAX_FORECAST_MONTHS = 60;
-export const MAX_FORECAST_END_ISO = "2030-12";
 
 export const PERIOD_TYPE = {
   SPECIFIC_MONTH: "specific_month",
@@ -47,29 +45,21 @@ export function splitIsoMonth(isoMonth) {
   return { year, month };
 }
 
-export function yearOptions(earliestIso, futureYears = FUTURE_YEAR_COUNT) {
+export function yearOptions(earliestIso, maximumIso) {
   const firstYear = Number(String(earliestIso || "").slice(0, 4));
-  if (!Number.isFinite(firstYear) || firstYear < 1) {
+  const lastYear = Number(String(maximumIso || "").slice(0, 4));
+  if (!Number.isFinite(firstYear) || firstYear < 1 || !Number.isFinite(lastYear) || lastYear < firstYear) {
     return [];
   }
-  const lastYear = Number(MAX_FORECAST_END_ISO.slice(0, 4));
   const years = [];
-  const limit = Math.min(firstYear + Number(futureYears), lastYear);
-  for (let year = firstYear; year <= limit; year += 1) {
+  for (let year = firstYear; year <= lastYear; year += 1) {
     years.push(year);
   }
   return years;
 }
 
-export function lastAllowedIso(earliestIso, maxHorizon = MAX_FORECAST_MONTHS) {
-  if (!earliestIso || !/^\d{4}-\d{2}$/.test(earliestIso)) {
-    return MAX_FORECAST_END_ISO;
-  }
-  const byHorizon = addMonths(earliestIso, Number(maxHorizon) - 1);
-  if (!byHorizon || byHorizon > MAX_FORECAST_END_ISO) {
-    return MAX_FORECAST_END_ISO;
-  }
-  return byHorizon;
+export function lastAllowedIso(maximumIso) {
+  return /^\d{4}-\d{2}$/.test(maximumIso || "") ? maximumIso : "";
 }
 
 export function isMonthDisabled(year, month, minimumIso, maximumIso) {
@@ -113,7 +103,7 @@ export function buildForecastRequest(startYear, startMonth, endYear, endMonth) {
   };
 }
 
-export function validateForecastPeriod({ startIso, endIso, earliestIso, historyEnd }) {
+export function validateForecastPeriod({ startIso, endIso, earliestIso, historyEnd, maximumIso }) {
   const { year: startYear, month: startMonth } = splitIsoMonth(startIso);
   const { year: endYear, month: endMonth } = splitIsoMonth(endIso);
   if (!startYear || !startMonth || !endYear || !endMonth) {
@@ -126,8 +116,12 @@ export function validateForecastPeriod({ startIso, endIso, earliestIso, historyE
   if (endIso < startIso) {
     return "End period cannot be before start period.";
   }
-  if (startIso > MAX_FORECAST_END_ISO || endIso > MAX_FORECAST_END_ISO) {
-    return "Forecast dates after December 2030 are not supported.";
+  const maximum = lastAllowedIso(maximumIso);
+  if (!maximum) {
+    return "The published forecast period is not available.";
+  }
+  if (startIso > maximum || endIso > maximum || (earliestIso && endIso < earliestIso)) {
+    return `Forecast dates must be from ${monthYearPlain(earliestIso)} through ${monthYearPlain(maximum)}.`;
   }
   return "";
 }
@@ -144,7 +138,7 @@ export function periodTypeHelp(periodType) {
     return "Forecast one selected month after the model history end.";
   }
   if (periodType === PERIOD_TYPE.REMAINING_YEAR) {
-    return "Forecast every remaining month of the selected year, through December.";
+    return "Forecast every month after the latest stored actual through December of that same year.";
   }
   if (periodType === PERIOD_TYPE.FINANCIAL_YEARS) {
     return "Forecast complete January–December financial years.";
@@ -194,10 +188,10 @@ export function formatSelectedPeriodDisplay(startIso, endIso) {
   return `${monthYearPlain(startIso)} – ${monthYearPlain(endIso)}`;
 }
 
-export function compactPeriodHelp({ startIso, endIso, earliestIso }) {
+export function compactPeriodHelp({ startIso, endIso, earliestIso, maximumIso }) {
   const forecast = formatCompactPeriodRange(startIso, endIso);
-  const available = earliestIso && /^\d{4}-\d{2}$/.test(earliestIso)
-    ? `Available from ${monthYearPlain(earliestIso)}`
+  const available = earliestIso && lastAllowedIso(maximumIso)
+    ? `Available forecast period: ${formatCompactPeriodRange(earliestIso, maximumIso)}`
     : "";
   if (forecast && available) {
     return `Forecasts ${forecast} · ${available}`;
@@ -225,13 +219,90 @@ export function remainingMonthsOfYear(year, earliestIso) {
   return { startIso, endIso: yearEnd };
 }
 
-export function remainingYearOptions(earliestIso, futureYears = FUTURE_YEAR_COUNT, maxHorizon = MAX_FORECAST_MONTHS) {
-  return yearOptions(earliestIso, futureYears).filter((year) => {
+/**
+ * Remaining months of the year: month after the latest stored actual through
+ * December of that same year. Does not invent a period when metadata is missing.
+ */
+export function remainingMonthsFromLatestActual(latestActualIso, { earliestIso = "", maximumIso = "" } = {}) {
+  if (!/^\d{4}-\d{2}$/.test(latestActualIso || "")) {
+    return {
+      available: false,
+      reason: "missing",
+      startIso: "",
+      endIso: "",
+      latestActualIso: "",
+      message: "Remaining months cannot be derived until the latest stored actual month is available.",
+    };
+  }
+  const { year, month } = splitIsoMonth(latestActualIso);
+  const monthNumber = Number(month);
+  const yearNumber = Number(year);
+  if (monthNumber === 12) {
+    return {
+      available: false,
+      reason: "december",
+      startIso: "",
+      endIso: "",
+      latestActualIso,
+      message: `There are no remaining months after ${monthYearPlain(latestActualIso)}. Use Future financial years instead.`,
+    };
+  }
+  const startIso = toIsoMonth(yearNumber, monthNumber + 1);
+  const endIso = toIsoMonth(yearNumber, 12);
+  const span = inclusiveMonthCount(startIso, endIso);
+  if (span < 1 || span > MAX_FORECAST_MONTHS) {
+    return {
+      available: false,
+      reason: "span",
+      startIso,
+      endIso,
+      latestActualIso,
+      message: "The remaining-months period is outside the supported forecast horizon.",
+    };
+  }
+  const maximum = lastAllowedIso(maximumIso);
+  if (earliestIso && (startIso < earliestIso || endIso < earliestIso)) {
+    return {
+      available: false,
+      reason: "model_horizon",
+      startIso,
+      endIso,
+      latestActualIso,
+      message: maximum
+        ? `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model. Choose a period from ${monthYearPlain(earliestIso)} through ${monthYearPlain(maximum)}.`
+        : `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model.`,
+    };
+  }
+  if (maximum && (startIso > maximum || endIso > maximum)) {
+    return {
+      available: false,
+      reason: "model_horizon",
+      startIso,
+      endIso,
+      latestActualIso,
+      message: earliestIso
+        ? `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model. Choose a period from ${monthYearPlain(earliestIso)} through ${monthYearPlain(maximum)}.`
+        : `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model.`,
+    };
+  }
+  return {
+    available: true,
+    reason: "",
+    startIso,
+    endIso,
+    latestActualIso,
+    message: "",
+  };
+}
+
+export function remainingYearOptions(earliestIso, maximumIso) {
+  return yearOptions(earliestIso, maximumIso).filter((year) => {
     const remaining = remainingMonthsOfYear(year, earliestIso);
-    if (!remaining) {
+    if (!remaining || (maximumIso && remaining.endIso > maximumIso)) {
       return false;
     }
-    return inclusiveMonthCount(earliestIso, remaining.endIso) <= Number(maxHorizon);
+    const span = inclusiveMonthCount(remaining.startIso, remaining.endIso);
+    return span >= 1 && span <= MAX_FORECAST_MONTHS;
   });
 }
 
@@ -243,20 +314,20 @@ export function firstCompleteFinancialYear(earliestIso) {
   return Number(month) <= 1 ? Number(year) : Number(year) + 1;
 }
 
-export function lastCompleteFinancialYear(earliestIso, maxHorizon = MAX_FORECAST_MONTHS) {
-  const lastIso = lastAllowedIso(earliestIso, maxHorizon);
+export function lastCompleteFinancialYear(maximumIso) {
+  const lastIso = lastAllowedIso(maximumIso);
   const { year, month } = splitIsoMonth(lastIso);
-  if (!year) {
-    return firstCompleteFinancialYear(earliestIso);
+  if (!year || Number(month) !== 12) {
+    return null;
   }
-  return Number(month) === 12 ? Number(year) : Number(year) - 1;
+  return Number(year);
 }
 
-export function financialYearOptions(earliestIso, maxHorizon = MAX_FORECAST_MONTHS) {
+export function financialYearOptions(earliestIso, maximumIso) {
   const first = firstCompleteFinancialYear(earliestIso);
-  const last = lastCompleteFinancialYear(earliestIso, maxHorizon);
+  const last = lastCompleteFinancialYear(maximumIso);
   if (!first || !last || last < first) {
-    return first ? [first] : [];
+    return [];
   }
   const years = [];
   for (let year = first; year <= last; year += 1) {
@@ -265,8 +336,8 @@ export function financialYearOptions(earliestIso, maxHorizon = MAX_FORECAST_MONT
   return years;
 }
 
-export function financialYearRange(startYear, endYear, earliestIso) {
-  const years = financialYearOptions(earliestIso);
+export function financialYearRange(startYear, endYear, earliestIso, maximumIso) {
+  const years = financialYearOptions(earliestIso, maximumIso);
   const first = years[0];
   const last = years[years.length - 1];
   if (!first) {
@@ -299,39 +370,40 @@ export function resolveForecastPeriod({
   startYear,
   endYear,
   earliestIso,
+  maximumIso,
+  latestActualIso,
   currentStartIso,
   currentEndIso,
 }) {
   const startParts = splitIsoMonth(currentStartIso || earliestIso);
   const endParts = splitIsoMonth(currentEndIso || currentStartIso || earliestIso);
+  const maximum = lastAllowedIso(maximumIso);
   if (periodType === PERIOD_TYPE.SPECIFIC_MONTH) {
     const iso = clampIsoToMinimum(
       year || startParts.year,
       month || startParts.month || "01",
       earliestIso,
-      lastAllowedIso(earliestIso)
+      maximum
     );
     return { startIso: iso, endIso: iso };
   }
   if (periodType === PERIOD_TYPE.REMAINING_YEAR) {
-    const options = remainingYearOptions(earliestIso);
-    let selectedYear = Number(year || startParts.year);
-    if (!options.includes(selectedYear)) {
-      selectedYear = options[0];
+    const remaining = remainingMonthsFromLatestActual(latestActualIso, {
+      earliestIso,
+      maximumIso: maximum,
+    });
+    if (remaining.available) {
+      return { startIso: remaining.startIso, endIso: remaining.endIso };
     }
-    const remaining = remainingMonthsOfYear(selectedYear, earliestIso);
-    if (remaining) {
-      return remaining;
-    }
-    return { startIso: earliestIso, endIso: defaultEndIso(earliestIso) };
+    return { startIso: "", endIso: "" };
   }
   if (periodType === PERIOD_TYPE.FINANCIAL_YEARS) {
     return (
-      financialYearRange(startYear || startParts.year, endYear || endParts.year, earliestIso)
-      || { startIso: earliestIso, endIso: defaultEndIso(earliestIso) }
+      financialYearRange(startYear || startParts.year, endYear || endParts.year, earliestIso, maximum)
+      || { startIso: "", endIso: "" }
     );
   }
-  return { startIso: earliestIso, endIso: defaultEndIso(earliestIso) };
+  return { startIso: "", endIso: "" };
 }
 
 export function validatePeriodTypeSelection({
@@ -340,30 +412,39 @@ export function validatePeriodTypeSelection({
   endIso,
   earliestIso,
   historyEnd,
+  maximumIso,
+  latestActualIso,
 }) {
+  if (!periodType) {
+    return "Forecast period type is required.";
+  }
+  if (periodType === PERIOD_TYPE.REMAINING_YEAR) {
+    const remaining = remainingMonthsFromLatestActual(latestActualIso, {
+      earliestIso,
+      maximumIso,
+    });
+    if (!remaining.available) {
+      return remaining.message;
+    }
+    if (remaining.startIso !== startIso || remaining.endIso !== endIso) {
+      return `Remaining months must be ${formatSelectedPeriodDisplay(remaining.startIso, remaining.endIso)} based on the latest stored actual (${monthYearPlain(latestActualIso)}).`;
+    }
+  }
   const periodMessage = validateForecastPeriod({
     startIso,
     endIso,
     earliestIso,
     historyEnd,
+    maximumIso,
   });
   if (periodMessage) {
     return periodMessage;
   }
-  if (!periodType) {
-    return "Forecast period type is required.";
-  }
   if (periodType === PERIOD_TYPE.SPECIFIC_MONTH && startIso !== endIso) {
     return "A specific future month must have the same start and end month.";
   }
-  if (periodType === PERIOD_TYPE.REMAINING_YEAR) {
-    const expected = remainingMonthsOfYear(startIso.slice(0, 4), earliestIso);
-    if (!expected || expected.startIso !== startIso || expected.endIso !== endIso) {
-      return "Remaining months must run from the first valid month through December of the selected year.";
-    }
-  }
   if (periodType === PERIOD_TYPE.FINANCIAL_YEARS) {
-    const expected = financialYearRange(startIso.slice(0, 4), endIso.slice(0, 4), earliestIso);
+    const expected = financialYearRange(startIso.slice(0, 4), endIso.slice(0, 4), earliestIso, maximumIso);
     if (!expected || expected.startIso !== startIso || expected.endIso !== endIso) {
       return "Future financial years must be complete January–December years after the current partial year.";
     }

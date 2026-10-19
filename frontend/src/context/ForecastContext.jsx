@@ -1,71 +1,162 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { generateForecast, getHealth } from "../api/forecastApi";
+import { getDatasetSummary } from "../api/datasetApi";
 import { ALL_CATEGORIES_ID, ALL_CATEGORIES_LABEL, requestCategoryValue } from "../utils/forecastCategory";
 import { inclusiveMonthCount } from "../utils/months";
 import {
-  MAX_FORECAST_END_ISO,
   MAX_FORECAST_MONTHS,
   PERIOD_TYPE,
-  defaultEndIso,
   firstValidForecastIso,
+  monthYearPlain,
+  remainingMonthsFromLatestActual,
+  resolveForecastPeriod,
   validatePeriodTypeSelection,
 } from "../utils/forecastPeriod";
 
 const ForecastContext = createContext(null);
 
+function pickLatestActualMonth(summary) {
+  const available = summary?.latest_available_month;
+  if (/^\d{4}-\d{2}$/.test(available || "")) {
+    return available;
+  }
+  const latest = summary?.latest_month;
+  if (/^\d{4}-\d{2}$/.test(latest || "")) {
+    return latest;
+  }
+  return "";
+}
+
 export function ForecastProvider({ children, enabled = true }) {
   const [health, setHealth] = useState(null);
+  const [latestActualMonth, setLatestActualMonth] = useState("");
+  const [historyMetaLoading, setHistoryMetaLoading] = useState(enabled);
+  const [boundsLoading, setBoundsLoading] = useState(enabled);
+  const [boundsError, setBoundsError] = useState("");
   const [periodType, setPeriodType] = useState(PERIOD_TYPE.REMAINING_YEAR);
   const [category, setCategory] = useState({ id: ALL_CATEGORIES_ID, name: ALL_CATEGORIES_LABEL });
-  const [startMonth, setStartMonth] = useState("2026-07");
-  const [endMonth, setEndMonth] = useState("2026-12");
+  const [startMonth, setStartMonth] = useState("");
+  const [endMonth, setEndMonth] = useState("");
   const [forecast, setForecast] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [validation, setValidation] = useState("");
   const requestIdRef = useRef(0);
+  const selectionRef = useRef({ startMonth: "", endMonth: "", periodType: PERIOD_TYPE.REMAINING_YEAR });
+  selectionRef.current = { startMonth, endMonth, periodType };
 
-  const earliestMonth = useMemo(
-    () => firstValidForecastIso(health?.history_end),
-    [health]
-  );
+  const earliestMonth = health?.min_forecast_month || firstValidForecastIso(health?.history_end) || "";
+  const maximumMonth = health?.max_forecast_end || "";
 
-  useEffect(() => {
-    if (!enabled) {
-      return undefined;
+  const applyDefaultPeriod = useCallback((minimum, maximum, latestActual, preferredType) => {
+    const remaining = remainingMonthsFromLatestActual(latestActual, {
+      earliestIso: minimum,
+      maximumIso: maximum,
+    });
+    let nextType = preferredType || PERIOD_TYPE.REMAINING_YEAR;
+    if (nextType === PERIOD_TYPE.REMAINING_YEAR && !remaining.available) {
+      nextType = PERIOD_TYPE.FINANCIAL_YEARS;
     }
-    let cancelled = false;
-    async function bootstrap() {
-      try {
-        const healthResponse = await getHealth();
-        if (cancelled) {
+    const resolved = resolveForecastPeriod({
+      periodType: nextType,
+      earliestIso: minimum,
+      maximumIso: maximum,
+      latestActualIso: latestActual,
+    });
+    setPeriodType(nextType);
+    setStartMonth(resolved.startIso || "");
+    setEndMonth(resolved.endIso || "");
+    if (nextType === PERIOD_TYPE.REMAINING_YEAR && !remaining.available) {
+      setValidation(remaining.message);
+    } else {
+      setValidation("");
+    }
+  }, []);
+
+  const refreshBounds = useCallback(async () => {
+    if (!enabled) {
+      setBoundsLoading(false);
+      setHistoryMetaLoading(false);
+      return;
+    }
+    setBoundsLoading(true);
+    setHistoryMetaLoading(true);
+    try {
+      const [healthResponse, summary] = await Promise.all([
+        getHealth(),
+        getDatasetSummary().catch(() => null),
+      ]);
+      const minimum = healthResponse.min_forecast_month || firstValidForecastIso(healthResponse.history_end) || "";
+      const maximum = healthResponse.max_forecast_end || "";
+      const latestActual = pickLatestActualMonth(summary);
+      const problem = healthResponse.forecast_bounds_error
+        || (!healthResponse.model_loaded
+          ? "The forecast model is not loaded."
+          : (!minimum || !maximum ? "The published model did not provide a forecast period." : ""));
+      setHealth(healthResponse);
+      setLatestActualMonth(latestActual);
+      setHistoryMetaLoading(false);
+      if (problem) {
+        setBoundsError(problem);
+        return;
+      }
+      setBoundsError("");
+      setError("");
+      const current = selectionRef.current;
+      if (!current.startMonth || !current.endMonth) {
+        applyDefaultPeriod(minimum, maximum, latestActual, current.periodType);
+        return;
+      }
+      if (current.periodType === PERIOD_TYPE.REMAINING_YEAR) {
+        const remaining = remainingMonthsFromLatestActual(latestActual, {
+          earliestIso: minimum,
+          maximumIso: maximum,
+        });
+        if (!remaining.available) {
+          setStartMonth("");
+          setEndMonth("");
+          setValidation(remaining.message);
           return;
         }
-        setHealth(healthResponse);
-        setError("");
-        const nextEarliest = firstValidForecastIso(healthResponse.history_end);
-        setPeriodType(PERIOD_TYPE.REMAINING_YEAR);
-        setStartMonth(nextEarliest);
-        setEndMonth(defaultEndIso(nextEarliest));
-      } catch (cause) {
-        if (!cancelled) {
-          setError(cause.message || "Unable to reach the forecast service.");
-        }
+        setStartMonth(remaining.startIso);
+        setEndMonth(remaining.endIso);
+        setValidation("");
+        return;
       }
+      if (current.startMonth < minimum || current.endMonth > maximum || current.startMonth > maximum) {
+        setValidation(
+          `The selected forecast period is outside the published model range. Choose a period from ${monthYearPlain(minimum)} through ${monthYearPlain(maximum)}.`
+        );
+        return;
+      }
+      setValidation("");
+    } catch (cause) {
+      setBoundsError(cause.message || "Unable to load the forecast period.");
+      setHistoryMetaLoading(false);
+    } finally {
+      setBoundsLoading(false);
     }
-    bootstrap();
-    return () => {
-      cancelled = true;
-    };
-  }, [enabled]);
+  }, [applyDefaultPeriod, enabled]);
+
+  useEffect(() => {
+    refreshBounds();
+  }, [refreshBounds]);
 
   const validate = useCallback(() => {
+    if (boundsLoading || historyMetaLoading) {
+      return "The forecast period is still loading.";
+    }
+    if (boundsError) {
+      return boundsError;
+    }
     const periodMessage = validatePeriodTypeSelection({
       periodType,
       startIso: startMonth,
       endIso: endMonth,
       earliestIso: earliestMonth,
       historyEnd: health?.history_end,
+      maximumIso: maximumMonth,
+      latestActualIso: latestActualMonth,
     });
     if (periodMessage) {
       return periodMessage;
@@ -78,13 +169,21 @@ export function ForecastProvider({ children, enabled = true }) {
     if (horizonFromOrigin > MAX_FORECAST_MONTHS) {
       return `The selected range exceeds the ${MAX_FORECAST_MONTHS}-month forecast limit.`;
     }
-    if (endMonth > MAX_FORECAST_END_ISO || startMonth > MAX_FORECAST_END_ISO) {
-      return "Forecast dates after December 2030 are not supported.";
-    }
     return "";
-  }, [earliestMonth, endMonth, health?.history_end, periodType, startMonth]);
+  }, [
+    boundsError,
+    boundsLoading,
+    earliestMonth,
+    endMonth,
+    health?.history_end,
+    historyMetaLoading,
+    latestActualMonth,
+    maximumMonth,
+    periodType,
+    startMonth,
+  ]);
 
-  const canSubmit = !validate();
+  const canSubmit = !boundsLoading && !historyMetaLoading && !boundsError && !validate();
 
   const runForecast = useCallback(async () => {
     const message = validate();
@@ -100,6 +199,7 @@ export function ForecastProvider({ children, enabled = true }) {
       const result = await generateForecast({
         start_month: startMonth,
         end_month: endMonth,
+        period_type: periodType,
         category: requestCategoryValue(category),
       });
       if (requestId === requestIdRef.current) {
@@ -116,7 +216,7 @@ export function ForecastProvider({ children, enabled = true }) {
         setLoading(false);
       }
     }
-  }, [category, endMonth, startMonth, validate]);
+  }, [category, endMonth, periodType, startMonth, validate]);
 
   const applyForecast = useCallback((result) => {
     setForecast(result);
@@ -143,10 +243,17 @@ export function ForecastProvider({ children, enabled = true }) {
     endMonth,
     setEndMonth,
     earliestMonth,
+    maximumMonth,
+    latestActualMonth,
+    historyMetaLoading,
+    boundsLoading,
+    boundsError,
+    refreshBounds,
     forecast,
     loading,
     error,
     validation,
+    setValidation,
     canSubmit,
     runForecast,
     applyForecast,

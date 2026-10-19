@@ -10,10 +10,10 @@ export default defineConfig({
   envDir: path.resolve(rootDir, ".."),
   server: {
     host: "localhost",
-    port: 5174,
+    port: 3003,
     strictPort: true,
     proxy: {
-      "/api": "http://localhost:8000",
+      "/api": "http://localhost:8003",
     },
   },
 });

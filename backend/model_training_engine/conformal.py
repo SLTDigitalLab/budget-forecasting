@@ -8,6 +8,8 @@ from preprocessing import (
     DEFAULT_MAX_INTERNAL_GAP,
     KIND_NUMBER,
     OUTCOME_READY,
+    apply_same_year_positive_means,
+    fit_same_year_positive_means,
     prepare_series_window,
 )
 
@@ -150,7 +152,7 @@ def _target_observed(raw_value, kind=None) -> bool:
         return False
 
 
-def _prepare_origin_window(values, kinds, interpolate: bool, max_internal_gap: int):
+def _prepare_origin_window(values, kinds, interpolate: bool, max_internal_gap: int, months=None):
     array = np.asarray(values, dtype=float)
     if kinds:
         kind_row = np.asarray(kinds, dtype=object)
@@ -162,8 +164,8 @@ def _prepare_origin_window(values, kinds, interpolate: bool, max_internal_gap: i
         kind_row,
         interpolate=bool(interpolate),
         max_internal_gap=int(max_internal_gap),
+        months=months,
     )
-    del interpolate, max_internal_gap
     return prepared, methods, outcome, reason
 
 
@@ -249,6 +251,7 @@ def calibrate_conformal_prediction(
                         origin_kinds,
                         interpolate=code in interpolate_set,
                         max_internal_gap=max_internal_gap,
+                        months=origin_months,
                     )
                 if outcome != OUTCOME_READY:
                     raise AssertionError(reason or outcome)
@@ -284,6 +287,12 @@ def calibrate_conformal_prediction(
                     "reason": f"{type(error).__name__}: {error}",
                 })
                 continue
+            origin_kind_row = (
+                np.asarray(origin_kinds, dtype=object)
+                if origin_kinds
+                else np.where(np.isfinite(np.asarray(origin_values, dtype=float)), KIND_NUMBER, "missing").astype(object)
+            )
+            year_means = fit_same_year_positive_means(origin_values, origin_months, origin_kind_row)
             for horizon in range(1, steps + 1):
                 if horizon not in account_scores[code]:
                     continue
@@ -299,8 +308,24 @@ def calibrate_conformal_prediction(
                         "reason": "Missing or invalid observed calibration target.",
                     })
                     continue
+                target_kind = kind if kind is not None else KIND_NUMBER
+                transformed, diagnostics = apply_same_year_positive_means(
+                    [actual],
+                    [target_date],
+                    year_means,
+                    [target_kind],
+                )
+                if diagnostics["unresolved_count"]:
+                    failures.append({
+                        "account_code": code,
+                        "origin": origin_date,
+                        "horizon": horizon,
+                        "reason": "Unresolved negative calibration target under train-only year means.",
+                    })
+                    continue
+                scored_actual = float(transformed[0])
                 try:
-                    score = nonconformity_score(actual, predicted[horizon - 1])
+                    score = nonconformity_score(scored_actual, predicted[horizon - 1])
                 except Exception as error:
                     failures.append({
                         "account_code": code,
@@ -313,7 +338,7 @@ def calibrate_conformal_prediction(
                 key = (str(origin_date), str(target_date))
                 origin_records.setdefault(key, {})[code] = {
                     "horizon": horizon,
-                    "actual": float(actual),
+                    "actual": scored_actual,
                     "prediction": float(predicted[horizon - 1]),
                     "score": score,
                 }

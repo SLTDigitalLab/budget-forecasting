@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import functools
 import io
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,7 @@ from fastapi import HTTPException, status
 from openpyxl import load_workbook
 
 from app.config import DATASET_MAX_UPLOAD_BYTES, DATASET_PREVIEW_TTL_SECONDS, ORIGINAL_ACTUALS_PATH
-from app.db import DatabaseError, ensure_forecast_tables
+from app.db import DatabaseError, ensure_forecast_tables, get_connection
 from app.services.dataset_merge import classify_historical_changes, intended_edit_records
 from app.services.dataset_parser import parse_historical_dataset
 from app.services.dataset_workflow import (
@@ -32,6 +33,7 @@ from app.services.dataset_repository import (
     get_dataset_file,
     get_legacy_file_by_checksum,
     get_preview,
+    get_preview_confirmation,
     commit_master_state,
     get_audit_event,
     historical_summary,
@@ -57,6 +59,8 @@ from app.services.dataset_storage import (
 )
 from app.services.dataset_storage import resolve_stored_path
 from app.services.system_lock import mutation_scope
+
+logger = logging.getLogger(__name__)
 
 
 def _guard_dataset_mutation(func):
@@ -91,7 +95,7 @@ def _suffix(filename: str) -> str:
 
 def _guard_upload(filename: str, data: bytes) -> None:
     if len(data) > DATASET_MAX_UPLOAD_BYTES:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "The dataset is larger than the 15 MB upload limit.")
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "The dataset is larger than the 20 MB upload limit.")
     suffix = _suffix(filename)
     if suffix not in {".xlsx", ".xlsm", ".csv"}:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only .xlsx and .csv files are supported.")
@@ -179,12 +183,16 @@ def preview_upload(filename: str, data: bytes, sheet_name: str | None, actor=Non
                 budget_codes=state["budget_codes"],
                 earliest_month=state["earliest_month"],
                 latest_month=state["latest_month"],
+                declarations=state.get("declarations") or [],
             )
             analysis["master_source"] = master_source
             classification = _classification_from_analysis(analysis)
         payload = _preview_payload(parsed, classification)
         if analysis is not None:
             payload.update(_public_analysis(analysis, parsed.get("errors") or []))
+            omitted_formulas = int(parsed.get("omitted_formula_cells") or 0)
+            if omitted_formulas and isinstance(payload.get("summary"), dict):
+                payload["summary"]["unresolved_formula_cells"] = omitted_formulas
         stored_preview_name = stored_name(str(uuid.uuid4()), filename)
         preview_file = resolve_stored_path(stored_preview_name).with_name(f".preview-{stored_preview_name}")
         write_bytes_atomically(preview_file, data)
@@ -220,6 +228,32 @@ def preview_upload(filename: str, data: bytes, sheet_name: str | None, actor=Non
             temp.unlink()
 
 
+def committed_upload_result(preview_id: str) -> dict[str, Any] | None:
+    row = get_preview_confirmation(preview_id)
+    if not row or row.get("status") != "committed":
+        return None
+    result = dict(row.get("result") or {})
+    result["file_id"] = str(row.get("file_id") or result.get("file_id") or "")
+    result["idempotent"] = True
+    return result
+
+
+def preview_confirmation_status(preview_id: str) -> dict[str, Any]:
+    preview_id = str(preview_id or "").strip()
+    if not preview_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A validation preview is required.")
+    committed = committed_upload_result(preview_id)
+    if committed:
+        return {"status": "committed", "file_id": committed.get("file_id"), "result": committed}
+    try:
+        _load_preview(preview_id)
+    except HTTPException as error:
+        if error.status_code == status.HTTP_404_NOT_FOUND:
+            return {"status": "unknown", "file_id": None, "result": None}
+        raise
+    return {"status": "not_committed", "file_id": None, "result": None}
+
+
 def _load_preview(preview_id: str) -> dict[str, Any]:
     preview = get_preview(preview_id)
     if preview is None:
@@ -233,9 +267,13 @@ def _load_preview(preview_id: str) -> dict[str, Any]:
 
 @_guard_dataset_mutation
 def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=None) -> dict[str, Any]:
+    """Save a validated dataset. Does not reset or extend the Book Entry registry."""
     preview_id = str(preview_id or "").strip()
     if not preview_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "A validation preview is required.")
+    already_saved = committed_upload_result(preview_id)
+    if already_saved:
+        return already_saved
     name, email, actor_tid, actor_oid = _actor(body, actor)
     preview = _load_preview(preview_id)
     payload = dict(preview.get("payload") or {})
@@ -261,6 +299,7 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
         budget_codes=state["budget_codes"],
         earliest_month=state["earliest_month"],
         latest_month=state["latest_month"],
+        declarations=state.get("declarations") or [],
     )
     structural = _structural_errors(payload.get("structural_errors") or [])
     if structural or not analysis["can_confirm"]:
@@ -274,6 +313,12 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
     stored_filename = stored_name(file_id, preview["original_filename"])
     now = _utc_now()
     next_state = next_master_state(state, analysis["changes"])
+    from app.services.submission_state import MasterTransitionError, assert_transition_preserves_master
+
+    try:
+        assert_transition_preserves_master(state, next_state, analysis["changes"])
+    except MasterTransitionError as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(error)) from error
     next_state["records"] = _stamp_source(next_state["records"], analysis["changes"], file_id, master_records)
     next_records = next_state["records"]
     file_row = _upload_file_row(
@@ -291,6 +336,16 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
         tid=actor_tid,
         oid=actor_oid,
     )
+    summary = analysis["summary"]
+    result = {
+        "file_id": file_id,
+        "inserted": summary["new_values"],
+        "changed": summary["updated_values"],
+        "unchanged": summary["unchanged_values"],
+        "message": "Historical dataset updated successfully. Trained forecast models were not updated.",
+        "models_retrained": False,
+        "idempotent": False,
+    }
     archive_written = False
     prepared_master = None
     try:
@@ -303,6 +358,7 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
             file_row=file_row,
             audit=audit,
             changes=analysis["changes"],
+            confirmation={"preview_id": preview_id, "file_id": file_id, "message": result["message"], "result": result},
             **_identity_kwargs(next_state),
         )
     except DatasetConflictError as error:
@@ -334,15 +390,7 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
         delete_preview(preview_id)
         cleanup_temp_files()
         _invalidate_overview()
-    summary = analysis["summary"]
-    return {
-        "file_id": file_id,
-        "inserted": summary["new_values"],
-        "changed": summary["updated_values"],
-        "unchanged": summary["unchanged_values"],
-        "message": "Historical dataset updated successfully. Trained forecast models were not updated.",
-        "models_retrained": False,
-    }
+    return result
 
 
 def _invalidate_overview() -> None:
@@ -355,10 +403,15 @@ def _invalidate_overview() -> None:
 
 
 def _structural_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from app.services.submission_state import SUPPLIED_CELL_MESSAGE
+
     kept = []
     for error in errors:
-        message = str(error.get("message") or "").lower()
-        if any(token in message for token in ("formula", "header", "column", "sheet", "ambiguous", "missing a budget code")):
+        message = str(error.get("message") or "")
+        if SUPPLIED_CELL_MESSAGE in message:
+            continue
+        lowered = message.lower()
+        if any(token in lowered for token in ("formula", "header", "column", "sheet", "ambiguous", "missing a budget code")):
             kept.append(error)
     return kept
 
@@ -387,6 +440,7 @@ def _public_analysis(analysis: dict[str, Any], errors: list[dict[str, Any]]) -> 
         "master_version": analysis["master_version"],
         "master_source": analysis.get("master_source"),
         "structural_errors": structural,
+        "errors": analysis.get("cell_errors") or [],
         "new_count": analysis["new_count"],
         "changed_count": analysis["changed_count"],
         "unchanged_count": analysis["unchanged_count"],
@@ -406,6 +460,7 @@ def _identity_kwargs(state: dict[str, Any]) -> dict[str, Any]:
         "budget_codes": state.get("budget_codes") or [],
         "earliest_month": state.get("earliest_month"),
         "latest_month": state.get("latest_month"),
+        "declarations": list(state.get("declarations") or []),
     }
 
 
@@ -415,6 +470,7 @@ def _prepare_from_state(state: dict[str, Any]):
         budget_codes=state.get("budget_codes") or [],
         earliest_month=state.get("earliest_month"),
         latest_month=state.get("latest_month"),
+        declarations=state.get("declarations") or [],
     )
 
 
@@ -536,6 +592,7 @@ def stage_upload(preview_id: str, body: dict[str, Any]) -> dict[str, Any]:
         budget_codes=state["budget_codes"],
         earliest_month=state["earliest_month"],
         latest_month=state["latest_month"],
+        declarations=state.get("declarations") or [],
     )
     analysis["master_source"] = master_source
     public = _public_analysis(analysis, payload.get("structural_errors") or payload.get("errors") or [])
@@ -549,7 +606,21 @@ def stage_upload(preview_id: str, body: dict[str, Any]) -> dict[str, Any]:
     return {"preview_id": str(preview["id"]), "expires_at": preview.get("expires_at"), **public, "rows": stored_rows}
 
 
+def _display_amount(value):
+    from app.services.dataset_master import _import_engine
+
+    _import_engine()
+    from preprocessing import display_historical_actual
+
+    return display_historical_actual(value)
+
+
 def master_dataset(page: int, page_size: int, search: str | None, revision_filter: str | None, highlight: str | None) -> dict[str, Any]:
+    from app.services.dataset_master import _import_engine
+
+    _import_engine()
+    from preprocessing import ACTUALS_DISPLAY_LABEL
+
     state = load_master_state()
     records, version, source = state["records"], state["version"], state["source"]
     highlights = _highlight_map(highlight)
@@ -570,7 +641,10 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
                 "description": item.get("description") or "",
                 "category": item.get("category") or "",
                 "amounts": {},
+                "display_amounts": {},
+                "raw_amounts": {},
                 "highlights": {},
+                "submissions": {},
             },
         )
     for item in records:
@@ -585,15 +659,27 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
                 "category": item.get("category") or "",
                 "amounts": {},
                 "highlights": {},
+                "submissions": {},
             },
         )
         row["amounts"][month] = item.get("amount")
+        row.setdefault("display_amounts", {})[month] = _display_amount(item.get("amount"))
+        row.setdefault("raw_amounts", {})[month] = item.get("amount")
         if item.get("description"):
             row["description"] = item["description"]
         if item.get("category"):
             row["category"] = item["category"]
         if (code, month) in highlights:
             row["highlights"][month] = highlights[(code, month)]
+    declared = {(str(item.get("budget_code")), str(item.get("month"))) for item in (state.get("declarations") or [])}
+    for code, row in grouped.items():
+        submissions = {}
+        for item_code, month in declared:
+            if item_code != code or row["amounts"].get(month) is not None:
+                continue
+            submissions[month] = "declared_missing"
+            months.add(month)
+        row["submissions"] = submissions
     ordered_months = inclusive_months(state.get("earliest_month"), state.get("latest_month"), sorted(months))
     rows = list(grouped.values())
     needle = (search or "").strip().casefold()
@@ -607,7 +693,14 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
     elif mode == "updated":
         rows = [row for row in rows if any(value == "updated" for value in row["highlights"].values())]
     elif mode == "missing":
-        rows = [row for row in rows if any(row["amounts"].get(month) is None for month in ordered_months)]
+        rows = [
+            row
+            for row in rows
+            if any(
+                row["amounts"].get(month) is None and row.get("submissions", {}).get(month) != "declared_missing"
+                for month in ordered_months
+            )
+        ]
     rows.sort(key=lambda item: item["budget_code"])
     size = max(1, min(int(page_size), 50))
     current = max(1, int(page))
@@ -624,6 +717,7 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
         "earliest_month": earliest,
         "latest_month": latest,
         "models_retrained": False,
+        "actuals_display_label": ACTUALS_DISPLAY_LABEL,
     }
 
 
@@ -655,6 +749,7 @@ def preview_manual_edits(body: dict[str, Any]) -> dict[str, Any]:
         records,
         master_version=version,
         budget_codes=state["budget_codes"],
+        declarations=state.get("declarations") or [],
     )
     plan["data_source"] = source
     plan["models_retrained"] = False
@@ -673,6 +768,7 @@ def confirm_manual_edits(body: dict[str, Any], actor=None) -> dict[str, Any]:
         records,
         master_version=version,
         budget_codes=state["budget_codes"],
+        declarations=state.get("declarations") or [],
     )
     if not plan["can_confirm"]:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, plan["errors"][0] if plan["errors"] else "No valid master changes were submitted.")
@@ -767,8 +863,9 @@ def preview_rollback(revision_id: str, body: dict[str, Any]) -> dict[str, Any]:
     if record.get("status") == "rolled_back":
         raise HTTPException(status.HTTP_409_CONFLICT, "This upload has already been rolled back.")
     changes = [item for item in list_change_records_for_file(str(record["id"])) if str(item.get("action")) == "UPLOAD" and not item.get("reversed_by_audit_id")]
-    records, version, _source = load_master_records()
-    plan = plan_rollback(changes, records)
+    state = load_master_state()
+    records, version = state["records"], state["version"]
+    plan = plan_rollback(changes, records, state.get("declarations") or [])
     plan["master_version"] = version
     plan["reason"] = reason
     plan["file_name"] = record["original_filename"]
@@ -881,10 +978,18 @@ def _summary_from_loaded_workbook(workbook: dict[str, Any]) -> dict[str, Any] | 
     return payload
 
 
+def _coverage_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.services.dataset_master import load_master_state
+    from app.services.submission_state import coverage_fields, coverage_report
+
+    report = coverage_report(load_master_state())
+    return {**payload, **coverage_fields(report)}
+
+
 def summary() -> dict[str, Any]:
     stored = historical_summary()
     if not stored.get("empty"):
-        return {**stored, "data_source": "database"}
+        return _coverage_summary({**stored, "data_source": "database"})
     try:
         from app.routers.overview import OverviewDataError, _load_workbook
 
@@ -896,7 +1001,7 @@ def summary() -> dict[str, Any]:
         return {**stored, "data_source": None}
     if derived["data_source"] == "database":
         derived["last_upload_at"] = stored.get("last_upload_at")
-    return derived
+    return _coverage_summary(derived)
 
 
 def list_files(page: int, page_size: int) -> dict[str, Any]:
@@ -1159,7 +1264,11 @@ def _apply_csv_edits(data: bytes, parsed: dict[str, Any], edits: list[dict[str, 
 
 
 def import_legacy_workbook() -> dict[str, Any]:
+    from app.services.dataset_repository import has_baseline_migration
+
     ensure_forecast_tables()
+    if has_baseline_migration():
+        return {"imported": False, "reason": "The original baseline migration is already recorded."}
     path = Path(ORIGINAL_ACTUALS_PATH)
     if not path.exists():
         return {"imported": False, "reason": "No existing historical workbook was found at ORIGINAL_ACTUALS_PATH."}
@@ -1168,10 +1277,10 @@ def import_legacy_workbook() -> dict[str, Any]:
     existing = get_legacy_file_by_checksum(checksum)
     if existing:
         return {"imported": False, "reason": "The existing historical workbook is already registered.", "file_id": str(existing["id"])}
-    parsed = parse_historical_dataset(path, path.name, None)
+    parsed = parse_historical_dataset(path, path.name, None, strict_supplied_cells=False)
     if parsed.get("needs_sheet_selection"):
         first = (parsed.get("sheets") or [{}])[0].get("sheet")
-        parsed = parse_historical_dataset(path, path.name, first)
+        parsed = parse_historical_dataset(path, path.name, first, strict_supplied_cells=False)
     if not parsed.get("can_confirm"):
         return {"imported": False, "reason": "The existing workbook could not be validated for import."}
     classification = classify_historical_changes(parsed["rows"], list_historical_actuals())
@@ -1215,3 +1324,639 @@ def import_legacy_workbook() -> dict[str, Any]:
     replace_current_file(stored_filename, data)
     _invalidate_overview()
     return {"imported": True, "file_id": file_id, "inserted": classification["new_count"]}
+
+
+def migrate_original_baseline() -> dict[str, Any]:
+    """Apply the one-time blank-as-declared rule to the original baseline workbook only."""
+    from app.services.dataset_master import (
+        authoritative_workbook_path,
+        extract_original_baseline,
+        prepare_managed_master,
+        publish_managed_master,
+    )
+    from app.services.dataset_repository import commit_master_state, get_baseline_migration, list_touched_submission_pairs
+    from app.services.retrain_state import SystemLocked
+    from app.services.submission_state import (
+        BASELINE_MIGRATION_REASON,
+        MasterTransitionError,
+        assert_transition_preserves_master,
+        plan_original_baseline,
+    )
+
+    path = authoritative_workbook_path()
+    data = path.read_bytes()
+    digest = file_checksum(data)
+    ensure_forecast_tables()
+    existing = get_baseline_migration(digest)
+    if existing:
+        return {
+            "already_applied": True,
+            "changed": False,
+            "baseline_hash": digest,
+            "declaration_count": existing["declaration_count"],
+            "numeric_count": existing["numeric_count"],
+            "budget_code_count": existing["budget_code_count"],
+            "scope_start": existing["scope_start"],
+            "scope_end": existing["scope_end"],
+            "reason": existing["reason"],
+        }
+    try:
+        with mutation_scope("dataset"):
+            existing = get_baseline_migration(digest)
+            if existing:
+                return {
+                    "already_applied": True,
+                    "changed": False,
+                    "baseline_hash": digest,
+                    "declaration_count": existing["declaration_count"],
+                    "numeric_count": existing["numeric_count"],
+                    "budget_code_count": existing["budget_code_count"],
+                    "scope_start": existing["scope_start"],
+                    "scope_end": existing["scope_end"],
+                    "reason": existing["reason"],
+                }
+            state = load_master_state()
+            baseline = extract_original_baseline(path)
+            touched = list_touched_submission_pairs() if state.get("source") == "database" else set()
+            plan = plan_original_baseline(baseline, state, touched)
+            after = {
+                "source": "database",
+                "records": plan["records"],
+                "declarations": plan["declarations"],
+                "budget_codes": plan["budget_codes"],
+                "earliest_month": plan["earliest_month"],
+                "latest_month": plan["latest_month"],
+            }
+            if state.get("source") != "database":
+                assert_transition_preserves_master(state, after, plan["changes"])
+            from app.services.dataset_workflow import same_amount
+
+            before_numbers = {
+                (str(item["budget_code"]), str(item["month"])): float(item["amount"])
+                for item in state.get("records") or []
+                if item.get("budget_code") and item.get("month") and item.get("amount") is not None
+            }
+            after_numbers = {
+                (str(item["budget_code"]), str(item["month"])): float(item["amount"])
+                for item in plan["records"]
+                if item.get("budget_code") and item.get("month") and item.get("amount") is not None
+            }
+            dropped_numbers = [
+                f"{code} {month}"
+                for (code, month), amount in before_numbers.items()
+                if (code, month) not in after_numbers or not same_amount(after_numbers[(code, month)], amount)
+            ]
+            if dropped_numbers:
+                raise MasterTransitionError(
+                    "Baseline migration would change or drop a stored numeric amount "
+                    f"({', '.join(dropped_numbers[:5])})."
+                )
+            file_id = str(uuid.uuid4())
+            now = _utc_now()
+            for item in plan["records"]:
+                item["source_file_id"] = file_id
+            declaration_count = sum(1 for item in plan["changes"] if item["operation"] == "DECLARE_MISSING")
+            stored_filename = stored_name(file_id, path.name)
+            file_row = {
+                "id": file_id,
+                "original_filename": path.name,
+                "stored_filename": stored_filename,
+                "content_type": CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+                "file_size": len(data),
+                "checksum": digest,
+                "sheet_name": "baseline",
+                "revision": 1,
+                "content_hash": digest,
+                "status": "active",
+                "staged_path": None,
+                "is_legacy": True,
+                "uploaded_at": now,
+                "uploaded_tid": "legacy-baseline",
+                "uploaded_oid": "legacy-baseline",
+                "uploaded_display_name": "Legacy baseline migration",
+                "uploaded_username": "",
+                "confirmed_at": now,
+                "confirmed_display_name": "Legacy baseline migration",
+                "confirmed_username": "",
+                "validation_summary": {"reason": BASELINE_MIGRATION_REASON},
+                "change_kind": "legacy_baseline",
+            }
+            audit = {
+                "file_id": file_id,
+                "file_name": path.name,
+                "action": "legacy_baseline",
+                "actor_tid": "legacy-baseline",
+                "actor_oid": "legacy-baseline",
+                "actor_display_name": "Legacy baseline migration",
+                "actor_username": "",
+                "occurred_at": now,
+                "inserted_count": declaration_count,
+                "changed_count": len(plan["changes"]),
+                "changes": [],
+                "reason": BASELINE_MIGRATION_REASON,
+                "summary": {
+                    "baseline_hash": digest,
+                    "declaration_count": declaration_count,
+                    "numeric_count": len(plan["records"]),
+                    "budget_code_count": len(plan["budget_codes"]),
+                    "ambiguous_count": len(plan["ambiguous"]),
+                },
+            }
+            prepared = prepare_managed_master(
+                plan["records"],
+                budget_codes=plan["budget_codes"],
+                earliest_month=plan["earliest_month"],
+                latest_month=plan["latest_month"],
+                declarations=plan["declarations"],
+            )
+            try:
+                replace_current_file(stored_filename, data)
+                result = commit_master_state(
+                    expected_version=int(state.get("version") or 0),
+                    next_records=plan["records"],
+                    file_row=file_row,
+                    audit=audit,
+                    changes=plan["changes"],
+                    budget_codes=plan["budget_codes"],
+                    earliest_month=plan["earliest_month"],
+                    latest_month=plan["latest_month"],
+                    declarations=plan["declarations"],
+                    baseline_migration={
+                        "baseline_hash": digest,
+                        "scope_start": plan["earliest_month"],
+                        "scope_end": plan["latest_month"],
+                        "declaration_count": declaration_count,
+                        "numeric_count": len(plan["records"]),
+                        "budget_code_count": len(plan["budget_codes"]),
+                        "reason": BASELINE_MIGRATION_REASON,
+                        "applied_at": now,
+                    },
+                )
+                try:
+                    publish_managed_master(prepared)
+                    prepared = None
+                except Exception:
+                    logger.exception("Managed workbook publish failed after the baseline migration was saved")
+            finally:
+                if prepared is not None and prepared.exists():
+                    prepared.unlink()
+            _invalidate_overview()
+            return {
+                "already_applied": False,
+                "changed": True,
+                "baseline_hash": digest,
+                "declaration_count": declaration_count,
+                "numeric_count": len(plan["records"]),
+                "budget_code_count": len(plan["budget_codes"]),
+                "scope_start": plan["earliest_month"],
+                "scope_end": plan["latest_month"],
+                "ambiguous_count": len(plan["ambiguous"]),
+                "ambiguous_sample": plan["ambiguous"][:20],
+                "reason": BASELINE_MIGRATION_REASON,
+                "version": result["version"],
+            }
+    except SystemLocked:
+        return {"already_applied": False, "changed": False, "skipped_locked": True, "baseline_hash": digest}
+
+
+def backfill_legacy_hyphen_declarations() -> dict[str, Any]:
+    """Recover stored "-" cells that no later edit has touched.
+
+    Numeric amounts, including accounting-format zeros, are left unchanged.
+    A second call inserts nothing.
+    """
+    from app.services.dataset_master import authoritative_workbook_path, scan_workbook_explicit_hyphens
+    from app.services.dataset_repository import insert_legacy_declarations, list_touched_submission_pairs
+    from app.services.submission_state import plan_legacy_hyphen_backfill
+
+    with mutation_scope("dataset"):
+        state = load_master_state()
+        scanned = scan_workbook_explicit_hyphens(authoritative_workbook_path())
+        plan = plan_legacy_hyphen_backfill(
+            scanned["hyphen_pairs"],
+            records=state.get("records") or [],
+            declarations=state.get("declarations") or [],
+            touched_pairs=list_touched_submission_pairs() if state.get("source") == "database" else set(),
+        )
+        report = {
+            "recovered": [],
+            "already_declared": plan["already_declared"],
+            "ambiguous": plan["ambiguous"],
+            "numeric_zero_dash_format": scanned["numeric_zero_dash_format"],
+            "version": state.get("version"),
+        }
+        if not plan["recover"] or state.get("source") != "database":
+            report["recovered_count"] = 0
+            return report
+        now = _utc_now()
+        result = insert_legacy_declarations(
+            expected_version=int(state.get("version") or 0),
+            declarations=plan["recover"],
+            audit={
+                "file_id": None,
+                "file_name": "historical_actuals_master.xlsx",
+                "action": "legacy_missing_backfill",
+                "actor_tid": "legacy-backfill",
+                "actor_oid": "legacy-backfill",
+                "actor_display_name": "Legacy declaration backfill",
+                "actor_username": "",
+                "occurred_at": now,
+                "reason": "Recover explicit hyphen cells that were not submitted as missing.",
+                "summary": {
+                    "ambiguous_count": len(plan["ambiguous"]),
+                    "already_declared_count": len(plan["already_declared"]),
+                },
+            },
+            changes=[
+                {
+                    "operation": "DECLARE_MISSING",
+                    "budget_code": item["budget_code"],
+                    "month": item["month"],
+                    "previous_amount": None,
+                    "new_amount": None,
+                    "previous_submission": "absent",
+                    "new_submission": "declared_missing",
+                }
+                for item in plan["recover"]
+            ],
+        )
+        _invalidate_overview()
+        report["recovered"] = result["inserted"]
+        report["recovered_count"] = len(result["inserted"])
+        report["version"] = result["version"]
+        return report
+
+
+def normalize_budget_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if not text.isdigit() or len(text) > 12:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Enter a numeric Budget Code.")
+    return text
+
+
+def resolve_book_entry_fields(name: Any, category: Any, master: dict[str, str] | None) -> tuple[str, str]:
+    """Use the master identity when the code exists. Otherwise keep the entered values."""
+    requested_name = str(name or "").strip()
+    requested_category = str(category or "").strip()
+    if master:
+        authoritative_name = str(master.get("budget_name") or "").strip()
+        authoritative_category = str(master.get("category") or "").strip()
+        if requested_name and requested_name != authoritative_name:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Budget Code Name must match the master dataset for this Budget Code.",
+            )
+        if requested_category and requested_category != authoritative_category:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Category must match the master dataset for this Budget Code.",
+            )
+        return authoritative_name, authoritative_category
+    if not requested_name or not requested_category:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Enter a Budget Code Name and Category. This Budget Code is not in the master dataset.",
+        )
+    return requested_name, requested_category
+
+
+def _master_identity(connection, budget_code: str) -> dict[str, str] | None:
+    row = connection.execute(
+        """
+        SELECT description AS budget_name, category
+        FROM historical_actuals
+        WHERE budget_code = %s
+          AND description IS NOT NULL
+          AND description <> ''
+        ORDER BY month DESC
+        LIMIT 1
+        """,
+        (budget_code,),
+    ).fetchone()
+    if not row:
+        return None
+    return {"budget_name": str(row["budget_name"] or ""), "category": str(row["category"] or "")}
+
+
+def _book_entry_record(row) -> dict[str, Any]:
+    updated_at = row["updated_at"]
+    return {
+        "budget_code": row["budget_code"],
+        "budget_name": row["budget_name"],
+        "category": row["category"],
+        "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
+        "updated_by": row["updated_by"],
+    }
+
+
+def _registry_rows(connection) -> list[dict[str, str]]:
+    rows = connection.execute(
+        """
+        SELECT budget_code, budget_name
+        FROM book_entry_accounts
+        ORDER BY budget_code
+        """
+    ).fetchall()
+    return [{"budget_code": row["budget_code"], "budget_name": row["budget_name"]} for row in rows]
+
+
+def _import_preprocessing():
+    import sys
+
+    from app.config import BACKEND_DIR
+
+    engine = BACKEND_DIR / "model_training_engine"
+    if str(engine) not in sys.path:
+        sys.path.insert(0, str(engine))
+
+
+def _run_book_entry_change(mutator):
+    """Apply a registry change and roll it back when the workbook cannot be saved."""
+    _import_preprocessing()
+    from preprocessing import book_entry_workbook_path
+
+    path = book_entry_workbook_path()
+    snapshot = path.read_bytes() if path is not None and path.is_file() else None
+    try:
+        with get_connection() as connection:
+            result = mutator(connection)
+            synchronize_book_entry_workbook(connection)
+            return result
+    except Exception:
+        if path is not None and snapshot is not None:
+            try:
+                path.write_bytes(snapshot)
+            except OSError:
+                logger.exception("Book Entry workbook could not be restored after a failed update")
+        raise
+
+
+def synchronize_book_entry_workbook(connection) -> None:
+    """Write the registry to the existing workbook. Raise if the file cannot be replaced."""
+    from preprocessing import BookEntryConfigurationError, read_book_entry_rows, write_book_entry_workbook
+
+    rows = _registry_rows(connection)
+    try:
+        current = read_book_entry_rows()
+    except BookEntryConfigurationError:
+        current = None
+
+    def identity(row):
+        return (str(row["budget_code"]), str(row.get("budget_name") or ""))
+
+    if current is not None and sorted(map(identity, current)) == sorted(map(identity, rows)):
+        return
+    try:
+        write_book_entry_workbook(rows)
+    except Exception as error:
+        logger.exception("Book Entry workbook synchronization failed")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "The Book Entry workbook could not be updated. The registry was not changed.",
+        ) from error
+
+
+def book_entry_codes_from_registry() -> list[str]:
+    with get_connection() as connection:
+        rows = connection.execute("SELECT budget_code FROM book_entry_accounts ORDER BY budget_code").fetchall()
+    return [row["budget_code"] for row in rows]
+
+
+def _import_book_entries_if_needed(connection) -> None:
+    from preprocessing import read_book_entry_rows
+
+    state = connection.execute(
+        "SELECT initialized_at FROM book_entry_registry_state WHERE id = 1"
+    ).fetchone()
+    if state is not None:
+        return
+    for row in read_book_entry_rows():
+        master = _master_identity(connection, row["budget_code"])
+        connection.execute(
+            """
+            INSERT INTO book_entry_accounts (budget_code, budget_name, category, updated_by)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (budget_code) DO NOTHING
+            """,
+            (
+                row["budget_code"],
+                row["budget_name"],
+                master["category"] if master else "",
+                "workbook-import",
+            ),
+        )
+    connection.execute(
+        "INSERT INTO book_entry_registry_state (id, initialized_at) VALUES (1, NOW())"
+    )
+
+
+def ensure_book_entry_registry() -> None:
+    """Import the workbook once. Later startups keep the saved registry, including an empty one."""
+    _import_preprocessing()
+    from preprocessing import set_book_entry_code_provider
+
+    ensure_forecast_tables()
+    try:
+        _run_book_entry_change(_import_book_entries_if_needed)
+    except Exception:
+        logger.exception("Book Entry workbook synchronization failed during startup")
+        try:
+            with get_connection() as connection:
+                state = connection.execute(
+                    "SELECT initialized_at FROM book_entry_registry_state WHERE id = 1"
+                ).fetchone()
+            if state is not None:
+                set_book_entry_code_provider(book_entry_codes_from_registry)
+        except Exception:
+            logger.exception("Book Entry registry could not be read")
+        return
+    set_book_entry_code_provider(book_entry_codes_from_registry)
+
+
+def list_master_categories() -> list[str]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT category
+            FROM historical_actuals
+            WHERE category IS NOT NULL AND category <> ''
+            ORDER BY category
+            """
+        ).fetchall()
+    return [row["category"] for row in rows]
+
+
+def list_book_entries(search: str = "", category: str = "", name: str = "") -> dict[str, Any]:
+    term = str(search or "").strip()
+    name_term = str(name or "").strip()
+    selected = str(category or "").strip()
+    like = f"%{term}%"
+    name_like = f"%{name_term}%"
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT budget_code, budget_name, category, updated_at, updated_by
+            FROM book_entry_accounts
+            WHERE (%s = '' OR budget_code ILIKE %s)
+              AND (%s = '' OR budget_name ILIKE %s)
+              AND (%s = '' OR category = %s)
+            ORDER BY category, budget_code
+            """,
+            (term, like, name_term, name_like, selected, selected),
+        ).fetchall()
+        total = connection.execute("SELECT COUNT(*) AS total FROM book_entry_accounts").fetchone()["total"]
+        registered = connection.execute(
+            """
+            SELECT DISTINCT category
+            FROM book_entry_accounts
+            WHERE category IS NOT NULL AND category <> ''
+            """
+        ).fetchall()
+    categories = list(dict.fromkeys([*list_master_categories(), *[row["category"] for row in registered]]))
+    categories.sort()
+    return {
+        "count": int(total),
+        "accounts": [_book_entry_record(row) for row in rows],
+        "categories": categories,
+    }
+
+
+def lookup_book_entry_code(budget_code: str) -> dict[str, Any]:
+    code = normalize_budget_code(budget_code)
+    with get_connection() as connection:
+        master = _master_identity(connection, code)
+        existing = connection.execute(
+            "SELECT budget_code FROM book_entry_accounts WHERE budget_code = %s",
+            (code,),
+        ).fetchone()
+    if not master:
+        return {"budget_code": code, "found": False, "already_registered": bool(existing)}
+    return {
+        "budget_code": code,
+        "found": True,
+        "budget_name": master["budget_name"],
+        "category": master["category"],
+        "already_registered": bool(existing),
+    }
+
+
+def _actor_label(actor) -> str:
+    if actor is None:
+        return ""
+    return str(getattr(actor, "name", "") or getattr(actor, "email", "") or getattr(actor, "object_id", ""))
+
+
+def add_book_entry(body: dict[str, Any], actor=None) -> dict[str, Any]:
+    code = normalize_budget_code(body.get("budget_code"))
+
+    def mutate(connection):
+        existing = connection.execute(
+            "SELECT budget_code, budget_name, category FROM book_entry_accounts WHERE budget_code = %s",
+            (code,),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This Budget Code is already a Book Entry account.")
+        master = _master_identity(connection, code)
+        name, category = resolve_book_entry_fields(body.get("budget_name"), body.get("category"), master)
+        connection.execute(
+            """
+            INSERT INTO book_entry_accounts (budget_code, budget_name, category, updated_by)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (code, name, category, _actor_label(actor)),
+        )
+        return {"budget_code": code, "budget_name": name, "category": category}
+
+    record = _run_book_entry_change(mutate)
+    _import_preprocessing()
+    from preprocessing import clear_book_entry_cache
+
+    clear_book_entry_cache()
+    return {"account": record, "previous": None, "new": record}
+
+
+def update_book_entry(budget_code: str, body: dict[str, Any], actor=None) -> dict[str, Any]:
+    code = normalize_budget_code(budget_code)
+    if "budget_code" in body and str(body.get("budget_code") or "").strip() not in ("", code):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Budget Code cannot be changed. Remove this account and add the correct Budget Code.",
+        )
+
+    def mutate(connection):
+        existing = connection.execute(
+            """
+            SELECT budget_code, budget_name, category
+            FROM book_entry_accounts
+            WHERE budget_code = %s
+            """,
+            (code,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "This Book Entry account was not found.")
+        master = _master_identity(connection, code)
+        name, category = resolve_book_entry_fields(body.get("budget_name"), body.get("category"), master)
+        previous = {
+            "budget_code": existing["budget_code"],
+            "budget_name": existing["budget_name"],
+            "category": existing["category"],
+        }
+        connection.execute(
+            """
+            UPDATE book_entry_accounts
+            SET budget_name = %s, category = %s, updated_at = NOW(), updated_by = %s
+            WHERE budget_code = %s
+            """,
+            (name, category, _actor_label(actor), code),
+        )
+        return previous, {"budget_code": code, "budget_name": name, "category": category}
+
+    previous, record = _run_book_entry_change(mutate)
+    _import_preprocessing()
+    from preprocessing import clear_book_entry_cache
+
+    clear_book_entry_cache()
+    return {"account": record, "previous": previous, "new": record}
+
+
+def delete_book_entry(budget_code: str) -> dict[str, Any]:
+    code = normalize_budget_code(budget_code)
+
+    def mutate(connection):
+        existing = connection.execute(
+            """
+            SELECT budget_code, budget_name, category
+            FROM book_entry_accounts
+            WHERE budget_code = %s
+            """,
+            (code,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "This Book Entry account was not found.")
+        previous = {
+            "budget_code": existing["budget_code"],
+            "budget_name": existing["budget_name"],
+            "category": existing["category"],
+        }
+        connection.execute("DELETE FROM book_entry_accounts WHERE budget_code = %s", (code,))
+        return previous
+
+    previous = _run_book_entry_change(mutate)
+    _import_preprocessing()
+    from preprocessing import clear_book_entry_cache
+
+    clear_book_entry_cache()
+    return {"account": previous, "previous": previous, "new": None}
+
+
+def book_entry_workbook_bytes() -> bytes:
+    _import_preprocessing()
+    from preprocessing import book_entry_workbook_path
+
+    _run_book_entry_change(lambda connection: None)
+    path = book_entry_workbook_path()
+    if path is None or not path.is_file():
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "The Book Entry workbook is not available.")
+    return path.read_bytes()

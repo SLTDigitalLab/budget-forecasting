@@ -16,7 +16,8 @@ import {
   financialYearOptions,
   formatSelectedPeriodDisplay,
   lastAllowedIso,
-  remainingYearOptions,
+  monthYearPlain,
+  remainingMonthsFromLatestActual,
   resolveForecastPeriod,
   splitIsoMonth,
   yearOptions,
@@ -34,8 +35,15 @@ export default function ForecastControls() {
     endMonth,
     setEndMonth,
     earliestMonth,
+    maximumMonth,
+    latestActualMonth,
+    historyMetaLoading,
+    boundsLoading,
+    boundsError,
+    refreshBounds,
     loading,
     validation,
+    setValidation,
     canSubmit,
     runForecast,
   } = useForecast();
@@ -46,21 +54,26 @@ export default function ForecastControls() {
   const [categoriesLoading, setCategoriesLoading] = useState(true);
   const [categoriesLoadError, setCategoriesLoadError] = useState("");
 
-  const years = yearOptions(earliestMonth);
-  const remainingYears = remainingYearOptions(earliestMonth);
-  const financialYears = financialYearOptions(earliestMonth);
-  const latestMonth = lastAllowedIso(earliestMonth);
+  const years = yearOptions(earliestMonth, maximumMonth);
+  const financialYears = financialYearOptions(earliestMonth, maximumMonth);
+  const latestMonth = lastAllowedIso(maximumMonth);
   const startParts = splitIsoMonth(startMonth);
   const endParts = splitIsoMonth(endMonth);
   const singleFieldset = periodType !== PERIOD_TYPE.FINANCIAL_YEARS;
   const categoryId = String(category?.id || ALL_CATEGORIES_ID);
   const selectedCategory = categories.find((item) => String(item.id) === categoryId) || category;
   const categoryReady = isForecastableCategory(selectedCategory);
-  const periodLocked = !categoryReady || categoriesLoading;
+  const boundsReady = !boundsLoading && !historyMetaLoading && !boundsError && Boolean(latestMonth);
+  const periodLocked = !categoryReady || categoriesLoading || !boundsReady;
+  const remainingPeriod = remainingMonthsFromLatestActual(latestActualMonth, {
+    earliestIso: earliestMonth,
+    maximumIso: maximumMonth,
+  });
   const periodHelp = compactPeriodHelp({
     startIso: startMonth,
     endIso: endMonth,
     earliestIso: earliestMonth,
+    maximumIso: maximumMonth,
   });
   const selectedPeriodLabel = formatSelectedPeriodDisplay(startMonth, endMonth);
 
@@ -93,18 +106,31 @@ export default function ForecastControls() {
   function applyResolved(next) {
     setStartMonth(next.startIso);
     setEndMonth(next.endIso);
+    if (next.startIso && next.endIso) {
+      setValidation("");
+    }
   }
 
   function changePeriodType(nextType) {
     if (periodLocked) {
       return;
     }
+    if (nextType === PERIOD_TYPE.REMAINING_YEAR && !remainingPeriod.available) {
+      setPeriodType(nextType);
+      setStartMonth("");
+      setEndMonth("");
+      setValidation(remainingPeriod.message);
+      return;
+    }
     setPeriodType(nextType);
     applyResolved(resolveForecastPeriod({
       periodType: nextType,
       earliestIso: earliestMonth,
-      currentStartIso: startMonth,
-      currentEndIso: endMonth,
+      maximumIso: maximumMonth,
+      latestActualIso: latestActualMonth,
+      // Clear stale year/month selections from the previous mode.
+      currentStartIso: "",
+      currentEndIso: "",
     }));
   }
 
@@ -114,15 +140,7 @@ export default function ForecastControls() {
       year,
       month,
       earliestIso: earliestMonth,
-      currentStartIso: startMonth,
-    }));
-  }
-
-  function applyRemainingYear(year) {
-    applyResolved(resolveForecastPeriod({
-      periodType: PERIOD_TYPE.REMAINING_YEAR,
-      year,
-      earliestIso: earliestMonth,
+      maximumIso: maximumMonth,
       currentStartIso: startMonth,
     }));
   }
@@ -133,6 +151,7 @@ export default function ForecastControls() {
       startYear,
       endYear: nextEndYear,
       earliestIso: earliestMonth,
+      maximumIso: maximumMonth,
       currentStartIso: startMonth,
       currentEndIso: endMonth,
     }));
@@ -146,6 +165,35 @@ export default function ForecastControls() {
     }
     setCategoryError("");
     runForecast();
+  }
+
+  function remainingOptionDisabled() {
+    if (periodLocked) {
+      return true;
+    }
+    if (historyMetaLoading) {
+      return true;
+    }
+    return !remainingPeriod.available;
+  }
+
+  function remainingOptionNote() {
+    if (historyMetaLoading) {
+      return "Loading latest stored actuals…";
+    }
+    if (remainingPeriod.reason === "december") {
+      return remainingPeriod.message;
+    }
+    if (remainingPeriod.reason === "missing") {
+      return remainingPeriod.message;
+    }
+    if (remainingPeriod.reason === "model_horizon") {
+      return remainingPeriod.message;
+    }
+    if (remainingPeriod.available && latestActualMonth) {
+      return `After ${monthYearPlain(latestActualMonth)} through December ${latestActualMonth.slice(0, 4)}`;
+    }
+    return "";
   }
 
   return (
@@ -210,21 +258,25 @@ export default function ForecastControls() {
           >
             {PERIOD_TYPE_OPTIONS.map((option) => {
               const selected = periodType === option.value;
+              const isRemaining = option.value === PERIOD_TYPE.REMAINING_YEAR;
+              const optionDisabled = isRemaining ? remainingOptionDisabled() : periodLocked;
+              const note = isRemaining ? remainingOptionNote() : "";
               return (
                 <label
                   key={option.value}
-                  className={`period-type-card${selected ? " is-selected" : ""}`}
+                  className={`period-type-card${selected ? " is-selected" : ""}${optionDisabled && !periodLocked ? " is-disabled" : ""}`}
                 >
                   <input
                     type="radio"
                     name="forecast-period-type"
                     value={option.value}
                     checked={selected}
-                    disabled={periodLocked}
+                    disabled={optionDisabled}
                     onChange={() => changePeriodType(option.value)}
                   />
                   <span className="period-type-card-title">{option.label}</span>
                   <span className="period-type-card-state">{selected ? "Selected" : "Not selected"}</span>
+                  {note ? <span className="period-type-card-note">{note}</span> : null}
                 </label>
               );
             })}
@@ -282,25 +334,23 @@ export default function ForecastControls() {
                 </fieldset>
               ) : null}
               {periodType === PERIOD_TYPE.REMAINING_YEAR ? (
-                <fieldset className="period-group" disabled={periodLocked}>
-                  <legend className="sr-only">Forecast Year</legend>
-                  <div className="field">
-                    <label htmlFor="remaining-year">Forecast Year</label>
-                    <select
-                      id="remaining-year"
-                      value={startParts.year}
-                      onChange={(event) => applyRemainingYear(event.target.value)}
-                      required
-                      disabled={periodLocked}
-                    >
-                      {remainingYears.map((year) => (
-                        <option key={`remaining-year-${year}`} value={year}>
-                          {year}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </fieldset>
+                <div className="generate-remaining-period" aria-live="polite">
+                  <label id="remaining-period-label" htmlFor="remaining-period-value">Derived remaining period</label>
+                  <p
+                    id="remaining-period-value"
+                    className="generate-remaining-period-value"
+                    aria-labelledby="remaining-period-label"
+                  >
+                    {remainingPeriod.available
+                      ? formatSelectedPeriodDisplay(remainingPeriod.startIso, remainingPeriod.endIso)
+                      : "—"}
+                  </p>
+                  <p className="generate-remaining-period-help">
+                    {remainingPeriod.available
+                      ? `Automatically set from the latest stored actual (${monthYearPlain(latestActualMonth)}) through December of that year. Year selection is not offered in this mode.`
+                      : (remainingPeriod.message || "Remaining months are unavailable until historical metadata loads.")}
+                  </p>
+                </div>
               ) : null}
               {periodType === PERIOD_TYPE.FINANCIAL_YEARS ? (
                 <fieldset className="period-group" disabled={periodLocked}>
@@ -353,13 +403,25 @@ export default function ForecastControls() {
             <button
               className="generate-button"
               type="submit"
-              disabled={periodLocked || !canSubmit || loading}
+              disabled={periodLocked || !canSubmit || loading || boundsLoading || historyMetaLoading || Boolean(boundsError)}
             >
               {loading ? <Loader2 className="spin" size={18} aria-hidden="true" /> : null}
               {loading ? "Generating Forecast..." : "Generate Forecast"}
             </button>
           </div>
           {periodHelp ? <p className="generate-period-help">{periodHelp}</p> : null}
+          {boundsLoading || historyMetaLoading ? (
+            <p className="generate-period-help">Loading the published forecast period.</p>
+          ) : null}
+          {boundsError ? (
+            <p className="validation generate-inline-validation" role="alert">
+              {boundsError}
+              {" "}
+              <button className="generate-button secondary" type="button" onClick={refreshBounds}>
+                Retry
+              </button>
+            </p>
+          ) : null}
         </div>
       </form>
       {validation ? <p className="validation generate-inline-validation" role="alert">{validation}</p> : null}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -10,9 +10,11 @@ import {
   YAxis,
 } from "recharts";
 import AnalyticsSectionHeading from "./AnalyticsSectionHeading";
+import BoundedChartTooltip from "./BoundedChartTooltip";
 import EmptyState from "./EmptyState";
 import { comparisonTotals } from "../utils/forecastComparison";
-import { cartesianChartMargin, valueYAxisProps } from "../utils/chartLayout";
+import useChartPalette from "../hooks/useChartPalette";
+import { cartesianChartMargin, SOLID_BAR_RADIUS, valueYAxisProps } from "../utils/chartLayout";
 import {
   axisUnitLabel,
   formatAmount,
@@ -26,7 +28,7 @@ function monthTitle(isoMonth) {
 }
 
 function ChartTooltip({ children }) {
-  return <div className="chart-tooltip">{children}</div>;
+  return <div className="chart-tooltip chart-tooltip-overlay">{children}</div>;
 }
 
 function differenceClass(value) {
@@ -37,6 +39,9 @@ function differenceClass(value) {
 }
 
 export default function ForecastComparison({ rows, amountUnit }) {
+  const palette = useChartPalette();
+  const hostRef = useRef(null);
+  const [active, setActive] = useState(null);
   const [selectedMonth, setSelectedMonth] = useState(rows[0]?.month || "");
   const totals = useMemo(() => comparisonTotals(rows), [rows]);
   const selected = rows.find((row) => row.month === selectedMonth) || rows[0] || null;
@@ -57,7 +62,6 @@ export default function ForecastComparison({ rows, amountUnit }) {
       <section className="analytics-major-section analytics-forecast-section" aria-labelledby="analytics-comparison-heading">
         <AnalyticsSectionHeading
           id="analytics-comparison-heading"
-          index="03"
           title="Historical vs Forecast Comparison"
         />
         <article className="card empty-panel">
@@ -72,7 +76,6 @@ export default function ForecastComparison({ rows, amountUnit }) {
       <div>
         <AnalyticsSectionHeading
           id="analytics-comparison-heading"
-          index="03"
           title="Historical vs Forecast Comparison"
         />
         <p className="muted">
@@ -113,41 +116,63 @@ export default function ForecastComparison({ rows, amountUnit }) {
             </p>
           </div>
         </div>
-        <div className="analytics-chart analytics-chart-wide" role="img" aria-label="Historical average versus forecast">
+        <div
+          className="analytics-chart analytics-chart-wide"
+          role="img"
+          aria-label="Historical average versus forecast"
+          ref={hostRef}
+        >
           <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartRows} margin={cartesianChartMargin()}>
-              <CartesianGrid stroke="#e6eef6" vertical={false} />
-              <XAxis dataKey="label" tick={{ fontSize: 11 }} tickMargin={6} />
-              <YAxis {...valueYAxisProps(unit)} tickFormatter={formatAxisTick} />
-              <Tooltip
-                allowEscapeViewBox={{ x: true, y: true }}
-                wrapperStyle={{ zIndex: 5, pointerEvents: "none" }}
-                content={({ active, payload }) => {
-                  if (!active || !payload?.length) {
-                    return null;
-                  }
-                  const point = payload[0].payload;
-                  return (
-                    <ChartTooltip>
-                      <div className="chart-tooltip-month">{monthTitle(point.month)}</div>
-                      <div className="chart-tooltip-value">
-                        {`Historical average ${point.historical_average == null ? "—" : formatAmount(point.historical_average, amountUnit)}`}
-                      </div>
-                      <div className="chart-tooltip-value">
-                        {`Forecast ${formatAmount(point.forecast_amount, amountUnit)}`}
-                      </div>
-                      <div className="chart-tooltip-series">
-                        {`${point.observation_count} historical month${point.observation_count === 1 ? "" : "s"} used`}
-                      </div>
-                    </ChartTooltip>
-                  );
-                }}
+            <BarChart
+              data={chartRows}
+              margin={cartesianChartMargin({ bottom: 16 })}
+              barGap={4}
+              barCategoryGap="18%"
+              onMouseMove={(state) => {
+                if (!state?.isTooltipActive || !state.activePayload?.length || !state.activeCoordinate) {
+                  setActive(null);
+                  return;
+                }
+                setActive({
+                  point: state.activePayload[0].payload,
+                  x: state.activeCoordinate.x,
+                  y: state.activeCoordinate.y,
+                });
+              }}
+              onMouseLeave={() => setActive(null)}
+            >
+              <CartesianGrid stroke={palette.grid} vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: palette.tick }} tickMargin={8} minTickGap={18} interval="preserveStartEnd" />
+              <YAxis {...valueYAxisProps(unit, { axisFill: palette.axis })} tickFormatter={formatAxisTick} />
+              <Tooltip cursor={{ fill: palette.cursor }} content={() => null} wrapperStyle={{ display: "none" }} />
+              <Legend wrapperStyle={{ fontSize: 12, color: palette.legend }} />
+              <Bar dataKey="historical_average" name="Historical average" fill={palette.historical} radius={SOLID_BAR_RADIUS} maxBarSize={22} isAnimationActive={false} />
+              <Bar
+                dataKey="forecast_amount"
+                name="Forecast"
+                fill={palette.forecast}
+                radius={SOLID_BAR_RADIUS}
+                maxBarSize={22}
+                isAnimationActive={false}
               />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Bar dataKey="historical_average" name="Historical average" fill="#071a33" radius={[4, 4, 0, 0]} maxBarSize={22} />
-              <Bar dataKey="forecast_amount" name="Forecast" fill="#1f7ae0" radius={[4, 4, 0, 0]} maxBarSize={22} />
             </BarChart>
           </ResponsiveContainer>
+          <BoundedChartTooltip active={Boolean(active)} anchor={active} hostRef={hostRef}>
+            {active ? (
+              <ChartTooltip>
+                <div className="chart-tooltip-month">{monthTitle(active.point.month)}</div>
+                <div className="chart-tooltip-value">
+                  {`Historical average ${active.point.historical_average == null ? "—" : formatAmount(active.point.historical_average, amountUnit)}`}
+                </div>
+                <div className="chart-tooltip-value">
+                  {`Forecast ${formatAmount(active.point.forecast_amount, amountUnit)}`}
+                </div>
+                <div className="chart-tooltip-series">
+                  {`${active.point.observation_count} historical month${active.point.observation_count === 1 ? "" : "s"} used`}
+                </div>
+              </ChartTooltip>
+            ) : null}
+          </BoundedChartTooltip>
         </div>
       </article>
 
@@ -213,7 +238,7 @@ export default function ForecastComparison({ rows, amountUnit }) {
                       : `${selected.observation_count} periods`}
                   </span>
                 </div>
-                {selected.historical_periods_used.length ? (
+                {selected.historical_periods_used?.length ? (
                   <ul className="analytics-month-detail-periods">
                     {selected.historical_periods_used.map((period) => (
                       <li key={period.month}>

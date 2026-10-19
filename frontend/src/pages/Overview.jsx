@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import {
+  Bar,
+  BarChart,
   CartesianGrid,
   Cell,
-  Line,
-  LineChart,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -19,15 +20,20 @@ import {
   getOverviewHistorical,
 } from "../api/forecastApi";
 import SummaryCard from "../components/SummaryCard";
+import useChartPalette from "../hooks/useChartPalette";
 import { cartesianChartMargin, valueYAxisProps } from "../utils/chartLayout";
+import { placeFixedTooltip } from "../utils/chartTooltipPlacement";
 import { axisUnitLabel, formatAmount, formatAxisTick } from "../utils/forecastDisplay";
 import { isoToLabel } from "../utils/months";
 import {
   actualYearSeries,
+  DECLARED_MISSING_TOTAL_NOTE,
   forecastViewFromRun,
-  latestCompleteActualYear,
+  overviewCompleteYearUnavailableMessage,
+  overviewLatestYearLabel,
   selectNewestForecast,
   shareDistribution,
+  sliceTooltipDetails,
   sortForecastHistoryNewestFirst,
   STORED_FORECAST_STATUS,
 } from "../utils/overviewDashboard";
@@ -84,8 +90,115 @@ function EmptyCopy({ children }) {
   return <p className="muted overview-empty">{children}</p>;
 }
 
-function DistributionCard({ title, rows, amountUnit, emptyMessage }) {
+function clientPoint(event) {
+  const native = event?.nativeEvent;
+  const point = Number.isFinite(native?.clientX) ? native : event;
+  if (Number.isFinite(point?.clientX) && Number.isFinite(point?.clientY)) {
+    return { x: point.clientX, y: point.clientY };
+  }
+  const rect = event?.target?.getBoundingClientRect?.();
+  if (rect) {
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+  return { x: 24, y: 24 };
+}
+
+function SliceTooltip({ slice, amountLabel, amountUnit, point }) {
+  const tooltipRef = useRef(null);
+  const [placement, setPlacement] = useState(null);
+
+  useEffect(() => {
+    const node = tooltipRef.current;
+    const width = node?.offsetWidth || 220;
+    const height = node?.offsetHeight || 128;
+    setPlacement(placeFixedTooltip({
+      clientX: point.x,
+      clientY: point.y,
+      tooltipWidth: width,
+      tooltipHeight: height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    }));
+  }, [point.x, point.y, slice.budget_code, slice.amount, slice.percent, amountLabel]);
+
+  const position = placement || placeFixedTooltip({
+    clientX: point.x,
+    clientY: point.y,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  });
+  return createPortal(
+    <div
+      ref={tooltipRef}
+      className="chart-tooltip overview-slice-tooltip"
+      role="tooltip"
+      style={{ left: position.x, top: position.y }}
+    >
+      <div className="chart-tooltip-series">Budget code</div>
+      <div className="chart-tooltip-value">{slice.budget_code}</div>
+      <div className="chart-tooltip-series">Account name</div>
+      <div className="chart-tooltip-value">{slice.account_name || "—"}</div>
+      <div className="chart-tooltip-series">{amountLabel}</div>
+      <div className="chart-tooltip-value">{formatAmount(slice.amount, amountUnit)}</div>
+      <div className="chart-tooltip-series">Share</div>
+      <div className="chart-tooltip-value">{formatSharePercent(slice.percent)}</div>
+    </div>,
+    document.body
+  );
+}
+
+function DistributionCard({ title, rows, amountUnit, emptyMessage, amountLabel }) {
   const slices = rows.map((row) => ({ ...row, color: codeColor(row.budget_code) }));
+  const [active, setActive] = useState(null);
+  const pinned = useRef(false);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    pinned.current = false;
+    setActive(null);
+  }, [title]);
+
+  useEffect(() => {
+    if (!active || !pinned.current) {
+      return undefined;
+    }
+    function dismiss(event) {
+      if (event.key === "Escape") {
+        pinned.current = false;
+        setActive(null);
+        return;
+      }
+      if (event.type === "pointerdown" && chartRef.current && !chartRef.current.contains(event.target)) {
+        pinned.current = false;
+        setActive(null);
+      }
+    }
+    window.addEventListener("keydown", dismiss);
+    window.addEventListener("pointerdown", dismiss);
+    return () => {
+      window.removeEventListener("keydown", dismiss);
+      window.removeEventListener("pointerdown", dismiss);
+    };
+  }, [active]);
+
+  function showSlice(data, event, pin) {
+    const slice = sliceTooltipDetails(data);
+    if (!slice) {
+      return;
+    }
+    if (pin) {
+      pinned.current = true;
+    }
+    const point = clientPoint(event);
+    setActive({ slice, x: point.x, y: point.y });
+  }
+
+  function hideHover() {
+    if (!pinned.current) {
+      setActive(null);
+    }
+  }
+
   return (
     <article className="card section-card">
       <h2 className="section-card-header">{title}</h2>
@@ -93,7 +206,7 @@ function DistributionCard({ title, rows, amountUnit, emptyMessage }) {
         {slices.length ? (
           <div className="overview-distribution">
             <div className="overview-forecast-donut">
-              <div className="overview-forecast-donut-chart">
+              <div className="overview-forecast-donut-chart" ref={chartRef}>
                 <ResponsiveContainer width="100%" height={180}>
                   <PieChart>
                     <Pie
@@ -105,7 +218,14 @@ function DistributionCard({ title, rows, amountUnit, emptyMessage }) {
                       paddingAngle={0}
                       startAngle={90}
                       endAngle={-270}
+                      stroke="#fff"
                       isAnimationActive={false}
+                      rootTabIndex={0}
+                      onMouseEnter={(data, _index, event) => showSlice(data, event, false)}
+                      onMouseLeave={hideHover}
+                      onClick={(data, _index, event) => showSlice(data, event, true)}
+                      onFocus={(data, _index, event) => showSlice(data, event, false)}
+                      onBlur={hideHover}
                     >
                       {slices.map((row) => (
                         <Cell key={row.budget_code} fill={row.color} />
@@ -113,6 +233,14 @@ function DistributionCard({ title, rows, amountUnit, emptyMessage }) {
                     </Pie>
                   </PieChart>
                 </ResponsiveContainer>
+                {active ? (
+                  <SliceTooltip
+                    slice={active.slice}
+                    amountLabel={amountLabel}
+                    amountUnit={amountUnit}
+                    point={{ x: active.x, y: active.y }}
+                  />
+                ) : null}
                 <div className="overview-forecast-donut-center">
                   <strong>{slices.length}</strong>
                   <span>Budget Codes</span>
@@ -156,6 +284,7 @@ function DistributionCard({ title, rows, amountUnit, emptyMessage }) {
 }
 
 export default function Overview() {
+  const palette = useChartPalette();
   const [categories, setCategories] = useState([]);
   const [categoryId, setCategoryId] = useState("");
   const [historyRecords, setHistoryRecords] = useState([]);
@@ -301,12 +430,22 @@ export default function Overview() {
   const forecastAxis = axisUnitLabel(forecastAmountUnit);
   const historicalUnit = historicalAxis === "LKR Mn" ? "Amount (LKR Mn)" : historicalAxis;
   const forecastUnit = forecastAxis === "LKR Mn" ? "Amount (LKR Mn)" : forecastAxis;
-  const actualYear = latestCompleteActualYear(historical?.latest_year_monthly_actuals);
-  const actualPoints = actualYearSeries(historical?.latest_year_monthly_actuals, actualYear);
-  const historicalYearMatches = actualYear != null && Number(historical?.latest_complete_year) === Number(actualYear);
-  const historicalCodes = historicalYearMatches
-    ? shareDistribution(historical?.latest_complete_year_budget_codes, "actual_amount")
-    : [];
+  const completeYear = historical?.latest_complete_year ?? null;
+  const chartYear = Number.isFinite(Number(completeYear)) ? Number(completeYear) : null;
+  const chartRows = chartYear == null ? [] : historical?.latest_year_monthly_actuals;
+  const chartHasActual = (chartRows || []).some((row) => row?.actual_amount != null && Number.isFinite(Number(row.actual_amount)));
+  const actualPoints = actualYearSeries(chartRows, chartYear);
+  const historicalCodes = shareDistribution(
+    historical?.historical_display_budget_codes ?? historical?.latest_complete_year_budget_codes,
+    "actual_amount",
+  );
+  const monthlyTitle = chartYear == null
+    ? `Monthly Actuals – ${categoryName}`
+    : `Monthly Actuals (${chartYear}) – ${categoryName}`;
+  const distributionTitle = chartYear == null
+    ? `Budget Code Distribution – ${categoryName}`
+    : `Budget Code Distribution (${chartYear}) – ${categoryName}`;
+  const completeYearUnavailable = overviewCompleteYearUnavailableMessage(historical);
   const forecastPoints = forecastView?.months || [];
   const forecastYear = forecastView?.forecastYear;
   const historicalNote = overviewHistoricalNote(historical);
@@ -340,6 +479,12 @@ export default function Overview() {
       </div>
 
       {historicalNote ? <p className="overview-historical-note">{historicalNote}</p> : null}
+      {historical ? (
+        <p className="overview-historical-note">
+          {overviewLatestYearLabel(completeYear)}. {DECLARED_MISSING_TOTAL_NOTE}
+          {historical.actuals_display_label ? ` ${historical.actuals_display_label}` : ""}
+        </p>
+      ) : null}
 
       <div className="summary-grid summary-grid-four overview-kpi-row">
         <SummaryCard label="Category Forecast" value={forecastView ? formatAmount(forecastView.total, forecastAmountUnit) : "—"} />
@@ -351,24 +496,26 @@ export default function Overview() {
       <div className="overview-split">
         <article className="card section-card">
           <h2 className="section-card-header">
-            {actualYear ? `Monthly Actuals (Latest Year: ${actualYear}) – ${categoryName}` : `Monthly Actuals – ${categoryName}`}
+            {monthlyTitle}
           </h2>
           <div className="section-card-body overview-chart-body">
             {historicalLoading && !historical ? (
               <EmptyCopy>Loading historical actuals…</EmptyCopy>
             ) : historicalError ? (
               <EmptyCopy>{historicalError}</EmptyCopy>
-            ) : !historical?.latest_year_monthly_actuals?.length ? (
-              <EmptyCopy>No historical actual data is available for this category.</EmptyCopy>
-            ) : actualYear == null ? (
-              <EmptyCopy>No complete 12-month actual year is available for this category.</EmptyCopy>
+            ) : !chartHasActual ? (
+              <EmptyCopy>
+                {completeYearUnavailable
+                  || `No numeric actuals for ${chartYear} in this category. ${DECLARED_MISSING_TOTAL_NOTE}`}
+              </EmptyCopy>
             ) : (
               <ResponsiveContainer width="100%" height={280}>
-                <LineChart data={actualPoints} margin={cartesianChartMargin()}>
-                  <CartesianGrid stroke="#e6eef6" vertical={false} />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={6} />
+                <BarChart data={actualPoints} margin={cartesianChartMargin({ bottom: 12 })} barCategoryGap="22%">
+                  <CartesianGrid stroke={palette.grid} vertical={false} />
+                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={12} interval="preserveStartEnd" />
                   <YAxis {...valueYAxisProps(historicalUnit)} tickLine={false} axisLine={false} tickFormatter={formatAxisTick} />
                   <Tooltip
+                    cursor={{ fill: "rgba(2, 62, 138, 0.08)" }}
                     content={({ active, payload }) => {
                       if (!active || !payload?.length) {
                         return null;
@@ -380,38 +527,38 @@ export default function Overview() {
                           <div>{`Category: ${categoryName}`}</div>
                           <div>{`Actual amount: ${point.actual_amount == null ? "—" : formatAmount(point.actual_amount, historicalAmountUnit)}`}</div>
                           <div>{`Year: ${point.year}`}</div>
+                          <div>{DECLARED_MISSING_TOTAL_NOTE}</div>
                         </ChartTooltip>
                       );
                     }}
                   />
-                  <Line
-                    type="monotone"
+                  <Bar
                     dataKey="actual_amount"
                     name="Actual"
-                    stroke="#1f7ae0"
-                    strokeWidth={2.4}
-                    dot={{ r: 3 }}
-                    connectNulls={false}
+                    fill={palette.historical}
+                    maxBarSize={28}
+                    radius={[3, 3, 0, 0]}
+                    isAnimationActive={false}
                   />
-                </LineChart>
+                </BarChart>
               </ResponsiveContainer>
             )}
           </div>
         </article>
         <DistributionCard
-          title={`Budget Code Distribution – ${categoryName}`}
+          title={distributionTitle}
           rows={historicalCodes}
           amountUnit={historicalAmountUnit}
+          amountLabel="Actual"
           emptyMessage={
             historicalLoading
               ? "Loading historical actuals…"
               : historicalError
                 ? historicalError
-                : !historical?.latest_year_monthly_actuals?.length
-                  ? "No historical actual data is available for this category."
-                  : actualYear == null
-                    ? "No complete 12-month actual year is available for this category."
-                    : "Budget Code breakdown is not available for this record."
+                : !chartHasActual
+                  ? (completeYearUnavailable
+                    || `No numeric actuals for ${chartYear} in this category. ${DECLARED_MISSING_TOTAL_NOTE}`)
+                  : "Budget Code breakdown is not available for this record."
           }
         />
       </div>
@@ -435,11 +582,12 @@ export default function Overview() {
               <EmptyCopy>{forecastError || "No forecast is available yet."}</EmptyCopy>
             ) : (
               <ResponsiveContainer width="100%" height={280}>
-                <LineChart data={forecastPoints} margin={cartesianChartMargin()}>
-                  <CartesianGrid stroke="#e6eef6" vertical={false} />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={6} />
+                <BarChart data={forecastPoints} margin={cartesianChartMargin({ bottom: 12 })} barCategoryGap="22%">
+                  <CartesianGrid stroke={palette.grid} vertical={false} />
+                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={12} interval="preserveStartEnd" />
                   <YAxis {...valueYAxisProps(forecastUnit)} tickLine={false} axisLine={false} tickFormatter={formatAxisTick} />
                   <Tooltip
+                    cursor={{ fill: "rgba(2, 62, 138, 0.08)" }}
                     content={({ active, payload }) => {
                       if (!active || !payload?.length) {
                         return null;
@@ -455,16 +603,15 @@ export default function Overview() {
                       );
                     }}
                   />
-                  <Line
-                    type="monotone"
+                  <Bar
                     dataKey="forecast_amount"
                     name="Forecast"
-                    stroke="#023E8A"
-                    strokeWidth={2.4}
-                    dot={{ r: 3 }}
-                    connectNulls={false}
+                    fill={palette.forecast}
+                    maxBarSize={28}
+                    radius={[3, 3, 0, 0]}
+                    isAnimationActive={false}
                   />
-                </LineChart>
+                </BarChart>
               </ResponsiveContainer>
             )}
           </div>
@@ -473,6 +620,7 @@ export default function Overview() {
           title={`Budget Code Distribution (Latest Forecast) – ${forecastCategoryName}`}
           rows={forecastView?.codes || []}
           amountUnit={forecastAmountUnit}
+          amountLabel="Forecast"
           emptyMessage={
             forecastLoading && !forecastView
               ? "Loading latest forecast…"

@@ -16,6 +16,9 @@ const CONFIRMATION_KINDS = new Set([
   "open-rollback",
   "review-rollback",
   "commit-rollback",
+  "add-book-entry",
+  "edit-book-entry",
+  "delete-book-entry",
 ]);
 
 let returnedToken = "";
@@ -43,12 +46,56 @@ function resumePayload(payload) {
   );
 }
 
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+export function jsonSafeData(value, seen = new WeakSet()) {
+  if (value == null) {
+    return value;
+  }
+  if (typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError("Settings actions cannot store non-finite numbers.");
+    }
+    return value;
+  }
+  if (typeof value !== "object") {
+    throw new TypeError("Settings actions cannot store functions or non-JSON values.");
+  }
+  if (
+    seen.has(value)
+    || value.nodeType != null
+    || value.nativeEvent
+    || Object.keys(value).some((key) => key.startsWith("__reactFiber") || key === "stateNode")
+  ) {
+    throw new TypeError("Settings actions cannot store a React event, DOM node, or circular value.");
+  }
+  if (!Array.isArray(value) && !isPlainObject(value)) {
+    throw new TypeError("Settings actions cannot store a React event, DOM node, or circular value.");
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => jsonSafeData(item, seen));
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, jsonSafeData(item, seen)]),
+  );
+}
+
 export function saveActionResume(descriptor, storage) {
   const store = storage || sessionStorage;
   const record = {
     kind: String(descriptor?.kind || ""),
     destructive: Boolean(descriptor?.destructive),
-    payload: resumePayload(descriptor?.payload),
+    payload: jsonSafeData(resumePayload(descriptor?.payload)),
   };
   store.setItem(ACTION_RESUME_KEY, JSON.stringify(record));
   return record;
@@ -99,7 +146,7 @@ export function requestSettingsAction(descriptor) {
   activePrompt = {
     kind: descriptor.kind,
     destructive: Boolean(descriptor.destructive),
-    payload: descriptor.payload || {},
+    payload: jsonSafeData(resumePayload(descriptor?.payload)),
   };
   notifyPrompt();
   return Promise.resolve({ started: false, prompt: true });

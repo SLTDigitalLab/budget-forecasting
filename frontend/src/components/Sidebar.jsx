@@ -11,6 +11,7 @@ import { useAuth } from "../auth/AuthContext";
 import { useForecast } from "../context/ForecastContext";
 import symbol from "../assets/slt-symbol.svg";
 import SidebarProfile from "./SidebarProfile";
+import ThemeToggle from "./ThemeToggle";
 
 const items = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
@@ -60,7 +61,10 @@ export default function Sidebar({ open, onNavigate }) {
           );
         })}
       </nav>
-      <SidebarProfile user={user} onLogout={handleLogout} />
+      <div className="sidebar-footer">
+        <SidebarProfile user={user} onLogout={handleLogout} />
+        <ThemeToggle />
+      </div>
     </aside>
   );
 }

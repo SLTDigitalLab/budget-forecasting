@@ -1,4 +1,4 @@
-import { LineChart } from "lucide-react";
+import { BarChart3 } from "lucide-react";
 import ErrorState from "../components/ErrorState";
 import ForecastControls from "../components/ForecastControls";
 import ForecastResults from "../components/ForecastResults";
@@ -26,7 +26,7 @@ export default function GenerateForecast() {
         </article>
       ) : (
         <article className="card generate-empty-state">
-          <LineChart size={28} aria-hidden="true" />
+          <BarChart3 size={28} aria-hidden="true" />
           <p>Your forecast results will appear here</p>
           <span>Select a category and forecast period, then generate a forecast.</span>
         </article>

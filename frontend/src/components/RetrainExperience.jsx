@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { claimReturnedActionToken, consumeSettingsActionResume, requestSettingsAction, subscribeActionPrompt } from "../auth/actionAuthentication";
+import { claimReturnedActionToken, consumeSettingsActionResume, requestSettingsAction, subscribeActionPrompt, takeReturnedActionExpiry } from "../auth/actionAuthentication";
+import { RETRAIN_FLOW, clearFlowAuthorization, grantFlowAuthorization, readFlowAuthorization } from "../utils/flowAuthorization";
+import { isEditorAuthorizationError } from "../utils/settingsFlow";
 import { cancelRetrain, getRetrainStatus, retryRetrain, saveRetrain } from "../api/retrainApi";
+import { useForecast } from "../context/ForecastContext";
 import {
   LOCK_MESSAGE,
   READY_TEXT,
@@ -18,6 +21,7 @@ import {
 } from "../utils/retrainWorkflow";
 
 export default function RetrainExperience() {
+  const { refreshBounds } = useForecast();
   const [status, setStatus] = useState(null);
   const [fetchedAt, setFetchedAt] = useState(() => Date.now());
   const [dismissedJobId, setDismissedJobId] = useState("");
@@ -27,6 +31,7 @@ export default function RetrainExperience() {
   const logRef = useRef(null);
   const stickToBottom = useRef(true);
   const actionGuard = useRef({ pending: false });
+  const publishedState = useRef("");
 
   useEffect(() => {
     let timer = 0;
@@ -36,6 +41,9 @@ export default function RetrainExperience() {
       try {
         const next = await getRetrainStatus();
         if (!stop) {
+          if (next?.state === "SAVED") {
+            clearFlowAuthorization(RETRAIN_FLOW);
+          }
           setStatus(next);
           setFetchedAt(Date.now());
         }
@@ -89,6 +97,15 @@ export default function RetrainExperience() {
   }, [presentation.mode, status?.state, status?.job_id]);
 
   useEffect(() => {
+    if (status?.state === "SAVED" && publishedState.current !== "SAVED") {
+      publishedState.current = "SAVED";
+      refreshBounds();
+    } else if (status?.state && status.state !== "SAVED") {
+      publishedState.current = status.state;
+    }
+  }, [refreshBounds, status?.state]);
+
+  useEffect(() => {
     if (status?.state !== "SAVED") {
       return undefined;
     }
@@ -103,7 +120,7 @@ export default function RetrainExperience() {
     }
   }), []);
 
-  const RETRAIN_ACTION_KINDS = new Set(["save-models", "retry-save", "cancel-job", "retry-training"]);
+  const RETRAIN_ACTION_KINDS = new Set(["save-models", "retry-save", "cancel-job", "retry-training", "renew-retrain"]);
 
   useEffect(() => {
     const outcome = consumeSettingsActionResume(undefined, RETRAIN_ACTION_KINDS);
@@ -121,32 +138,35 @@ export default function RetrainExperience() {
     if (action) {
       runAction(outcome.resume.kind, payload.jobId, action);
     } else {
-      claimReturnedActionToken();
+      runAction("renew-retrain", payload.jobId, () => Promise.resolve());
     }
   }, []);
 
-  function runAction(kind, jobId, action) {
-    const token = claimReturnedActionToken();
-    if (!token) {
-      if (actionGuard.current.pending) {
-        return;
-      }
-      actionGuard.current.pending = true;
-      setWorking(true);
-      requestSettingsAction({ kind, payload: { jobId }, destructive: true });
-      return;
-    }
+  function performRetrainAction(token, action, jobId) {
     setWorking(true);
     setActionError("");
     Promise.resolve()
       .then(() => action(token))
       .then(async () => {
         const next = await getRetrainStatus();
+        if (next?.state === "SAVED") {
+          clearFlowAuthorization(RETRAIN_FLOW);
+        }
         setStatus(next);
         setFetchedAt(Date.now());
         setNow(Date.now());
       })
       .catch(async (cause) => {
+        if (isEditorAuthorizationError(cause)) {
+          clearFlowAuthorization(RETRAIN_FLOW);
+          setActionError("Authentication was rejected. Sign in again before managing this job. Nothing was submitted.");
+          if (!actionGuard.current.pending) {
+            actionGuard.current.pending = true;
+            setWorking(true);
+            requestSettingsAction({ kind: "renew-retrain", payload: { jobId }, destructive: false });
+          }
+          return;
+        }
         setActionError(cause.message || "The retraining action failed.");
         try {
           const next = await getRetrainStatus();
@@ -157,6 +177,32 @@ export default function RetrainExperience() {
         }
       })
       .finally(() => setWorking(false));
+  }
+
+  function runAction(kind, jobId, action) {
+    const existing = readFlowAuthorization(RETRAIN_FLOW, Date.now());
+    if (existing) {
+      performRetrainAction(existing, action, jobId);
+      return;
+    }
+    const returned = claimReturnedActionToken();
+    if (returned) {
+      const expiresAt = takeReturnedActionExpiry();
+      actionGuard.current.pending = false;
+      setWorking(false);
+      if (!grantFlowAuthorization(RETRAIN_FLOW, returned, expiresAt)) {
+        setActionError("Authentication expired. Sign in again before managing this job. Nothing was submitted.");
+        return;
+      }
+      setActionError("Authentication renewed. Choose the action again. Nothing was submitted.");
+      return;
+    }
+    if (actionGuard.current.pending) {
+      return;
+    }
+    actionGuard.current.pending = true;
+    setWorking(true);
+    requestSettingsAction({ kind: "renew-retrain", payload: { jobId }, destructive: false });
   }
 
   if (presentation.mode === "hidden") {

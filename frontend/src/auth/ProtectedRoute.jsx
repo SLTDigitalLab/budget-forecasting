@@ -18,8 +18,8 @@ export default function ProtectedRoute() {
   return (
     <ForecastProvider enabled={isAuthenticated}>
       <div className={signedOut ? "auth-frame is-locked" : "auth-frame"}>
-        <div className={signedOut ? "login-app-preview" : undefined} inert={signedOut ? "" : undefined} aria-hidden={signedOut ? "true" : undefined}>
-          <AppLayout />
+        <div className={signedOut ? "app-frame login-app-preview" : "app-frame"}>
+          <AppLayout contentInert={signedOut} />
         </div>
         {signedOut ? <AuthenticationOverlay /> : null}
       </div>

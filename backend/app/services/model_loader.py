@@ -21,6 +21,7 @@ from app.config import (
 ALLOWED_NON_FITTED_STATUSES = {
     "ZERO_POLICY",
     "NO_DATA",
+    "NO_POSITIVE_YEAR_MEAN",
     "ALL_MISSING",
     "NOT_EVALUABLE",
     "NO_VALID_WINNER",
@@ -220,7 +221,7 @@ def _validate_bundle(bundle: dict) -> None:
         if all_account and status and status != "FITTED_MODEL":
             if status not in ALLOWED_NON_FITTED_STATUSES:
                 raise ModelLoadError(f"{code} production_status {status!r} is not recognized.")
-            if status in {"ZERO_POLICY", "NO_DATA", "ALL_MISSING", "NOT_EVALUABLE", "NO_VALID_WINNER"} and fitted is not None:
+            if status in {"ZERO_POLICY", "NO_DATA", "NO_POSITIVE_YEAR_MEAN", "ALL_MISSING", "NOT_EVALUABLE", "NO_VALID_WINNER"} and fitted is not None:
                 raise ModelLoadError(
                     f"{code} {status} record must not include a fitted model."
                 )

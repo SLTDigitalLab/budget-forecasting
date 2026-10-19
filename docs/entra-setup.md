@@ -56,8 +56,11 @@ Health checks and Settings reads stay available without the change card.
 
 | How you run the UI | Origin used at runtime |
 | --- | --- |
-| Docker frontend (nginx on port 80) | `http://localhost` |
-| Local Vite (`npm run dev`, port 5174, `strictPort`) | `http://localhost:5174` |
+| Docker frontend (host port 3003 → nginx 80) | `http://localhost:3003` |
+| Local Vite (`npm run dev`, port 3003, `strictPort`) | `http://localhost:3003` |
+
+Do not run Docker frontend and Vite on 3003 at the same time. Register
+`http://localhost:3003` as a Single-page application redirect URI in Entra.
 
 ## Legacy historical workbook
 

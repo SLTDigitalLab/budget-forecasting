@@ -295,77 +295,117 @@ def render_forecast_pdf(report: dict[str, Any]) -> bytes:
         insight_blocks.append(Spacer(1, 2))
     story.append(KeepTogether(insight_blocks))
 
-    story.append(KeepTogether([
-        Paragraph("4. Monthly forecast visualization", styles["section"]),
-        Paragraph("Forecast line with Expected Range (90%) only where both bounds are available.", styles["muted"]),
-        Spacer(1, 4),
-        ForecastLineChart(report.get("chart_months") or [], width, 58 * mm),
-    ]))
+    if report.get("forecast_available", True):
+        story.append(KeepTogether([
+            Paragraph("4. Monthly forecast visualization", styles["section"]),
+            Paragraph("Forecast line with Expected Range (90%) only where both bounds are available.", styles["muted"]),
+            Spacer(1, 4),
+            ForecastLineChart(report.get("chart_months") or [], width, 58 * mm),
+        ]))
 
-    code_header = [
-        Paragraph("Rank", styles["cell"]),
-        Paragraph("Budget Code", styles["cell"]),
-        Paragraph("Account name", styles["cell"]),
-        Paragraph("Forecast total", styles["cell"]),
-        Paragraph("Share", styles["cell"]),
-    ]
-    code_rows = [code_header]
-    for row in report.get("budget_codes") or []:
-        code_rows.append([
-            Paragraph(str(row.get("rank")), styles["cell"]),
-            Paragraph(str(row.get("budget_code") or ""), styles["cell"]),
-            Paragraph(str(row.get("account_name") or ""), styles["cell"]),
-            Paragraph(_format_amount(row.get("forecast_amount")), styles["cellRight"]),
-            Paragraph(_format_percent((row.get("percent") or 0) * 100), styles["cellRight"]),
-        ])
-    story.append(KeepTogether([
-        Paragraph("5. Budget Code contribution", styles["section"]),
-        _table(code_rows, [16 * mm, 28 * mm, width - 88 * mm, 28 * mm, 16 * mm]),
-    ]))
+        code_header = [
+            Paragraph("Rank", styles["cell"]),
+            Paragraph("Budget Code", styles["cell"]),
+            Paragraph("Account name", styles["cell"]),
+            Paragraph("Forecast total", styles["cell"]),
+            Paragraph("Share", styles["cell"]),
+        ]
+        code_rows = [code_header]
+        for row in report.get("budget_codes") or []:
+            code_rows.append([
+                Paragraph(str(row.get("rank")), styles["cell"]),
+                Paragraph(str(row.get("budget_code") or ""), styles["cell"]),
+                Paragraph(str(row.get("account_name") or ""), styles["cell"]),
+                Paragraph(_format_amount(row.get("forecast_amount")), styles["cellRight"]),
+                Paragraph(_format_percent((row.get("percent") or 0) * 100), styles["cellRight"]),
+            ])
+        story.append(KeepTogether([
+            Paragraph("5. Budget Code contribution", styles["section"]),
+            _table(code_rows, [16 * mm, 28 * mm, width - 88 * mm, 28 * mm, 16 * mm]),
+        ]))
 
-    month_header = [
-        Paragraph("Month", styles["cell"]),
-        Paragraph("Forecast amount", styles["cell"]),
-        Paragraph("Lower expected value", styles["cell"]),
-        Paragraph("Upper expected value", styles["cell"]),
-        Paragraph("Change from previous month", styles["cell"]),
-    ]
-    month_rows = [month_header]
-    for row in report.get("monthly_forecasts") or []:
-        month_rows.append([
-            Paragraph(iso_to_label(row["month"]), styles["cell"]),
-            Paragraph(_format_amount(row.get("forecast_amount")), styles["cellRight"]),
-            Paragraph(_format_amount(row.get("lower_bound")), styles["cellRight"]),
-            Paragraph(_format_amount(row.get("upper_bound")), styles["cellRight"]),
-            Paragraph(_format_percent(row.get("change_percent")), styles["cellRight"]),
-        ])
-    story.append(KeepTogether([Paragraph("6. Monthly forecast table", styles["section"])]))
-    story.append(_table(month_rows, [24 * mm, 32 * mm, 36 * mm, 36 * mm, width - 128 * mm]))
+        month_header = [
+            Paragraph("Month", styles["cell"]),
+            Paragraph("Forecast amount", styles["cell"]),
+            Paragraph("Lower expected value", styles["cell"]),
+            Paragraph("Upper expected value", styles["cell"]),
+            Paragraph("Change from previous month", styles["cell"]),
+        ]
+        month_rows = [month_header]
+        for row in report.get("monthly_forecasts") or []:
+            month_rows.append([
+                Paragraph(iso_to_label(row["month"]), styles["cell"]),
+                Paragraph(_format_amount(row.get("forecast_amount")), styles["cellRight"]),
+                Paragraph(_format_amount(row.get("lower_bound")), styles["cellRight"]),
+                Paragraph(_format_amount(row.get("upper_bound")), styles["cellRight"]),
+                Paragraph(_format_percent(row.get("change_percent")), styles["cellRight"]),
+            ])
+        story.append(KeepTogether([Paragraph("6. Monthly forecast table", styles["section"])]))
+        story.append(_table(month_rows, [24 * mm, 32 * mm, 36 * mm, 36 * mm, width - 128 * mm]))
 
-    comparison_header = [
-        Paragraph("Forecast month", styles["cell"]),
-        Paragraph("Historical average", styles["cell"]),
-        Paragraph("Forecast amount", styles["cell"]),
-        Paragraph("Difference", styles["cell"]),
-        Paragraph("% change", styles["cell"]),
-        Paragraph("Historical periods used", styles["cell"]),
-    ]
-    comparison_rows = [comparison_header]
-    for row in report.get("comparison") or []:
-        periods = ", ".join(
-            f"{iso_to_label(item['month'])} {_format_amount(item['actual'])}"
-            for item in row.get("historical_periods_used") or []
-        ) or UNAVAILABLE
-        comparison_rows.append([
-            Paragraph(iso_to_label(row["month"]), styles["cell"]),
-            Paragraph(_format_amount(row.get("historical_average")), styles["cellRight"]),
-            Paragraph(_format_amount(row.get("forecast_amount")), styles["cellRight"]),
-            Paragraph(_format_amount(row.get("difference")), styles["cellRight"]),
-            Paragraph(_format_percent(row.get("difference_percent")), styles["cellRight"]),
-            Paragraph(periods, styles["cell"]),
-        ])
-    story.append(KeepTogether([Paragraph("7. Historical vs forecast comparison", styles["section"])]))
-    story.append(_table(comparison_rows, [26 * mm, 28 * mm, 28 * mm, 24 * mm, 20 * mm, width - 126 * mm]))
+        comparison_header = [
+            Paragraph("Forecast month", styles["cell"]),
+            Paragraph("Historical average", styles["cell"]),
+            Paragraph("Forecast amount", styles["cell"]),
+            Paragraph("Difference", styles["cell"]),
+            Paragraph("% change", styles["cell"]),
+            Paragraph("Historical periods used", styles["cell"]),
+        ]
+        comparison_rows = [comparison_header]
+        for row in report.get("comparison") or []:
+            periods = ", ".join(
+                f"{iso_to_label(item['month'])} {_format_amount(item['actual'])}"
+                for item in row.get("historical_periods_used") or []
+            ) or UNAVAILABLE
+            comparison_rows.append([
+                Paragraph(iso_to_label(row["month"]), styles["cell"]),
+                Paragraph(_format_amount(row.get("historical_average")), styles["cellRight"]),
+                Paragraph(_format_amount(row.get("forecast_amount")), styles["cellRight"]),
+                Paragraph(_format_amount(row.get("difference")), styles["cellRight"]),
+                Paragraph(_format_percent(row.get("difference_percent")), styles["cellRight"]),
+                Paragraph(periods, styles["cell"]),
+            ])
+        story.append(KeepTogether([Paragraph("7. Historical vs forecast comparison", styles["section"])]))
+        story.append(_table(comparison_rows, [26 * mm, 28 * mm, 28 * mm, 24 * mm, 20 * mm, width - 126 * mm]))
+    else:
+        story.append(Paragraph(str(report.get("no_forecast_message") or "No forecast available for the selected category."), styles["section"]))
+
+    _append_coverage_sections(story, report, styles, width)
 
     document.build(story)
     return buffer.getvalue()
+
+
+def _append_coverage_sections(story: list[Any], report: dict[str, Any], styles: dict[str, ParagraphStyle], width: float) -> None:
+    coverage_rows = [[Paragraph("Description", styles["cell"]), Paragraph("Budget Codes", styles["cell"])]]
+    for label, count in report.get("coverage_rows") or []:
+        coverage_rows.append([
+            Paragraph(str(label), styles["cell"]),
+            Paragraph(str(count), styles["cellRight"]),
+        ])
+    story.append(Paragraph("Forecast Coverage Summary", styles["section"]))
+    story.append(_table(coverage_rows, [width * 0.74, width * 0.26]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Excluded & Unavailable Budget Codes", styles["section"]))
+    accounts = list(report.get("unavailable_accounts") or [])
+    if not accounts:
+        story.append(Paragraph(str(report.get("no_unavailable_message") or "No excluded or unavailable budget codes."), styles["body"]))
+        return
+    header = [
+        Paragraph("ACT CODE", styles["cell"]),
+        Paragraph("ACT NAME", styles["cell"]),
+        Paragraph("CATEGORY", styles["cell"]),
+        Paragraph("STATUS", styles["cell"]),
+        Paragraph("REASON", styles["cell"]),
+    ]
+    data = [header]
+    for item in accounts:
+        data.append([
+            Paragraph(str(item.get("budget_code") or ""), styles["cell"]),
+            Paragraph(str(item.get("account_name") or ""), styles["cell"]),
+            Paragraph(str(item.get("category") or ""), styles["cell"]),
+            Paragraph("UNAVAILABLE", styles["cell"]),
+            Paragraph(str(item.get("reason") or ""), styles["cell"]),
+        ])
+    reason_width = max(width - 128 * mm, 36 * mm)
+    story.append(_table(data, [22 * mm, 42 * mm, 36 * mm, 28 * mm, reason_width]))

@@ -95,6 +95,185 @@ def load_master_identity() -> dict[str, Any]:
         raise DatabaseError("Unable to load the historical master identity.") from error
 
 
+def list_declarations() -> list[dict[str, str]]:
+    """Explicit missing declarations. Absence of a row means not submitted."""
+    try:
+        with get_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT budget_code, month
+                FROM historical_declarations
+                ORDER BY budget_code, month
+                """
+            ).fetchall()
+        return [{"budget_code": str(row["budget_code"]), "month": str(row["month"])} for row in rows]
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to load historical submission declarations.") from error
+
+
+def has_baseline_migration() -> bool:
+    try:
+        with get_connection() as connection:
+            row = connection.execute("SELECT 1 FROM legacy_baseline_migrations LIMIT 1").fetchone()
+        return row is not None
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to read the legacy baseline migration.") from error
+
+
+def get_baseline_migration(baseline_hash: str) -> dict[str, Any] | None:
+    try:
+        with get_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT baseline_hash, scope_start, scope_end, declaration_count, numeric_count,
+                       budget_code_count, reason, applied_at, audit_event_id
+                FROM legacy_baseline_migrations
+                WHERE baseline_hash = %s
+                """,
+                (baseline_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to read the legacy baseline migration.") from error
+
+
+def list_touched_submission_pairs() -> set[tuple[str, str]]:
+    """Code/month pairs that already have a confirmed revision."""
+    try:
+        with get_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT budget_code, month
+                FROM historical_change_records
+                WHERE budget_code IS NOT NULL AND month IS NOT NULL
+                """
+            ).fetchall()
+        return {(str(row["budget_code"]), str(row["month"])) for row in rows}
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to load historical revision provenance.") from error
+
+
+def insert_legacy_declarations(
+    *,
+    expected_version: int,
+    declarations: list[dict[str, str]],
+    audit: dict[str, Any],
+    changes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Insert explicit missing markers without rewriting numeric actuals."""
+    if not declarations:
+        raise ValueError("Legacy declaration backfill has nothing to insert.")
+    try:
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO dataset_master_meta (id, version)
+                    VALUES (1, 0)
+                    ON CONFLICT (id) DO NOTHING
+                    """
+                )
+                locked = connection.execute(
+                    "SELECT version FROM dataset_master_meta WHERE id = 1 FOR UPDATE"
+                ).fetchone()
+                current = int(locked["version"] if locked else 0)
+                if current != int(expected_version):
+                    raise DatasetConflictError(
+                        "The historical master changed while legacy declarations were being prepared."
+                    )
+                inserted = []
+                for item in declarations:
+                    row = connection.execute(
+                        """
+                        INSERT INTO historical_declarations (budget_code, month)
+                        VALUES (%s, %s)
+                        ON CONFLICT (budget_code, month) DO NOTHING
+                        RETURNING budget_code, month
+                        """,
+                        (str(item["budget_code"]), str(item["month"])),
+                    ).fetchone()
+                    if row is not None:
+                        inserted.append({"budget_code": str(row["budget_code"]), "month": str(row["month"])})
+                if not inserted:
+                    return {"audit_id": None, "version": current, "inserted": []}
+                audit_changes = [
+                    item for item in changes
+                    if (str(item.get("budget_code")), str(item.get("month")))
+                    in {(row["budget_code"], row["month"]) for row in inserted}
+                ]
+                audit_row = connection.execute(
+                    """
+                    INSERT INTO dataset_audit_events (
+                        file_id, file_name, action, actor_tid, actor_oid, actor_display_name,
+                        actor_username, occurred_at, inserted_count, changed_count, changes, reason, summary
+                    )
+                    VALUES (
+                        %(file_id)s, %(file_name)s, %(action)s, %(actor_tid)s, %(actor_oid)s,
+                        %(actor_display_name)s, %(actor_username)s, %(occurred_at)s,
+                        %(inserted_count)s, %(changed_count)s, %(changes)s, %(reason)s, %(summary)s
+                    )
+                    RETURNING id
+                    """,
+                    {
+                        **audit,
+                        "inserted_count": len(inserted),
+                        "changed_count": len(inserted),
+                        "changes": Jsonb(audit_changes),
+                        "reason": audit.get("reason"),
+                        "summary": Jsonb(audit.get("summary") or {}),
+                    },
+                ).fetchone()
+                audit_id = int(audit_row["id"])
+                with connection.cursor() as cursor:
+                    cursor.executemany(
+                        """
+                        INSERT INTO historical_change_records (
+                            audit_event_id, file_id, action, operation, budget_code, month,
+                            previous_amount, new_amount, previous_category, new_category,
+                            previous_description, new_description, actor_display_name, actor_username,
+                            occurred_at, previous_submission, new_submission
+                        )
+                        VALUES (
+                            %(audit_event_id)s, %(file_id)s, %(action)s, %(operation)s, %(budget_code)s, %(month)s,
+                            %(previous_amount)s, %(new_amount)s, %(previous_category)s, %(new_category)s,
+                            %(previous_description)s, %(new_description)s, %(actor_display_name)s,
+                            %(actor_username)s, %(occurred_at)s, %(previous_submission)s, %(new_submission)s
+                        )
+                        """,
+                        [
+                            {
+                                "audit_event_id": audit_id,
+                                "file_id": None,
+                                "action": audit["action"],
+                                "operation": "DECLARE_MISSING",
+                                "budget_code": item["budget_code"],
+                                "month": item["month"],
+                                "previous_amount": None,
+                                "new_amount": None,
+                                "previous_category": "",
+                                "new_category": "",
+                                "previous_description": "",
+                                "new_description": "",
+                                "actor_display_name": audit.get("actor_display_name") or "",
+                                "actor_username": audit.get("actor_username") or "",
+                                "occurred_at": audit["occurred_at"],
+                                "previous_submission": "absent",
+                                "new_submission": "declared_missing",
+                            }
+                            for item in inserted
+                        ],
+                    )
+                connection.execute(
+                    "UPDATE dataset_master_meta SET version = %s, updated_at = NOW() WHERE id = 1",
+                    (current + 1,),
+                )
+        return {"audit_id": audit_id, "version": current + 1, "inserted": inserted}
+    except DatasetConflictError:
+        raise
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to record legacy missing declarations.") from error
+
+
 def list_historical_actuals() -> list[dict[str, Any]]:
     try:
         with get_connection() as connection:
@@ -215,6 +394,22 @@ def get_preview(preview_id: str) -> dict[str, Any] | None:
         return dict(row) if row else None
     except (psycopg.Error, ValueError) as error:
         raise DatabaseError("Unable to load the dataset preview.") from error
+
+
+def get_preview_confirmation(preview_id: str) -> dict[str, Any] | None:
+    try:
+        with get_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT preview_id, status, file_id, message, result, updated_at
+                FROM dataset_preview_confirmations
+                WHERE preview_id = %s
+                """,
+                (str(preview_id),),
+            ).fetchone()
+        return dict(row) if row else None
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to read the preview confirmation.") from error
 
 
 def delete_preview(preview_id: str) -> None:
@@ -377,6 +572,9 @@ def commit_master_state(
     budget_codes: list[dict[str, Any]] | None = None,
     earliest_month: str | None = None,
     latest_month: str | None = None,
+    declarations: list[dict[str, Any]] | None = None,
+    confirmation: dict[str, Any] | None = None,
+    baseline_migration: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replace the master rows and write audit records in one transaction."""
     try:
@@ -396,6 +594,26 @@ def commit_master_state(
                 if current != int(expected_version):
                     raise DatasetConflictError(
                         "The historical master changed while this review was open. Validate again before saving."
+                    )
+                if file_row:
+                    connection.execute(
+                        """
+                        INSERT INTO dataset_files (
+                            id, original_filename, stored_filename, content_type, file_size, checksum,
+                            sheet_name, revision, content_hash, status, staged_path, is_legacy,
+                            uploaded_at, uploaded_tid, uploaded_oid, uploaded_display_name, uploaded_username,
+                            confirmed_at, confirmed_display_name, confirmed_username, validation_summary, change_kind
+                        )
+                        VALUES (
+                            %(id)s, %(original_filename)s, %(stored_filename)s, %(content_type)s, %(file_size)s,
+                            %(checksum)s, %(sheet_name)s, %(revision)s, %(content_hash)s, %(status)s, %(staged_path)s,
+                            %(is_legacy)s, %(uploaded_at)s, %(uploaded_tid)s, %(uploaded_oid)s,
+                            %(uploaded_display_name)s, %(uploaded_username)s,
+                            %(confirmed_at)s, %(confirmed_display_name)s, %(confirmed_username)s,
+                            %(validation_summary)s, %(change_kind)s
+                        )
+                        """,
+                        {**file_row, "validation_summary": Jsonb(file_row.get("validation_summary") or {})},
                     )
                 connection.execute("DELETE FROM historical_actuals")
                 if next_records:
@@ -419,29 +637,9 @@ def commit_master_state(
                                     "category": item.get("category") or "",
                                     "source_file_id": item.get("source_file_id"),
                                 }
-                                for item in next_records
-                                if item.get("amount") is not None
-                            ],
-                        )
-                if file_row:
-                    connection.execute(
-                        """
-                        INSERT INTO dataset_files (
-                            id, original_filename, stored_filename, content_type, file_size, checksum,
-                            sheet_name, revision, content_hash, status, staged_path, is_legacy,
-                            uploaded_at, uploaded_tid, uploaded_oid, uploaded_display_name, uploaded_username,
-                            confirmed_at, confirmed_display_name, confirmed_username, validation_summary, change_kind
-                        )
-                        VALUES (
-                            %(id)s, %(original_filename)s, %(stored_filename)s, %(content_type)s, %(file_size)s,
-                            %(checksum)s, %(sheet_name)s, %(revision)s, %(content_hash)s, %(status)s, %(staged_path)s,
-                            %(is_legacy)s, %(uploaded_at)s, %(uploaded_tid)s, %(uploaded_oid)s,
-                            %(uploaded_display_name)s, %(uploaded_username)s,
-                            %(confirmed_at)s, %(confirmed_display_name)s, %(confirmed_username)s,
-                            %(validation_summary)s, %(change_kind)s
-                        )
-                        """,
-                        {**file_row, "validation_summary": Jsonb(file_row.get("validation_summary") or {})},
+                            for item in next_records
+                            if item.get("amount") is not None
+                        ],
                     )
                 if file_status_update:
                     connection.execute(
@@ -483,13 +681,13 @@ def commit_master_state(
                                 audit_event_id, file_id, action, operation, budget_code, month,
                                 previous_amount, new_amount, previous_category, new_category,
                                 previous_description, new_description, actor_display_name, actor_username,
-                                occurred_at
+                                occurred_at, previous_submission, new_submission
                             )
                             VALUES (
                                 %(audit_event_id)s, %(file_id)s, %(action)s, %(operation)s, %(budget_code)s, %(month)s,
                                 %(previous_amount)s, %(new_amount)s, %(previous_category)s, %(new_category)s,
                                 %(previous_description)s, %(new_description)s, %(actor_display_name)s,
-                                %(actor_username)s, %(occurred_at)s
+                                %(actor_username)s, %(occurred_at)s, %(previous_submission)s, %(new_submission)s
                             )
                             """,
                             [
@@ -509,6 +707,8 @@ def commit_master_state(
                                     "actor_display_name": audit.get("actor_display_name") or "",
                                     "actor_username": audit.get("actor_username") or "",
                                     "occurred_at": audit["occurred_at"],
+                                    "previous_submission": item.get("previous_submission"),
+                                    "new_submission": item.get("new_submission"),
                                 }
                                 for item in changes
                             ],
@@ -518,6 +718,22 @@ def commit_master_state(
                         "UPDATE historical_change_records SET reversed_by_audit_id = %s WHERE id = ANY(%s)",
                         (audit_id, reversed_change_ids),
                     )
+                if declarations is not None:
+                    connection.execute("DELETE FROM historical_declarations")
+                    declaration_rows = [
+                        {"budget_code": str(item["budget_code"]), "month": str(item["month"])}
+                        for item in declarations
+                        if item.get("budget_code") and item.get("month")
+                    ]
+                    if declaration_rows:
+                        with connection.cursor() as cursor:
+                            cursor.executemany(
+                                """
+                                INSERT INTO historical_declarations (budget_code, month)
+                                VALUES (%(budget_code)s, %(month)s)
+                                """,
+                                declaration_rows,
+                            )
                 if budget_codes is not None:
                     connection.execute(
                         """
@@ -534,6 +750,8 @@ def commit_master_state(
                                         "budget_code": str(item["budget_code"]),
                                         "description": item.get("description") or "",
                                         "category": item.get("category") or "",
+                                        "effective_from": item.get("effective_from") or None,
+                                        "effective_to": item.get("effective_to") or None,
                                     }
                                     for item in budget_codes
                                     if item.get("budget_code")
@@ -541,6 +759,46 @@ def commit_master_state(
                             ),
                             earliest_month,
                             latest_month,
+                        ),
+                    )
+                if confirmation and confirmation.get("preview_id"):
+                    recorded = connection.execute(
+                        """
+                        INSERT INTO dataset_preview_confirmations (
+                            preview_id, status, file_id, message, result, updated_at
+                        )
+                        VALUES (%s, 'committed', %s, %s, %s, NOW())
+                        ON CONFLICT (preview_id) DO NOTHING
+                        RETURNING preview_id
+                        """,
+                        (
+                            str(confirmation["preview_id"]),
+                            confirmation.get("file_id"),
+                            confirmation.get("message") or "",
+                            Jsonb(confirmation.get("result") or {}),
+                        ),
+                    ).fetchone()
+                    if recorded is None:
+                        raise DatasetConflictError("This preview was already saved.")
+                if baseline_migration:
+                    connection.execute(
+                        """
+                        INSERT INTO legacy_baseline_migrations (
+                            baseline_hash, scope_start, scope_end, declaration_count, numeric_count,
+                            budget_code_count, reason, applied_at, audit_event_id
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            baseline_migration["baseline_hash"],
+                            baseline_migration.get("scope_start"),
+                            baseline_migration.get("scope_end"),
+                            int(baseline_migration["declaration_count"]),
+                            int(baseline_migration["numeric_count"]),
+                            int(baseline_migration["budget_code_count"]),
+                            baseline_migration["reason"],
+                            baseline_migration["applied_at"],
+                            audit_id,
                         ),
                     )
                 connection.execute(

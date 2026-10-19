@@ -1,5 +1,6 @@
 export const LOCK_MESSAGE = "Model training in progress. Please wait.";
-export const CONFIRM_TEXT = "The system will be unavailable until training and model saving finish.";
+export const CONFIRM_TEXT = "Training uses the current historical master. The system will be unavailable to all users until training and Save Models finish.";
+export const RETRAIN_SAVE_NOTICE = "After training completes, you must select Save Models.";
 export const READY_TEXT = "Training completed — ready to save";
 export const SAVED_TEXT = "Models saved successfully";
 export const JOB_STORAGE_KEY = "retrainJobId";
@@ -73,10 +74,12 @@ export function progressText(status) {
   const current = status.progress_current;
   const total = status.progress_total;
   const code = status.progress_budget_code ? ` · ${status.progress_budget_code}` : "";
+  const algorithm = status.progress_algorithm ? ` · ${status.progress_algorithm}` : "";
+  const fold = status.progress_fold ? ` · ${status.progress_fold}` : "";
   if (Number.isInteger(current) && Number.isInteger(total) && total > 0) {
-    return `${stage} ${current} of ${total}${code}`;
+    return `${stage} ${current} of ${total}${code}${algorithm}${fold}`;
   }
-  return `${stage}${code}`;
+  return `${stage}${code}${algorithm}${fold}`;
 }
 
 export function shouldStickToBottom(scrollHeight, scrollTop, clientHeight, threshold = 24) {

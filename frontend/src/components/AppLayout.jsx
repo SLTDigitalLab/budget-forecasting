@@ -8,7 +8,7 @@ import AppErrorBoundary from "./AppErrorBoundary";
 import RetrainExperience from "./RetrainExperience";
 import Sidebar from "./Sidebar";
 
-export default function AppLayout() {
+export default function AppLayout({ contentInert = false }) {
   const [open, setOpen] = useState(false);
   const [actionPrompt, setActionPrompt] = useState(null);
   const [actionError, setActionError] = useState("");
@@ -41,7 +41,11 @@ export default function AppLayout() {
         />
       ) : null}
       <Sidebar open={open} onNavigate={() => setOpen(false)} />
-      <div className="content">
+      <div
+        className="content"
+        inert={contentInert ? "" : undefined}
+        aria-hidden={contentInert ? "true" : undefined}
+      >
         <button
           type="button"
           className="menu-button generate-button"

@@ -88,7 +88,7 @@ export function formatCallbackError(error, description = "") {
     return "Microsoft sign-in was cancelled. Retry when you are ready to continue.";
   }
   if (/AADSTS50011/i.test(detail) || /redirect.?uri/i.test(detail)) {
-    return "Microsoft rejected this app's redirect URL. Ask an administrator to add http://localhost:5174 as a Single-page application redirect URI. The Tenant ID and Client ID are unchanged.";
+    return "Microsoft rejected this app's redirect URL. Ask an administrator to add http://localhost:3003 as a Single-page application redirect URI. The Tenant ID and Client ID are unchanged.";
   }
   if (detail) {
     return `Microsoft sign-in could not be completed. ${detail}`;

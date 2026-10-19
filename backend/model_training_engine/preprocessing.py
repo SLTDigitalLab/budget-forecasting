@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from calendar import month_abbr, month_name
+import logging
 from math import floor
 from pathlib import Path
 import re
@@ -31,9 +32,18 @@ KIND_NUMBER = "number"
 KIND_MISSING = "missing"
 KIND_INVALID = "invalid"
 
+HISTORICAL_ACTUAL_POLICY = "negative_same_year_positive_mean"
+HISTORICAL_ACTUAL_POLICY_VERSION = "negative-same-year-positive-mean-v1"
+logger = logging.getLogger(__name__)
+BOOK_ENTRY_WORKBOOK_NAME = "Book entry accounts.xlsx"
+_BOOK_ENTRY_CACHE: set[str] | None = None
+_BOOK_ENTRY_PROVIDER = None
+ACTUALS_DISPLAY_LABEL = "Historical actuals are shown with their original sign. Stored values are unchanged."
+
 OUTCOME_READY = "READY"
 OUTCOME_ZERO_POLICY = "ZERO_POLICY"
 OUTCOME_NO_DATA = "NO_DATA"
+OUTCOME_NO_POSITIVE_YEAR_MEAN = "NO_POSITIVE_YEAR_MEAN"
 OUTCOME_UNRESOLVED = "NEEDS_MISSING_AWARE_MODEL_OR_REVIEW"
 OUTCOME_INVALID = "INVALID_ENTRIES"
 NOT_EVALUABLE = "NOT_EVALUABLE"
@@ -41,14 +51,13 @@ NOT_EVALUABLE = "NOT_EVALUABLE"
 STATUS_FITTED_MODEL = "FITTED_MODEL"
 STATUS_ZERO_POLICY = "ZERO_POLICY"
 STATUS_NO_DATA = "NO_DATA"
+STATUS_NO_POSITIVE_YEAR_MEAN = "NO_POSITIVE_YEAR_MEAN"
 STATUS_UNRESOLVED_MISSING = "UNRESOLVED_MISSING"
 STATUS_INVALID_DATA = "INVALID_DATA"
 STATUS_INSUFFICIENT_HISTORY = "INSUFFICIENT_HISTORY"
 STATUS_NOT_EVALUABLE = "NOT_EVALUABLE"
 STATUS_NO_VALID_WINNER = "NO_VALID_WINNER"
 STATUS_FIT_FAILED = "FIT_FAILED"
-
-MAX_FORECAST_END = pd.Timestamp(year=2030, month=12, day=1)
 
 REASON_ALL_MISSING = "ALL_MISSING"
 REASON_ALL_ZERO = "ALL_ZERO"
@@ -57,10 +66,14 @@ REASON_SHORT_GAP_INTERPOLATED = "SHORT_INTERNAL_GAP_INTERPOLATED"
 REASON_UNRESOLVED_GAPS = "UNRESOLVED_MISSING_GAPS"
 REASON_NO_USABLE_NUMERIC = "NO_USABLE_NUMERIC_OBSERVATION"
 REASON_INVALID_TRAIN = "INVALID_TRAINING_ENTRIES"
+REASON_NO_POSITIVE_YEAR_MEAN = "NO_POSITIVE_YEAR_MEAN"
 METHOD_LINEAR_INTERNAL = "linear_internal_gap"
 METHOD_ACCOUNT_MEAN = "account_mean"
 
-MISSING_TOKENS = {"", "nan", "none", "null", "n/a", "na", "#n/a", "<na>"}
+MISSING_TOKENS = {
+    "", "nan", "none", "null", "n/a", "na", "#n/a", "<na>",
+    "declared missing", "declared_missing", "explicit missing", "explicit_missing",
+}
 BLANK_PLACEHOLDERS = {"-", "–", "—", "−", ".", ".."}
 EXCEL_ERROR_PATTERN = re.compile(
     r"^#(DIV/0!|N/A|NAME\?|NULL!|NUM!|REF!|VALUE!|GETTING_DATA|SPILL!|CALC!)",
@@ -72,9 +85,10 @@ for month_number in range(1, 13):
     MONTH_LOOKUP[month_name[month_number].lower()] = month_number
     MONTH_LOOKUP[month_abbr[month_number].lower()] = month_number
 MONTH_LOOKUP["sept"] = 9
+MONTH_LOOKUP["sepetember"] = 9
 
 MONTH_NAME_PATTERN = (
-    "january|february|march|april|june|july|august|september|october|november|december|"
+    "sepetember|january|february|march|april|june|july|august|september|october|november|december|"
     "sept|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
 )
 
@@ -189,6 +203,226 @@ def parse_amount_cell(value) -> dict[str, Any]:
     return {"kind": KIND_NUMBER, "value": (-number if negative else number), "detail": ""}
 
 
+class BookEntryConfigurationError(RuntimeError):
+    """The authoritative Book Entry workbook is missing or unusable."""
+
+
+def book_entry_workbook_path() -> Path | None:
+    """Authoritative client workbook beside the historical dataset."""
+    dataset_dir = Path(__file__).resolve().parent / "dataset"
+    for name in (BOOK_ENTRY_WORKBOOK_NAME, "Book Entry Accounts.xlsx", "book entry accounts.xlsx"):
+        candidate = dataset_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _book_entry_code_text(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text if text.isdigit() else ""
+
+
+def _codes_from_book_entry_workbook(path: Path) -> set[str]:
+    return {row["budget_code"] for row in read_book_entry_rows(path)}
+
+
+def read_book_entry_rows(path: Path | None = None) -> list[dict[str, str]]:
+    """Code and name rows from the client workbook. Category is stored in the registry."""
+    target = path or book_entry_workbook_path()
+    if target is None:
+        raise BookEntryConfigurationError(
+            "Book Entry exclusion list is not configured. "
+            "Expected Book entry accounts.xlsx in the dataset directory."
+        )
+    frame = pd.read_excel(target, dtype=str)
+    columns = list(frame.columns)
+    preferred = [
+        column for column in columns
+        if any(token in str(column).strip().casefold() for token in ("code", "budget", "account", "entries"))
+    ]
+    code_column = None
+    for column in preferred or columns[:1]:
+        if any(_book_entry_code_text(value) for value in frame[column].tolist()):
+            code_column = column
+            break
+    if code_column is None:
+        return []
+    name_column = next((column for column in columns if column != code_column), None)
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, value in frame[code_column].items():
+        code = _book_entry_code_text(value)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        name = ""
+        if name_column is not None:
+            raw_name = frame.at[index, name_column]
+            if raw_name is not None and not (isinstance(raw_name, float) and pd.isna(raw_name)):
+                name = str(raw_name).strip()
+        rows.append({"budget_code": code, "budget_name": name})
+    return rows
+
+
+def write_book_entry_workbook(rows: list[dict[str, str]], path: Path | None = None) -> None:
+    """Replace the workbook atomically. The previous file is restored if the write fails."""
+    import os
+    import shutil
+    import tempfile
+
+    from openpyxl import Workbook, load_workbook
+
+    target = path or book_entry_workbook_path()
+    if target is None:
+        target = Path(__file__).resolve().parent / "dataset" / BOOK_ENTRY_WORKBOOK_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup = target.with_name(f"{target.name}.bak")
+    if target.exists():
+        shutil.copy2(target, backup)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="book-entry-", suffix=".xlsx", dir=target.parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    workbook = None
+    try:
+        if target.exists():
+            workbook = load_workbook(target)
+            sheet = workbook["Main Sheet"] if "Main Sheet" in workbook.sheetnames else workbook.active
+        else:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Main Sheet"
+        if sheet.cell(1, 1).value in (None, ""):
+            sheet.cell(1, 1, "Book Entries  ")
+        if sheet.max_row > 1:
+            sheet.delete_rows(2, sheet.max_row - 1)
+        for offset, row in enumerate(rows, start=2):
+            sheet.cell(offset, 1, str(row["budget_code"]))
+            sheet.cell(offset, 2, str(row.get("budget_name") or ""))
+        workbook.save(temporary)
+        workbook.close()
+        workbook = None
+        os.replace(temporary, target)
+    except Exception:
+        if workbook is not None:
+            workbook.close()
+        if backup.exists():
+            shutil.copy2(backup, target)
+        raise
+    finally:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+        if target.exists() and backup.exists():
+            backup.unlink(missing_ok=True)
+
+
+def set_book_entry_code_provider(provider) -> None:
+    """Install the runtime registry. None restores the workbook reader."""
+    global _BOOK_ENTRY_PROVIDER, _BOOK_ENTRY_CACHE
+    _BOOK_ENTRY_PROVIDER = provider
+    _BOOK_ENTRY_CACHE = None
+
+
+def clear_book_entry_cache() -> None:
+    global _BOOK_ENTRY_CACHE
+    _BOOK_ENTRY_CACHE = None
+
+
+def book_entry_account_codes() -> set[str]:
+    """Budget codes that must never be forecast or trained."""
+    global _BOOK_ENTRY_CACHE
+    if _BOOK_ENTRY_PROVIDER is not None:
+        try:
+            return {str(code) for code in _BOOK_ENTRY_PROVIDER() if str(code).strip()}
+        except BookEntryConfigurationError:
+            raise
+        except Exception as error:
+            raise BookEntryConfigurationError(
+                "Book Entry exclusion list could not be loaded from the registry."
+            ) from error
+    if _BOOK_ENTRY_CACHE is not None:
+        return set(_BOOK_ENTRY_CACHE)
+    path = book_entry_workbook_path()
+    if path is None:
+        raise BookEntryConfigurationError(
+            "Book Entry exclusion list is not configured. "
+            "Expected Book entry accounts.xlsx in the dataset directory."
+        )
+    try:
+        codes = _codes_from_book_entry_workbook(path)
+    except BookEntryConfigurationError:
+        raise
+    except Exception as error:
+        raise BookEntryConfigurationError(
+            f"Book Entry exclusion list could not be loaded from {path.name}."
+        ) from error
+    if not codes:
+        raise BookEntryConfigurationError(
+            f"Book Entry exclusion list in {path.name} did not contain any Budget Codes."
+        )
+    _BOOK_ENTRY_CACHE = set(codes)
+    return set(_BOOK_ENTRY_CACHE)
+
+
+def exclude_book_entry_codes(codes) -> list[str]:
+    blocked = book_entry_account_codes()
+    return [str(code) for code in codes if str(code) not in blocked]
+
+
+def effective_historical_actual(value) -> float:
+    """Signed calculation value for one historical actual. Does not mutate the input.
+
+    Positive, negative, and zero numbers keep their stored sign. Missing, blank,
+    and declared-missing markers stay missing and never become 0. Training
+    negative replacement uses fit_same_year_positive_means, not this helper.
+    """
+    if isinstance(value, str) or value is None:
+        parsed = parse_amount_cell(value)
+        if parsed["kind"] != KIND_NUMBER:
+            return np.nan
+        number = float(parsed["value"])
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return np.nan
+    if not np.isfinite(number):
+        return np.nan
+    return number
+
+
+def normalize_historical_actuals(values) -> np.ndarray:
+    """Return a float copy of historical actuals with original signs preserved."""
+    source = np.asarray(values)
+    return np.array(source, dtype=float, copy=True).reshape(-1)
+
+
+def display_historical_actual(value):
+    """Signed display amount. Missing stays None so it is not shown as zero."""
+    number = effective_historical_actual(value)
+    if not np.isfinite(number):
+        return None
+    return float(number)
+
+
+def historical_actual_policy_status(bundle) -> dict[str, Any]:
+    """Read recorded policy metadata. A legacy bundle does not claim this policy."""
+    policy = {}
+    if isinstance(bundle, dict) and isinstance(bundle.get("historical_actual_policy"), dict):
+        policy = bundle["historical_actual_policy"]
+    version = policy.get("version")
+    if not version:
+        return {"status": "unavailable", "version": None, "rule": None}
+    return {
+        "status": "recorded",
+        "version": str(version),
+        "rule": policy.get("rule") or HISTORICAL_ACTUAL_POLICY,
+    }
+
+
 def clean_account_code(value):
     """Keep account codes as strings and strip Excel's trailing .0."""
     if pd.isna(value):
@@ -265,9 +499,9 @@ def detect_monthly_columns(column_names, history_start=HISTORY_START):
 def assign_categories(df, account_code_col, account_name_col):
     cleaned_code = df[account_code_col].map(clean_account_code)
     numeric_account_code = pd.to_numeric(df[account_code_col], errors="coerce")
-    account_name = df[account_name_col].astype("string")
-    is_category_row = cleaned_code.isna() & account_name.notna()
-    category = account_name.where(is_category_row).str.strip().ffill()
+    account_name = df[account_name_col].astype("string").str.strip()
+    is_category_row = cleaned_code.isna() & account_name.notna() & account_name.ne("")
+    category = account_name.where(is_category_row).ffill()
     assigned = df.copy()
     assigned["category"] = category
     assigned["numeric_account_code"] = numeric_account_code
@@ -541,23 +775,108 @@ def _safe_descriptive_stats(values: np.ndarray) -> dict[str, float]:
     }
 
 
+def observation_years(months, size: int) -> np.ndarray:
+    """Calendar year of each observation. The caller supplies the window's own months."""
+    labels = list(months or [])
+    if len(labels) != int(size):
+        raise ValueError("Month labels are required and must match the series length.")
+    years = np.empty(int(size), dtype=int)
+    for index, label in enumerate(labels):
+        if isinstance(label, pd.Timestamp):
+            timestamp = label
+        else:
+            timestamp = pd.to_datetime(label, errors="coerce")
+        if pd.isna(timestamp):
+            raise ValueError(f"Could not read a calendar year from {label!r}.")
+        years[index] = int(pd.Timestamp(timestamp).year)
+    return years
+
+
+def _numeric_mask(values: np.ndarray, kinds: np.ndarray | None) -> np.ndarray:
+    finite = np.isfinite(values)
+    if kinds is None:
+        return finite
+    kind_row = np.asarray(kinds, dtype=object).reshape(-1)
+    if kind_row.size != values.size:
+        raise ValueError("Observation-kind length does not match values.")
+    return finite & (kind_row == KIND_NUMBER)
+
+
+def fit_same_year_positive_means(
+    values: np.ndarray,
+    months,
+    kinds: np.ndarray | None = None,
+) -> dict[int, float]:
+    """Mean of strictly positive actuals by calendar year, using only this window.
+
+    Zeros, negatives, missing values, and non-finite values are not included.
+    The input array is not mutated.
+    """
+    array = np.asarray(values, dtype=float).reshape(-1)
+    years = observation_years(months, array.size)
+    numeric = _numeric_mask(array, kinds)
+    means: dict[int, float] = {}
+    for year in sorted(set(int(item) for item in years)):
+        selected = array[numeric & (years == year) & (array > 0)]
+        if selected.size:
+            means[int(year)] = float(np.sum(selected) / selected.size)
+    return means
+
+
+def apply_same_year_positive_means(
+    values: np.ndarray,
+    months,
+    year_means: dict[int, float],
+    kinds: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Replace negatives with a supplied same-year positive mean.
+
+    Positive values and zeros stay unchanged. Missing values stay missing.
+    A negative with no mean in ``year_means`` is left unresolved and becomes
+    NaN in the returned copy so it cannot be fitted. The input is not mutated.
+    """
+    array = np.array(np.asarray(values, dtype=float).reshape(-1), dtype=float, copy=True)
+    years = observation_years(months, array.size)
+    numeric = _numeric_mask(array, kinds)
+    detected = 0
+    replaced = 0
+    unresolved: list[int] = []
+    years_without: set[int] = set()
+    for index in range(array.size):
+        if not numeric[index] or array[index] >= 0:
+            continue
+        detected += 1
+        year = int(years[index])
+        mean_value = year_means.get(year)
+        if mean_value is None or not np.isfinite(float(mean_value)):
+            unresolved.append(index)
+            years_without.add(year)
+            array[index] = np.nan
+            continue
+        array[index] = float(mean_value)
+        replaced += 1
+    return array, {
+        "negative_detected": detected,
+        "negative_replaced": replaced,
+        "unresolved_count": len(unresolved),
+        "unresolved_indices": unresolved,
+        "years_without_positive_mean": sorted(years_without),
+    }
+
+
 def account_numeric_mean(
     values: np.ndarray,
     kinds: np.ndarray | None = None,
 ) -> float | None:
     """Arithmetic mean of one Budget Code's usable numeric values.
 
-    Zeros are included. Missing and invalid values are excluded. Returns None
-    when the series has no usable numeric observation.
+    Zeros are included. Missing and non-finite values are excluded. Negative
+    replacement is a separate earlier step; this mean does not turn negatives
+    into zeros. Returns None when the series has no usable numeric observation.
+    The input array is not mutated.
     """
     array = np.asarray(values, dtype=float).reshape(-1)
-    if kinds is None:
-        usable = array[np.isfinite(array)]
-    else:
-        kind_row = np.asarray(kinds, dtype=object).reshape(-1)
-        if kind_row.size != array.size:
-            raise ValueError("Observation-kind length does not match values.")
-        usable = array[(kind_row == KIND_NUMBER) & np.isfinite(array)]
+    usable = array[_numeric_mask(array, kinds)]
     if usable.size == 0:
         return None
     return float(np.mean(usable))
@@ -654,21 +973,37 @@ def prepare_series_window(
     interpolate: bool = False,
     max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
     imputation_mean: float | None = None,
+    months=None,
+    year_means: dict[int, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, str, str]:
-    """Prepare one chronological window independently. Never uses later observations.
+    """Prepare one chronological window. Statistics come only from this window.
 
-    Missing months are filled with this window's own mean unless
-    ``imputation_mean`` is supplied (evaluation uses the TRAIN mean).
-    ``interpolate`` and ``max_internal_gap`` are unused compatibility arguments.
+    Negative replacement uses strictly positive values from the same calendar
+    year inside ``months``. Missing months are then filled with this window's
+    own numeric mean unless ``imputation_mean`` is supplied. ``interpolate``
+    and ``max_internal_gap`` are unused compatibility arguments.
     """
     del interpolate, max_internal_gap
-    raw = np.array(values, dtype=float, copy=True)
-    kind_row = np.array(kinds, copy=True)
+    raw = np.asarray(values, dtype=float).reshape(-1)
+    kind_row = np.array(kinds, dtype=object, copy=True).reshape(-1)
+    unresolved_count = 0
+    if months is None:
+        transformed = np.array(raw, dtype=float, copy=True)
+        negative = _numeric_mask(transformed, kind_row) & (transformed < 0)
+        unresolved_count = int(negative.sum())
+        transformed[negative] = np.nan
+    else:
+        means = year_means if year_means is not None else fit_same_year_positive_means(raw, months, kind_row)
+        transformed, diagnostics = apply_same_year_positive_means(raw, months, means, kind_row)
+        unresolved_count = int(diagnostics["unresolved_count"])
+    if unresolved_count:
+        methods = np.full(transformed.shape, "", dtype=object)
+        return transformed, methods, OUTCOME_NO_POSITIVE_YEAR_MEAN, REASON_NO_POSITIVE_YEAR_MEAN
     mean_value = imputation_mean
     if mean_value is None:
-        mean_value = account_numeric_mean(raw, kind_row)
-    prepared, methods, _fills = fill_missing_with_mean(raw, kind_row, mean_value)
-    outcome, reason = classify_training_outcome(np.array(values, dtype=float), kind_row, prepared)
+        mean_value = account_numeric_mean(transformed, kind_row)
+    prepared, methods, _fills = fill_missing_with_mean(transformed, kind_row, mean_value)
+    outcome, reason = classify_training_outcome(raw, kind_row, prepared, unresolved_negative_count=0)
     return prepared, methods, outcome, reason
 
 
@@ -676,14 +1011,18 @@ def classify_training_outcome(
     train_values: np.ndarray,
     train_kinds: np.ndarray,
     prepared_train: np.ndarray,
+    unresolved_negative_count: int = 0,
 ) -> tuple[str, str]:
     if np.any(train_kinds == KIND_INVALID):
         return OUTCOME_INVALID, REASON_INVALID_TRAIN
-    original_finite = train_values[(train_kinds == KIND_NUMBER) & np.isfinite(train_values)]
-    if original_finite.size == 0:
+    if int(unresolved_negative_count) > 0:
+        return OUTCOME_NO_POSITIVE_YEAR_MEAN, REASON_NO_POSITIVE_YEAR_MEAN
+    observed = np.asarray(train_values, dtype=float).reshape(-1)
+    numeric = observed[_numeric_mask(observed, train_kinds)]
+    if numeric.size == 0:
         return OUTCOME_NO_DATA, REASON_ALL_MISSING
-    if np.all(original_finite == 0):
-        if np.any(train_kinds == KIND_MISSING):
+    if np.all(numeric == 0):
+        if np.any(np.asarray(train_kinds) == KIND_MISSING):
             return OUTCOME_ZERO_POLICY, REASON_ZERO_AND_MISSING_ONLY
         return OUTCOME_ZERO_POLICY, REASON_ALL_ZERO
     if np.any(~np.isfinite(prepared_train)):
@@ -708,7 +1047,8 @@ def preprocess_account_panel(
     history_labels = [month_label(ts) for ts in month_dates]
     allowed = {str(code) for code in (regular_expense_accounts or [])}
     codes = [str(code) for code in raw_matrix.index.tolist()]
-    raw_values = raw_matrix.loc[codes, history_labels].to_numpy(dtype=float)
+    source_values = np.array(raw_matrix.loc[codes, history_labels].to_numpy(dtype=float), copy=True)
+    raw_values = np.array(source_values, dtype=float, copy=True)
     kinds = kind_matrix.loc[codes, history_labels].to_numpy()
     prepared_train_full = np.full((len(codes), source_n_months), np.nan, dtype=float)
     raw_train_full = np.full((len(codes), source_n_months), np.nan, dtype=float)
@@ -747,9 +1087,25 @@ def preprocess_account_panel(
         test_kind = kinds[row_index, test_indices]
         window_raw = raw_values[row_index, window_indices]
         window_kind = kinds[row_index, window_indices]
-        train_mean = account_numeric_mean(train_raw, train_kind)
-        filled, methods, _fills = fill_missing_with_mean(train_raw, train_kind, train_mean)
-        test_filled, _test_methods, test_fills = fill_missing_with_mean(test_raw, test_kind, train_mean)
+        train_year_means = fit_same_year_positive_means(train_raw, train_labels, train_kind)
+        train_replaced, train_negative = apply_same_year_positive_means(
+            train_raw, train_labels, train_year_means, train_kind
+        )
+        test_replaced, test_negative = apply_same_year_positive_means(
+            test_raw, test_labels, train_year_means, test_kind
+        )
+        if train_negative["unresolved_count"]:
+            train_mean = None
+            filled = train_replaced
+            methods = np.full(train_replaced.shape, "", dtype=object)
+            test_filled = test_replaced
+            test_fills = []
+        else:
+            train_mean = account_numeric_mean(train_replaced, train_kind)
+            filled, methods, _fills = fill_missing_with_mean(train_replaced, train_kind, train_mean)
+            test_filled, _test_methods, test_fills = fill_missing_with_mean(
+                test_replaced, test_kind, train_mean
+            )
         test_fill_count += len(test_fills)
         if train_mean is None:
             unable_to_impute += 1
@@ -760,20 +1116,35 @@ def preprocess_account_panel(
             imputation_mask_full[row_index, source_index] = methods[offset] != ""
         for offset, source_index in enumerate(test_indices):
             raw_test_full[row_index, source_index] = test_raw[offset]
+            unresolved_target = offset in set(test_negative["unresolved_indices"])
             observed_test_mask_full[row_index, source_index] = (
-                test_kind[offset] == KIND_NUMBER and np.isfinite(test_raw[offset])
+                test_kind[offset] == KIND_NUMBER
+                and np.isfinite(test_raw[offset])
+                and not unresolved_target
             )
         prepared_train_by_account[code] = pd.Series(filled, index=train_labels, dtype=float)
         prepared_test_by_account[code] = pd.Series(test_filled, index=test_labels, dtype=float)
         raw_test_by_account[code] = pd.Series(test_raw, index=test_labels, dtype=float)
+        policy_kinds = np.where(window_kind == KIND_INVALID, KIND_MISSING, window_kind)
+        train_policy_kinds = np.where(train_kind == KIND_INVALID, KIND_MISSING, train_kind)
         if np.any(train_kind == KIND_INVALID):
-            outcome, reason = classify_training_outcome(train_raw, train_kind, filled)
-        else:
-            policy_kinds = np.where(window_kind == KIND_INVALID, KIND_MISSING, window_kind)
-            _full_prepared, _full_methods, outcome, reason = prepare_series_window(
-                window_raw, policy_kinds
+            train_window_outcome, train_window_reason = classify_training_outcome(
+                train_raw, train_kind, filled
             )
-            del _full_prepared, _full_methods
+        else:
+            _train_prepared, _train_methods, train_window_outcome, train_window_reason = prepare_series_window(
+                train_raw,
+                train_policy_kinds,
+                months=train_labels,
+                year_means=train_year_means,
+            )
+            del _train_prepared, _train_methods
+        _full_prepared, _full_methods, outcome, reason = prepare_series_window(
+            window_raw,
+            policy_kinds,
+            months=window_labels,
+        )
+        del _full_prepared, _full_methods
         source_stats = _series_counts(raw_values[row_index], kinds[row_index])
         window_stats = _series_counts(window_raw, window_kind)
         train_stats = _series_counts(train_raw, train_kind)
@@ -817,11 +1188,13 @@ def preprocess_account_panel(
                 "category": category,
                 "training_outcome": outcome,
                 "training_reason": reason,
+                "train_window_outcome": train_window_outcome,
+                "train_window_reason": train_window_reason,
+                "full_history_outcome": outcome,
+                "full_history_reason": reason,
                 "zero_policy": outcome == OUTCOME_ZERO_POLICY,
                 "no_data": outcome == OUTCOME_NO_DATA,
-                "ready_for_complete_data_model": (
-                    outcome == OUTCOME_READY and bool(np.isfinite(filled).all())
-                ),
+                "ready_for_complete_data_model": outcome == OUTCOME_READY,
                 "evaluation_status": evaluation_status,
                 "observed_test_count": observed_test_count,
                 "history_start": split_payload["history_start"],
@@ -860,7 +1233,8 @@ def preprocess_account_panel(
         for month in split["test_months"]:
             kind_test.loc[code, month] = kind_matrix.loc[code, month]
     observed_test_mask = pd.DataFrame(observed_test_mask_full, index=codes, columns=history_labels)
-    accounts_df = raw_matrix.loc[codes, history_labels].copy()
+    normalized_frame = pd.DataFrame(raw_values, index=codes, columns=history_labels)
+    accounts_df = normalized_frame.copy()
     accounts_df.insert(0, ACCOUNT_CODE_COLUMN, codes)
     accounts_df = accounts_df.reset_index(drop=True)
     zero_policy_codes = outcome_frame.loc[outcome_frame["zero_policy"], "account_code"].tolist()
@@ -892,7 +1266,7 @@ def preprocess_account_panel(
         "accounts_df": accounts_df,
         "selected_12": accounts_df,
         "account_matrix": raw_matrix.loc[codes, history_labels],
-        "selected_matrix": raw_matrix.loc[codes, history_labels],
+        "selected_matrix": normalized_frame,
         "kind_matrix": kind_matrix.loc[codes, history_labels],
         "month_columns": history_labels,
         "month_dates": month_dates,
@@ -1157,7 +1531,66 @@ def map_training_outcome_to_status(outcome: str) -> str:
         return STATUS_INVALID_DATA
     if outcome == OUTCOME_UNRESOLVED:
         return STATUS_UNRESOLVED_MISSING
+    if outcome == OUTCOME_NO_POSITIVE_YEAR_MEAN:
+        return STATUS_NO_POSITIVE_YEAR_MEAN
     return str(outcome)
+
+
+def negative_policy_summary(matrix, kind_matrix, months, codes) -> dict[str, Any]:
+    """Full-history diagnostic for the eligible accounts. Does not fit models."""
+    selected = [str(code) for code in codes]
+    labels = list(months)
+    detected = 0
+    replaced = 0
+    unresolved = 0
+    blocked = []
+    code_years = []
+    no_data = 0
+    zero_policy = 0
+    imputed = 0
+    eligible = 0
+    for code in selected:
+        values = np.asarray(matrix.loc[code, labels], dtype=float)
+        kinds = np.asarray(kind_matrix.loc[code, labels], dtype=object)
+        means = fit_same_year_positive_means(values, labels, kinds)
+        _transformed, diagnostics = apply_same_year_positive_means(values, labels, means, kinds)
+        detected += int(diagnostics["negative_detected"])
+        replaced += int(diagnostics["negative_replaced"])
+        unresolved += int(diagnostics["unresolved_count"])
+        for year in diagnostics["years_without_positive_mean"]:
+            code_years.append({"budget_code": code, "year": int(year)})
+        _prepared, methods, outcome, _reason = prepare_series_window(values, kinds, months=labels, year_means=means)
+        if diagnostics["unresolved_count"] or outcome == OUTCOME_NO_POSITIVE_YEAR_MEAN:
+            blocked.append(code)
+        elif outcome == OUTCOME_NO_DATA:
+            no_data += 1
+        elif outcome == OUTCOME_ZERO_POLICY:
+            zero_policy += 1
+        elif outcome == OUTCOME_READY:
+            eligible += 1
+            imputed += int(np.sum(np.asarray(methods) == METHOD_ACCOUNT_MEAN))
+    report = {
+        "policy_version": HISTORICAL_ACTUAL_POLICY_VERSION,
+        "budget_codes_loaded": int(len(selected)),
+        "negative_observations": int(detected),
+        "negative_observations_replaced": int(replaced),
+        "code_years_without_positive_mean": code_years,
+        "unresolved_observations": int(unresolved),
+        "missing_values_imputed": int(imputed),
+        "no_data_accounts": int(no_data),
+        "zero_policy_accounts": int(zero_policy),
+        "blocked_no_positive_year_mean": blocked,
+        "evaluation_eligible_accounts": int(eligible),
+    }
+    logger.info(
+        "Negative preprocessing %s: loaded=%s replaced=%s unresolved=%s blocked=%s",
+        HISTORICAL_ACTUAL_POLICY_VERSION,
+        report["budget_codes_loaded"],
+        report["negative_observations_replaced"],
+        report["unresolved_observations"],
+        len(blocked),
+    )
+    return report
 
 
 def run_preprocessing(

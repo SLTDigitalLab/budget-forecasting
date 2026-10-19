@@ -3,9 +3,14 @@
 Model families:
 ARIMA, SARIMA, ARIMAX, SARIMAX, ETS, XGBoost, Prophet.
 
-Each account is evaluated on its own historical window. Parameter-tuning folds
-stay inside the training window. The outer 20% is a selection-holdout, not an
-untouched final test. Production does not use overall-algorithm selection.
+When the chronological history is long enough, each algorithm is scored on the
+same three expanding-window folds. For 42 months those folds are train 24 /
+validate 6, train 30 / validate 6, and train 36 / validate 6. A longer history
+keeps the latest three six-month validation blocks and lengthens the training
+windows. A shorter history is marked INSUFFICIENT_FOLDS and is not replaced
+with shuffled cross-validation. Imputation and scaling are fit on each fold's
+training rows only. Validation targets that were missing stay unscored.
+Production does not use overall-algorithm selection.
 """
 
 from __future__ import annotations
@@ -34,17 +39,22 @@ from preprocessing import (
     KIND_MISSING,
     OUTCOME_INVALID,
     OUTCOME_NO_DATA,
+    OUTCOME_NO_POSITIVE_YEAR_MEAN,
     OUTCOME_READY,
     OUTCOME_UNRESOLVED,
     OUTCOME_ZERO_POLICY,
     STATUS_INSUFFICIENT_HISTORY,
     STATUS_INVALID_DATA,
     STATUS_NO_DATA,
+    STATUS_NO_POSITIVE_YEAR_MEAN,
     STATUS_NO_VALID_WINNER,
     STATUS_NOT_EVALUABLE,
     STATUS_UNRESOLVED_MISSING,
     STATUS_ZERO_POLICY,
     account_numeric_mean,
+    apply_same_year_positive_means,
+    fit_same_year_positive_means,
+    normalize_historical_actuals,
     calendar_split_sizes,
     fill_missing_with_mean,
     prepare_series_window,
@@ -52,6 +62,17 @@ from preprocessing import (
 
 DEFAULT_TEST_MONTHS = 6
 MIN_TRAIN_MONTHS = 12
+EXPANDING_FOLDS = 3
+EXPANDING_HORIZON = 6
+EXPANDING_MIN_TRAIN = 24
+FOLD_STATUS_READY = "READY"
+FOLD_STATUS_INSUFFICIENT = "INSUFFICIENT_FOLDS"
+ARIMA_FAMILY = {"ARIMA", "SARIMA", "ARIMAX", "SARIMAX"}
+NON_ARIMA_ALGORITHMS = {"ETS", "Holt-Winters", "XGBoost", "Prophet"}
+ROOT_MODULUS_LIMIT = 1.0
+# Floating-point noise around the unit circle is not an explosive root.
+# A modulus within this distance of 1 is the boundary. A smaller modulus is inside.
+ROOT_BOUNDARY_TOLERANCE = 1e-6
 # Holdout length is derived from the preprocessing calendar 80/20 split.
 # DEFAULT_TEST_MONTHS remains only for model-specific rolling-horizon helpers.
 SEASONAL_PERIOD = 12
@@ -268,16 +289,31 @@ def build_prophet_model(parameters: dict):
     Prophet = _import_prophet()
     if parameters.get("growth") == "logistic":
         raise ForecastEvaluationError("Prophet logistic growth is not used without valid floor and cap values.")
-    model = Prophet(
-        growth=parameters.get("growth") or "linear",
-        seasonality_mode=parameters.get("seasonality_mode") or "additive",
-        yearly_seasonality=bool(parameters.get("yearly_seasonality", False)),
-        weekly_seasonality=False,
-        daily_seasonality=False,
-        changepoint_prior_scale=float(parameters.get("changepoint_prior_scale", 0.05)),
-        seasonality_prior_scale=float(parameters.get("seasonality_prior_scale", 10.0)),
-        n_changepoints=int(parameters.get("n_changepoints", 5)),
-    )
+    try:
+        model = Prophet(
+            growth=parameters.get("growth") or "linear",
+            seasonality_mode=parameters.get("seasonality_mode") or "additive",
+            yearly_seasonality=bool(parameters.get("yearly_seasonality", False)),
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            changepoint_prior_scale=float(parameters.get("changepoint_prior_scale", 0.05)),
+            seasonality_prior_scale=float(parameters.get("seasonality_prior_scale", 10.0)),
+            n_changepoints=int(parameters.get("n_changepoints", 5)),
+        )
+    except AttributeError as error:
+        # Prophet 1.1.x leaves stan_backend unset when every backend loader fails
+        # (commonly missing CmdStan). Surface this as a Prophet-family failure.
+        raise ForecastEvaluationError(
+            "Prophet Stan backend is unavailable (CmdStan/cmdstanpy not usable). "
+            "Install CmdStan in the training environment before treating Prophet as eligible; "
+            "other algorithms may still succeed."
+        ) from error
+    if not hasattr(model, "stan_backend") or model.stan_backend is None:
+        raise ForecastEvaluationError(
+            "Prophet Stan backend is unavailable (CmdStan/cmdstanpy not usable). "
+            "Install CmdStan in the training environment before treating Prophet as eligible; "
+            "other algorithms may still succeed."
+        )
     fourier_order = parameters.get("yearly_fourier_order")
     if fourier_order:
         model.add_seasonality(name="yearly", period=365.25, fourier_order=int(fourier_order))
@@ -442,6 +478,14 @@ def calculate_metrics(actual, predicted, train_values=None, observed_mask=None, 
             train_values, obs_actual, obs_predicted, train_observed=train_observed
         )
 
+    mean_error = float(np.mean(obs_predicted - obs_actual))
+    if mean_error > 1e-9:
+        bias_direction = "overprediction"
+    elif mean_error < -1e-9:
+        bias_direction = "underprediction"
+    else:
+        bias_direction = "none"
+
     return {
         "MAE": mae,
         "RMSE": rmse,
@@ -450,6 +494,8 @@ def calculate_metrics(actual, predicted, train_values=None, observed_mask=None, 
         "sMAPE": smape,
         "MASE": mase,
         "R2": r_squared,
+        "MEAN_ERROR": mean_error,
+        "BIAS_DIRECTION": bias_direction,
         "MAPE_NOTE": mape_note,
         "MASE_NOTE": mase_note,
         "EVALUATION_STATUS": "EVALUABLE",
@@ -771,8 +817,8 @@ def _fit_forecast(model_name, parameters, train_values, train_months, steps, fut
             fitted = ARIMA(
                 series,
                 order=tuple(parameters["order"]),
-                enforce_stationarity=False,
-                enforce_invertibility=False,
+                enforce_stationarity=True,
+                enforce_invertibility=True,
             ).fit()
             raw = fitted.forecast(steps)
             residuals = getattr(fitted, "resid", None)
@@ -781,8 +827,8 @@ def _fit_forecast(model_name, parameters, train_values, train_months, steps, fut
                 series,
                 order=tuple(parameters["order"]),
                 seasonal_order=tuple(parameters["seasonal_order"]),
-                enforce_stationarity=False,
-                enforce_invertibility=False,
+                enforce_stationarity=True,
+                enforce_invertibility=True,
             ).fit(disp=False, maxiter=50)
             raw = fitted.forecast(steps)
             residuals = getattr(fitted, "resid", None)
@@ -806,8 +852,8 @@ def _fit_forecast(model_name, parameters, train_values, train_months, steps, fut
                 exog=train_exog_scaled,
                 order=tuple(parameters["order"]),
                 seasonal_order=seasonal_order,
-                enforce_stationarity=False,
-                enforce_invertibility=False,
+                enforce_stationarity=True,
+                enforce_invertibility=True,
             ).fit(disp=False, maxiter=50)
             raw = fitted.forecast(steps=steps, exog=future_exog_scaled)
             residuals = getattr(fitted, "resid", None)
@@ -830,6 +876,14 @@ def _fit_forecast(model_name, parameters, train_values, train_months, steps, fut
         else:
             raise ForecastEvaluationError(f"Unsupported model family: {model_name}")
 
+    if model_name in ARIMA_FAMILY:
+        root_failures = inspect_arima_stability(fitted, order=parameters.get("order"))
+        if root_failures:
+            raise ForecastEvaluationError(
+                f"{model_name} failed stability validation: " + "; ".join(root_failures)
+            )
+    elif model_name in NON_ARIMA_ALGORITHMS and fitted is None:
+        raise ForecastEvaluationError(f"{model_name} did not return a fitted model.")
     predicted = require_finite_forecast(raw, model_name, expected=steps)
     reason = _implausible(predicted, train_values)
     if reason:
@@ -931,6 +985,494 @@ def build_rolling_folds(month_labels, horizon: int = DEFAULT_TEST_MONTHS) -> lis
     return folds
 
 
+def expanding_validation_plan(
+    month_labels,
+    horizon: int = EXPANDING_HORIZON,
+    n_folds: int = EXPANDING_FOLDS,
+    min_train: int = EXPANDING_MIN_TRAIN,
+) -> dict:
+    """Latest chronological expanding-window validation plan.
+
+    Boundaries come from the month index. For 42 months and a six-month
+    horizon the folds are train 24/validate 6, train 30/validate 6, and
+    train 36/validate 6. A longer history uses the latest three validation
+    blocks and a longer first training window (48 months trains 30, 36, and
+    42). Histories shorter than ``min_train + n_folds * horizon`` return
+    INSUFFICIENT_FOLDS. Shuffled or random cross-validation is never used.
+    """
+    months = [str(label) for label in month_labels]
+    count = len(months)
+    horizon = int(horizon)
+    n_folds = int(n_folds)
+    min_train = int(min_train)
+    required = min_train + n_folds * horizon
+    plan = {
+        "status": FOLD_STATUS_READY,
+        "reason": "",
+        "folds": [],
+        "horizon": horizon,
+        "n_folds": n_folds,
+        "min_train": min_train,
+        "n_months": count,
+        "required_months": required,
+    }
+    if count < required or horizon < 1 or n_folds < 1:
+        plan["status"] = FOLD_STATUS_INSUFFICIENT
+        plan["reason"] = (
+            f"History of {count} months cannot form {n_folds} expanding folds "
+            f"of {horizon} months after at least {min_train} training months "
+            f"({required} months required). Random cross-validation is not used."
+        )
+        return plan
+    folds = []
+    for index in range(n_folds):
+        blocks_after_train = n_folds - index
+        train_end = count - blocks_after_train * horizon
+        val_end = train_end + horizon
+        if train_end < min_train or val_end > count or train_end <= 0:
+            plan["status"] = FOLD_STATUS_INSUFFICIENT
+            plan["reason"] = (
+                f"Fold {index + 1} is outside the chronological history. "
+                "Random cross-validation is not used."
+            )
+            plan["folds"] = []
+            return plan
+        folds.append({
+            "name": f"fold_{index + 1}",
+            "fold_index": index + 1,
+            "train_end": int(train_end),
+            "val_end": int(val_end),
+            "train_start": months[0],
+            "train_end_label": months[train_end - 1],
+            "validation_start": months[train_end],
+            "validation_end": months[val_end - 1],
+            "description": (
+                f"train {months[0]} through {months[train_end - 1]} ({train_end} months), "
+                f"validate {months[train_end]} to {months[val_end - 1]}"
+            ),
+        })
+    plan["folds"] = folds
+    return plan
+
+
+def _root_moduli(values) -> list[float]:
+    if values is None:
+        return []
+    moduli = []
+    for root in np.asarray(values, dtype=complex).reshape(-1):
+        modulus = abs(root)
+        if np.isfinite(modulus):
+            moduli.append(float(modulus))
+    return moduli
+
+
+def inspect_arima_stability(fitted, order=None) -> list[str]:
+    """Reject explosive or non-invertible ARIMA-family roots.
+
+    Differencing (d > 0) is not a failure. The roots belong to the AR and MA
+    polynomials after differencing.     Stationarity and invertibility require each root modulus to lie outside
+    the unit circle. A modulus within 1e-6 of 1 is the unit-circle boundary,
+    not an explosive root. A smaller modulus is a hard failure.
+    """
+    if fitted is None:
+        return ["The ARIMA-family fit is missing."]
+    differencing = 0
+    if order is not None and len(tuple(order)) > 1:
+        differencing = int(tuple(order)[1])
+    failures = []
+    checks = (
+        ("arroots", "AR"),
+        ("seasonalarroots", "seasonal AR"),
+        ("maroots", "MA"),
+        ("seasonalmaroots", "seasonal MA"),
+    )
+    for attribute, label in checks:
+        if not hasattr(fitted, attribute):
+            continue
+        for modulus in _root_moduli(getattr(fitted, attribute)):
+            if modulus < ROOT_MODULUS_LIMIT - ROOT_BOUNDARY_TOLERANCE:
+                suffix = f" after differencing d={differencing}" if differencing else ""
+                failures.append(
+                    f"{label} root modulus {modulus:.5f} is not outside the unit circle{suffix}."
+                )
+    return failures
+
+
+def forecast_direction_warnings(predictions, history_values) -> list[str]:
+    """Diagnostic warnings for unusual finite forecasts. These do not reject a model."""
+    predicted = np.asarray(predictions, dtype=float).reshape(-1)
+    history = np.asarray(history_values, dtype=float).reshape(-1)
+    observed = history[np.isfinite(history)]
+    finite = predicted[np.isfinite(predicted)]
+    if observed.size == 0 or finite.size == 0:
+        return []
+    low = float(np.min(observed))
+    high = float(np.max(observed))
+    scale = max(abs(low), abs(high), 1.0)
+    limit = EXPLOSION_MULTIPLIER * scale
+    warnings = []
+    if float(np.max(finite)) > high + limit:
+        warnings.append(
+            "Forecast is unusually high relative to this Budget Code's observed history."
+        )
+    if float(np.min(finite)) < low - limit:
+        warnings.append(
+            "Forecast is unusually low relative to this Budget Code's observed history."
+        )
+    return warnings
+
+
+def seasonal_naive_forecast(train_values, steps: int, train_observed=None, season: int = SEASONAL_PERIOD):
+    """Seasonal naive forecast from the training window only. Never reads future actuals."""
+    history = [float(value) if np.isfinite(value) else np.nan for value in np.asarray(train_values, dtype=float)]
+    if train_observed is None:
+        observed = [bool(np.isfinite(value)) for value in history]
+    else:
+        observed = [bool(flag) and bool(np.isfinite(history[index])) for index, flag in enumerate(np.asarray(train_observed, dtype=bool))]
+    if not any(observed):
+        raise ForecastEvaluationError("Seasonal naive has no observed training values.")
+    forecasts = []
+    for _ in range(int(steps)):
+        source_index = len(history) - int(season)
+        if source_index >= 0 and observed[source_index]:
+            value = float(history[source_index])
+        else:
+            value = float(history[max(index for index, flag in enumerate(observed) if flag)])
+        forecasts.append(value)
+        history.append(value)
+        observed.append(True)
+    return forecasts
+
+
+def _mean_metric(rows, key):
+    values = []
+    for row in rows:
+        value = row.get(key)
+        if value is None or not np.isfinite(float(value)):
+            return np.nan
+        values.append(float(value))
+    if not values:
+        return np.nan
+    return float(np.mean(values))
+
+
+def aggregate_fold_metrics(fold_rows) -> dict:
+    """Average fold metrics only when every fold succeeded.
+
+    A failed or missing fold is not dropped. Its algorithm stays incomparable
+    so it cannot win on the remaining folds.
+    """
+    rows = list(fold_rows or [])
+    failed = [row for row in rows if row.get("status") != "success"]
+    if not rows or failed:
+        return {
+            "comparable": False,
+            "reason": "One or more validation folds failed. Failed folds were not dropped from the comparison.",
+            "metrics": {metric: np.nan for metric in EVALUATION_METRICS},
+            "mean_error": np.nan,
+            "bias_direction": None,
+        }
+    metrics = {
+        "MAE": _mean_metric(rows, "mae"),
+        "RMSE": _mean_metric(rows, "rmse"),
+        "MAPE": _mean_metric(rows, "mape"),
+        "WAPE": _mean_metric(rows, "wape"),
+        "MASE": _mean_metric(rows, "mase"),
+        "R2": _mean_metric(rows, "r2"),
+    }
+    bias_values = [row.get("mean_error") for row in rows]
+    if any(value is None or not np.isfinite(float(value)) for value in bias_values):
+        mean_error = np.nan
+        bias_direction = None
+    else:
+        mean_error = float(np.mean([float(value) for value in bias_values]))
+        if mean_error > 1e-9:
+            bias_direction = "overprediction"
+        elif mean_error < -1e-9:
+            bias_direction = "underprediction"
+        else:
+            bias_direction = "none"
+    return {
+        "comparable": True,
+        "reason": "",
+        "metrics": metrics,
+        "mean_error": mean_error,
+        "bias_direction": bias_direction,
+    }
+
+
+def evaluate_expanding_specification(
+    model_name,
+    parameters,
+    month_labels,
+    monthly_history,
+    kinds=None,
+    interpolate: bool = False,
+    max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
+    progress_callback=None,
+    account_code=None,
+    progress_current=None,
+    progress_total=None,
+):
+    """Refit one specification on each expanding fold of the raw series."""
+    months = list(month_labels)
+    values = np.asarray(monthly_history, dtype=float).reshape(-1)
+    kind_row = None if kinds is None else np.asarray(kinds, dtype=object)
+    plan = expanding_validation_plan(months)
+    if plan["status"] != FOLD_STATUS_READY:
+        return {
+            **plan,
+            "comparable": False,
+            "fold_rows": [],
+            "aggregate_metrics": {metric: np.nan for metric in EVALUATION_METRICS},
+            "baseline": None,
+            "summary": {
+                "rolling_folds": [],
+                "rolling_wape_mean": None,
+                "rolling_wape_std": None,
+                "rolling_successful_folds": 0,
+                "rolling_failed_folds": 0,
+            },
+        }
+    fold_rows = []
+    baseline_rows = []
+    last_predictions = None
+    residual_info = {}
+    for fold in plan["folds"]:
+        report_progress(
+            progress_callback,
+            f"  {account_code or model_name} {model_name} {fold['name']}: {fold['description']}",
+            persist=False,
+            stage="evaluation",
+            current=progress_current,
+            total=progress_total,
+            budget_code=account_code,
+            algorithm=model_name,
+            fold=fold["name"],
+        )
+        train_end = fold["train_end"]
+        val_end = fold["val_end"]
+        train_raw = values[:train_end]
+        val_raw = values[train_end:val_end]
+        train_months = months[:train_end]
+        val_months = months[train_end:val_end]
+        train_kinds = None if kind_row is None else kind_row[:train_end]
+        val_kinds = None if kind_row is None else kind_row[train_end:val_end]
+        train_kind_for_prep = train_kinds if train_kinds is not None else np.where(
+            np.isfinite(train_raw), KIND_NUMBER, KIND_MISSING
+        ).astype(object)
+        val_kind_for_score = val_kinds if val_kinds is not None else np.where(
+            np.isfinite(val_raw), KIND_NUMBER, KIND_MISSING
+        ).astype(object)
+        year_means = fit_same_year_positive_means(train_raw, train_months, train_kind_for_prep)
+        val_transformed, val_negative = apply_same_year_positive_means(
+            val_raw, val_months, year_means, val_kind_for_score
+        )
+        observed = observed_mask_from_kinds(val_raw, val_kind_for_score)
+        unresolved_targets = np.zeros(len(val_raw), dtype=bool)
+        unresolved_targets[val_negative["unresolved_indices"]] = True
+        score_mask = observed & ~unresolved_targets
+        train_transformed, _train_negative = apply_same_year_positive_means(
+            train_raw, train_months, year_means, train_kind_for_prep
+        )
+        train_observed = observed_mask_from_kinds(train_transformed, train_kind_for_prep)
+        try:
+            if _needs_two_seasons(model_name, parameters) and len(train_raw) < 24:
+                raise ForecastEvaluationError("Seasonal model needs at least 24 training months for period=12.")
+            prepared, _methods, outcome, reason = prepare_series_window(
+                train_raw,
+                train_kind_for_prep,
+                interpolate=interpolate,
+                max_internal_gap=max_internal_gap,
+                months=train_months,
+                year_means=year_means,
+            )
+            if outcome != OUTCOME_READY:
+                raise ForecastEvaluationError(f"Fold training window is not model-ready: {reason}")
+            predicted, _fitted, _state, residual_info = _fit_forecast(
+                model_name,
+                parameters,
+                prepared,
+                train_months,
+                len(val_raw),
+                val_months,
+            )
+            metrics = calculate_metrics(
+                val_transformed,
+                predicted,
+                train_values=train_transformed,
+                observed_mask=score_mask,
+                train_observed=train_observed,
+            )
+            if metrics.get("EVALUATION_STATUS") == "NOT_EVALUABLE":
+                raise ForecastEvaluationError("Validation fold has no observed numeric targets.")
+            baseline = seasonal_naive_forecast(train_transformed, len(val_raw), train_observed=train_observed)
+            baseline_metrics = calculate_metrics(
+                val_transformed,
+                baseline,
+                train_values=train_transformed,
+                observed_mask=score_mask,
+                train_observed=train_observed,
+            )
+            fold_rows.append({
+                "name": fold["name"],
+                "description": fold["description"],
+                "train_start": fold["train_start"],
+                "train_end": fold["train_end_label"],
+                "validation_start": fold["validation_start"],
+                "validation_end": fold["validation_end"],
+                "status": "success",
+                "error": None,
+                "observed_target_count": int(score_mask.sum()),
+                "missing_or_invalid_target_count": int((~observed).sum()),
+                "excluded_unresolved_negative_targets": int(unresolved_targets.sum()),
+                "mae": _to_float_or_none(metrics["MAE"]),
+                "rmse": _to_float_or_none(metrics["RMSE"]),
+                "mape": _to_float_or_none(metrics["MAPE"]),
+                "wape": _to_float_or_none(metrics["WAPE"]),
+                "mase": _to_float_or_none(metrics["MASE"]),
+                "r2": _to_float_or_none(metrics["R2"]),
+                "mean_error": _to_float_or_none(metrics.get("MEAN_ERROR")),
+                "bias_direction": metrics.get("BIAS_DIRECTION"),
+            })
+            baseline_rows.append({
+                "name": fold["name"],
+                "status": "success" if baseline_metrics.get("EVALUATION_STATUS") == "EVALUABLE" else "failed",
+                "wape": _to_float_or_none(baseline_metrics.get("WAPE")),
+                "mae": _to_float_or_none(baseline_metrics.get("MAE")),
+                "mean_error": _to_float_or_none(baseline_metrics.get("MEAN_ERROR")),
+            })
+            last_predictions = [float(value) for value in predicted]
+        except Exception as error:
+            fold_rows.append({
+                "name": fold["name"],
+                "description": fold["description"],
+                "train_start": fold["train_start"],
+                "train_end": fold["train_end_label"],
+                "validation_start": fold["validation_start"],
+                "validation_end": fold["validation_end"],
+                "status": "failed",
+                "error": str(error),
+                "exception_type": type(error).__name__,
+                "observed_target_count": int(observed.sum()),
+                "missing_or_invalid_target_count": int(len(val_raw) - int(observed.sum())),
+                "mae": None,
+                "rmse": None,
+                "mape": None,
+                "wape": None,
+                "mase": None,
+                "r2": None,
+                "mean_error": None,
+                "bias_direction": None,
+            })
+    aggregate = aggregate_fold_metrics(fold_rows)
+    successful = [row for row in fold_rows if row.get("status") == "success"]
+    wapes = [row["wape"] for row in successful if row.get("wape") is not None and np.isfinite(float(row["wape"]))]
+    baseline_aggregate = aggregate_fold_metrics([
+        {
+            "status": row["status"],
+            "mae": row.get("mae"),
+            "rmse": row.get("mae"),
+            "mape": row.get("wape"),
+            "wape": row.get("wape"),
+            "mase": None,
+            "r2": None,
+            "mean_error": row.get("mean_error"),
+        }
+        for row in baseline_rows
+    ]) if baseline_rows else {"comparable": False, "metrics": {}}
+    model_wape = aggregate["metrics"].get("WAPE")
+    baseline_wape = (baseline_aggregate.get("metrics") or {}).get("WAPE")
+    return {
+        **plan,
+        "comparable": bool(aggregate["comparable"]),
+        "reason": aggregate["reason"],
+        "fold_rows": fold_rows,
+        "aggregate_metrics": aggregate["metrics"],
+        "mean_error": aggregate["mean_error"],
+        "bias_direction": aggregate["bias_direction"],
+        "last_predictions": last_predictions,
+        "residual_diagnostics": residual_info,
+        "baseline": {
+            "name": "seasonal_naive",
+            "role": "diagnostic",
+            "automatic_fallback": False,
+            "folds": baseline_rows,
+            "wape": None if baseline_wape is None or not np.isfinite(float(baseline_wape)) else float(baseline_wape),
+            "model_wape_advantage": (
+                None
+                if model_wape is None or baseline_wape is None
+                or not np.isfinite(float(model_wape)) or not np.isfinite(float(baseline_wape))
+                else float(baseline_wape) - float(model_wape)
+            ),
+        },
+        "summary": {
+            "rolling_folds": fold_rows,
+            "rolling_wape_mean": float(np.mean(wapes)) if aggregate["comparable"] and wapes else None,
+            "rolling_wape_std": (
+                float(np.std(wapes, ddof=1)) if aggregate["comparable"] and len(wapes) > 1
+                else (0.0 if aggregate["comparable"] and len(wapes) == 1 else None)
+            ),
+            "rolling_successful_folds": len(successful) if aggregate["comparable"] else 0,
+            "rolling_failed_folds": len(fold_rows) - len(successful),
+        },
+    }
+
+
+def ranked_success_algorithms(evaluation_table: pd.DataFrame, code: str) -> list[str]:
+    """Same metric-win order used to select an account winner, including ties."""
+    if evaluation_table is None or getattr(evaluation_table, "empty", True):
+        return []
+    group = evaluation_table[evaluation_table["Budget Code"].astype(str) == str(code)].copy()
+    successful = group[_success_mask(group["Status"])].copy()
+    if successful.empty:
+        return []
+    if "Metric_Wins" not in successful.columns:
+        successful["Metric_Wins"] = 0
+    successful["_wape_sort"] = successful["WAPE"].apply(
+        lambda value: float(value) if value is not None and np.isfinite(float(value)) else np.inf
+    )
+    successful["_mase_sort"] = successful["MASE"].apply(
+        lambda value: float(value) if value is not None and np.isfinite(float(value)) else np.inf
+    )
+    successful["_rmse_sort"] = successful["RMSE"].apply(
+        lambda value: float(value) if value is not None and np.isfinite(float(value)) else np.inf
+    )
+    successful = successful.sort_values(
+        ["Metric_Wins", "_wape_sort", "_mase_sort", "_rmse_sort", "Algorithm"],
+        ascending=[False, True, True, True, True],
+        kind="mergesort",
+    )
+    return [str(algorithm) for algorithm in successful["Algorithm"].tolist()]
+
+
+def first_passing_candidate(ranked, validate):
+    """Try ranked candidates in order. A hard validation failure moves to the next one."""
+    attempts = []
+    for name in list(ranked or []):
+        try:
+            outcome = validate(name)
+        except Exception as error:
+            attempts.append({
+                "algorithm": str(name),
+                "passed": False,
+                "reason": f"{type(error).__name__}: {error}",
+                "warnings": [],
+            })
+            continue
+        warnings = []
+        if isinstance(outcome, dict):
+            warnings = [str(item) for item in (outcome.get("warnings") or [])]
+        attempts.append({
+            "algorithm": str(name),
+            "passed": True,
+            "reason": "",
+            "warnings": warnings,
+        })
+        return str(name), outcome, attempts
+    return None, None, attempts
+
+
 def observed_mask_from_kinds(values, kinds=None) -> np.ndarray:
     array = np.asarray(values, dtype=float).reshape(-1)
     if kinds is None:
@@ -952,7 +1494,7 @@ def evaluate_rolling(
     max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
 ):
     months = list(month_labels)
-    values = np.asarray(monthly_history, dtype=float)
+    values = np.asarray(monthly_history, dtype=float).reshape(-1)
     kind_row = None if kinds is None else np.asarray(kinds, dtype=object)
     fold_rows = []
     wapes = []
@@ -975,6 +1517,12 @@ def evaluate_rolling(
         val_raw = values[train_end:val_end]
         train_kinds = None if kind_row is None else kind_row[:train_end]
         val_kinds = None if kind_row is None else kind_row[train_end:val_end]
+        train_kind_for_prep = train_kinds if train_kinds is not None else np.where(
+            np.isfinite(train_raw), KIND_NUMBER, KIND_MISSING
+        ).astype(object)
+        val_kind_for_score = val_kinds if val_kinds is not None else np.where(
+            np.isfinite(val_raw), KIND_NUMBER, KIND_MISSING
+        ).astype(object)
         if _needs_two_seasons(model_name, parameters) and len(train_raw) < 24:
             failed += 1
             fold_rows.append({
@@ -983,14 +1531,28 @@ def evaluate_rolling(
                 "status": "skipped",
                 "error": "Seasonal model needs at least 24 training months for period=12.",
                 "wape": None,
+                "excluded_unresolved_negative_targets": 0,
             })
             continue
         try:
+            year_means = fit_same_year_positive_means(train_raw, train_months, train_kind_for_prep)
+            val_transformed, val_negative = apply_same_year_positive_means(
+                val_raw, val_months, year_means, val_kind_for_score
+            )
+            train_transformed, _train_negative = apply_same_year_positive_means(
+                train_raw, train_months, year_means, train_kind_for_prep
+            )
+            observed = observed_mask_from_kinds(val_raw, val_kind_for_score)
+            unresolved_targets = np.zeros(len(val_raw), dtype=bool)
+            unresolved_targets[val_negative["unresolved_indices"]] = True
+            score_mask = observed & ~unresolved_targets
             prepared, _methods, outcome, reason = prepare_series_window(
                 train_raw,
-                train_kinds if train_kinds is not None else np.full(train_raw.shape, KIND_NUMBER, dtype=object),
+                train_kind_for_prep,
                 interpolate=interpolate,
                 max_internal_gap=max_internal_gap,
+                months=train_months,
+                year_means=year_means,
             )
             if outcome != OUTCOME_READY:
                 raise ForecastEvaluationError(f"Fold training window is not model-ready: {reason}")
@@ -1003,11 +1565,11 @@ def evaluate_rolling(
                 val_months,
             )
             metrics = calculate_metrics(
-                val_raw,
+                val_transformed,
                 predicted,
-                train_values=train_raw,
-                observed_mask=observed_mask_from_kinds(val_raw, val_kinds),
-                train_observed=observed_mask_from_kinds(train_raw, train_kinds),
+                train_values=train_transformed,
+                observed_mask=score_mask,
+                train_observed=observed_mask_from_kinds(train_transformed, train_kind_for_prep),
             )
             if metrics.get("EVALUATION_STATUS") == "NOT_EVALUABLE":
                 raise ForecastEvaluationError("Rolling fold has no observed validation targets.")
@@ -1021,6 +1583,9 @@ def evaluate_rolling(
                 "mae": _to_float_or_none(metrics["MAE"]),
                 "rmse": _to_float_or_none(metrics["RMSE"]),
                 "mape": _to_float_or_none(metrics["MAPE"]),
+                "observed_target_count": int(score_mask.sum()),
+                "missing_or_invalid_target_count": int((~observed).sum()),
+                "excluded_unresolved_negative_targets": int(unresolved_targets.sum()),
             })
             if wape is not None and np.isfinite(wape):
                 wapes.append(wape)
@@ -1033,6 +1598,7 @@ def evaluate_rolling(
                 "error": str(error),
                 "exception_type": type(error).__name__,
                 "wape": None,
+                "excluded_unresolved_negative_targets": 0,
             })
     successful = len([row for row in fold_rows if row.get("status") == "success"])
     return {
@@ -1091,20 +1657,81 @@ def _evaluate_candidate_grid(
     kinds=None,
     interpolate: bool = False,
     max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
+    progress_callback=None,
+    progress_current=None,
+    progress_total=None,
 ):
     started = time.perf_counter()
     best = None
     succeeded = 0
     train_values = np.asarray(split.get("train_values_prepared", split["train_values"]), dtype=float)
-    train_raw = np.asarray(split.get("train_values_raw", split["train_values"]), dtype=float)
-    test_raw = np.asarray(split["test_values"], dtype=float)
+    train_raw = np.asarray(
+        split.get("train_values_transformed", split.get("train_values_raw", split["train_values"])),
+        dtype=float,
+    )
+    test_raw = np.asarray(split.get("score_values", split["test_values"]), dtype=float)
     test_mask = split.get("test_observed_mask")
     train_observed = split.get("train_observed_mask")
     rolling_months = list(split["train_months"])
     rolling_history = train_raw
     rolling_kinds = split.get("train_kinds")
+    expanding_plan = expanding_validation_plan(month_labels)
+    use_expanding = expanding_plan["status"] == FOLD_STATUS_READY
     for parameters in candidates:
         try:
+            if use_expanding:
+                fold_result = evaluate_expanding_specification(
+                    model_name,
+                    parameters,
+                    month_labels,
+                    monthly_history,
+                    kinds=kinds,
+                    interpolate=interpolate,
+                    max_internal_gap=max_internal_gap,
+                    progress_callback=progress_callback,
+                    account_code=account_code,
+                    progress_current=progress_current,
+                    progress_total=progress_total,
+                )
+                if not fold_result.get("comparable"):
+                    if failure_log is not None:
+                        failure_log.append({
+                            "account_code": account_code,
+                            "model_family": model_name,
+                            "configuration": dict(parameters),
+                            "exception_type": "IncompleteFolds",
+                            "reason": fold_result.get("reason") or "Expanding-window folds were not all comparable.",
+                        })
+                    continue
+                metrics = dict(fold_result["aggregate_metrics"])
+                metrics["MEAN_ERROR"] = fold_result.get("mean_error")
+                metrics["BIAS_DIRECTION"] = fold_result.get("bias_direction")
+                metrics["MAPE_NOTE"] = None
+                predicted = np.asarray(fold_result.get("last_predictions") or [], dtype=float)
+                fitted = None
+                state = {}
+                residual_info = fold_result.get("residual_diagnostics") or {}
+                holdout_wape = _to_float_or_none(metrics.get("WAPE"))
+                rolling_info = dict(fold_result["summary"])
+                rolling_info["baseline"] = fold_result.get("baseline")
+                rolling_info["bias_direction"] = fold_result.get("bias_direction")
+                rolling_info["mean_error"] = _to_float_or_none(fold_result.get("mean_error"))
+                succeeded += 1
+                score = _candidate_score(holdout_wape if holdout_wape is not None else float("inf"), rolling_info)
+                current = {
+                    "parameters": dict(parameters),
+                    "metrics": metrics,
+                    "raw": predicted,
+                    "clipped": predicted,
+                    "fitted": fitted,
+                    "state": state,
+                    "residual_info": residual_info,
+                    "rolling_info": rolling_info,
+                    "score": score,
+                }
+                if best is None or score < best["score"]:
+                    best = current
+                continue
             predicted, fitted, state, residual_info = _fit_forecast(
                 model_name,
                 parameters,
@@ -1514,15 +2141,28 @@ def evaluate_seven_models(
     max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
     prepared_train=None,
     test_observed_mask=None,
+    progress_callback=None,
+    progress_current=None,
+    progress_total=None,
 ):
     requested = list(algorithms or ALGORITHMS)
 
-    def _progress(message: str) -> None:
-        print(message, flush=True)
+    def _progress(message: str, *, algorithm=None, persist: bool = False) -> None:
+        report_progress(
+            progress_callback,
+            message,
+            persist=persist,
+            stage="evaluation",
+            current=progress_current,
+            total=progress_total,
+            budget_code=account_code,
+            algorithm=algorithm if algorithm is not None else _PROGRESS_UNSET,
+        )
 
+    raw_history = np.asarray(monthly_history, dtype=float).reshape(-1)
     split = chronological_train_test_split(
         month_labels,
-        monthly_history,
+        raw_history,
         quiet=quiet,
         test_months=test_months,
         split_index=split_index,
@@ -1535,44 +2175,67 @@ def evaluate_seven_models(
     kind_for_prep = train_kinds if train_kinds is not None else np.full(train_raw.shape, KIND_NUMBER, dtype=object)
     if train_kinds is None:
         kind_for_prep = np.where(np.isfinite(train_raw), KIND_NUMBER, KIND_MISSING).astype(object)
-    train_mean = account_numeric_mean(train_raw, kind_for_prep)
-    if prepared_train is None:
+    train_months = list(split["train_months"])
+    test_months_labels = list(split["test_months"])
+    year_means = fit_same_year_positive_means(train_raw, train_months, kind_for_prep)
+    train_replaced, train_negative = apply_same_year_positive_means(
+        train_raw, train_months, year_means, kind_for_prep
+    )
+    test_kind_for_prep = test_kinds if test_kinds is not None else np.where(
+        np.isfinite(test_raw), KIND_NUMBER, KIND_MISSING
+    ).astype(object)
+    test_replaced, test_negative = apply_same_year_positive_means(
+        test_raw, test_months_labels, year_means, test_kind_for_prep
+    )
+    expanding_ready = expanding_validation_plan(month_labels)["status"] == FOLD_STATUS_READY
+    if train_negative["unresolved_count"] and not expanding_ready:
+        raise ForecastEvaluationError(
+            f"Training window is not model-ready: {OUTCOME_NO_POSITIVE_YEAR_MEAN}"
+        )
+    if train_negative["unresolved_count"]:
+        train_mean = None
+        prepared_train = np.asarray(train_replaced, dtype=float)
+        prepared_test = np.asarray(test_replaced, dtype=float)
+    else:
+        train_mean = account_numeric_mean(train_replaced, kind_for_prep)
         prepared_train, _methods, outcome, reason = prepare_series_window(
             train_raw,
             kind_for_prep,
             interpolate=interpolate,
             max_internal_gap=max_internal_gap,
             imputation_mean=train_mean,
+            months=train_months,
+            year_means=year_means,
         )
         if outcome != OUTCOME_READY:
             raise ForecastEvaluationError(f"Training window is not model-ready: {reason}")
-    prepared_train = np.asarray(prepared_train, dtype=float)
-    test_kind_for_prep = test_kinds if test_kinds is not None else np.where(
-        np.isfinite(test_raw), KIND_NUMBER, KIND_MISSING
-    ).astype(object)
-    prepared_test, _test_methods, _test_fills = fill_missing_with_mean(
-        test_raw, test_kind_for_prep, train_mean
-    )
-    train_observed = observed_mask_from_kinds(train_raw, train_kinds)
-    test_mask = (
-        np.asarray(test_observed_mask, dtype=bool)
-        if test_observed_mask is not None
-        else observed_mask_from_kinds(test_raw, test_kinds)
-    )
+        prepared_train = np.asarray(prepared_train, dtype=float)
+        prepared_test, _test_methods, _test_fills = fill_missing_with_mean(
+            test_replaced, test_kind_for_prep, train_mean
+        )
+    train_observed = observed_mask_from_kinds(train_replaced, train_kinds)
+    unresolved_targets = np.zeros(len(test_raw), dtype=bool)
+    unresolved_targets[test_negative["unresolved_indices"]] = True
+    test_mask = observed_mask_from_kinds(test_raw, test_kinds) & ~unresolved_targets
+    if test_observed_mask is not None:
+        test_mask = np.asarray(test_observed_mask, dtype=bool) & ~unresolved_targets
     split = {
         **split,
         "train_values": prepared_train,
         "train_values_prepared": prepared_train,
         "train_values_raw": train_raw,
+        "train_values_transformed": train_replaced,
         "test_values": test_raw,
+        "score_values": test_replaced,
         "test_values_prepared": prepared_test,
         "train_imputation_mean": train_mean,
         "train_observed_mask": train_observed,
         "test_observed_mask": test_mask,
+        "excluded_unresolved_negative_targets": int(unresolved_targets.sum()),
         "train_kinds": train_kinds,
         "evaluation_label": "selection-holdout evaluation",
     }
-    observed_train = train_raw[train_observed]
+    observed_train = train_replaced[train_observed]
     all_positive = bool(observed_train.size > 0 and np.all(observed_train > 0))
     if not quiet:
         _progress(f"[5/8] Evaluating {len(requested)} algorithms")
@@ -1599,7 +2262,7 @@ def evaluate_seven_models(
     diagnostics["diagnostics_source"] = "training_window_only"
     results = []
     for model_name in requested:
-        _progress(f"  Evaluating {model_name}...")
+        _progress(f"  Evaluating {model_name}...", algorithm=model_name, persist=False)
         try:
             results.append(
                 _evaluate_candidate_grid(
@@ -1613,6 +2276,9 @@ def evaluate_seven_models(
                     kinds=kind_row,
                     interpolate=interpolate,
                     max_internal_gap=max_internal_gap,
+                    progress_callback=progress_callback,
+                    progress_current=progress_current,
+                    progress_total=progress_total,
                 )
             )
         except Exception as error:
@@ -1766,6 +2432,10 @@ def compact_evaluation_row(row: dict) -> dict:
         "rolling_wape_std": row.get("rolling_wape_std"),
         "rolling_successful_folds": row.get("rolling_successful_folds"),
         "rolling_failed_folds": row.get("rolling_failed_folds"),
+        "rolling_folds": row.get("rolling_folds") or [],
+        "baseline": row.get("baseline"),
+        "bias_direction": row.get("bias_direction"),
+        "mean_error": row.get("mean_error"),
         "candidates_evaluated": row.get("candidates_evaluated"),
         "candidates_succeeded": row.get("candidates_succeeded"),
     }
@@ -1882,6 +2552,12 @@ def _window_split_meta(outcome_row, history_months, split_index=None, test_month
 
 
 def _status_from_outcome(outcome_row) -> tuple[str, str]:
+    """Map preprocessing outcomes to a status label for reporting.
+
+    Full-history ``NO_POSITIVE_YEAR_MEAN`` is reported here but must not alone
+    block expanding-fold evaluation admission (see
+    ``_structural_block_for_evaluation``).
+    """
     outcome = str(outcome_row.get("training_outcome") or "")
     reason = str(outcome_row.get("training_reason") or outcome)
     if int(outcome_row.get("train_size") or 0) < MIN_TRAIN_MONTHS:
@@ -1894,7 +2570,40 @@ def _status_from_outcome(outcome_row) -> tuple[str, str]:
         return STATUS_INVALID_DATA, reason
     if outcome == OUTCOME_UNRESOLVED:
         return STATUS_UNRESOLVED_MISSING, reason
+    if outcome == OUTCOME_NO_POSITIVE_YEAR_MEAN:
+        return STATUS_NO_POSITIVE_YEAR_MEAN, reason
     return str(outcome_row.get("evaluation_status") or STATUS_NOT_EVALUABLE), reason
+
+
+def _structural_block_for_evaluation(outcome_row) -> tuple[str | None, str]:
+    """Return a skip status when algorithm search must not run.
+
+    Structural blocks: invalid entries, all-missing, all-zero policy, short
+    history. Full-history ``ready_for_complete_data_model`` / full-history
+    ``NO_POSITIVE_YEAR_MEAN`` do **not** block admission: expanding folds and
+    holdout prep recompute train-only statistics, and later folds may become
+    usable even when an early train window or the full-history final-fit gate
+    is unresolved. Final fitting still uses full-history readiness separately.
+    """
+    if outcome_row is None:
+        return None, ""
+    if int(outcome_row.get("train_size") or 0) < MIN_TRAIN_MONTHS:
+        return STATUS_INSUFFICIENT_HISTORY, "Training window is shorter than the minimum 12 months."
+    train_outcome = str(outcome_row.get("train_window_outcome") or "")
+    full_outcome = str(
+        outcome_row.get("full_history_outcome") or outcome_row.get("training_outcome") or ""
+    )
+    train_reason = str(outcome_row.get("train_window_reason") or train_outcome)
+    full_reason = str(outcome_row.get("full_history_reason") or outcome_row.get("training_reason") or full_outcome)
+    if OUTCOME_INVALID in {train_outcome, full_outcome}:
+        return STATUS_INVALID_DATA, full_reason or train_reason or "INVALID_ENTRIES"
+    if full_outcome == OUTCOME_ZERO_POLICY:
+        return STATUS_ZERO_POLICY, full_reason or "ZERO_POLICY"
+    if full_outcome == OUTCOME_NO_DATA and train_outcome in {"", OUTCOME_NO_DATA}:
+        return STATUS_NO_DATA, full_reason or "NO_DATA"
+    if full_outcome == OUTCOME_UNRESOLVED and train_outcome in {"", OUTCOME_UNRESOLVED}:
+        return STATUS_UNRESOLVED_MISSING, full_reason or "UNRESOLVED_MISSING"
+    return None, ""
 
 
 def _zero_baseline_row(code, split_meta, test_values, test_mask, train_raw, train_observed) -> dict:
@@ -1936,6 +2645,43 @@ def _zero_baseline_row(code, split_meta, test_values, test_mask, train_raw, trai
     }
 
 
+_PROGRESS_UNSET = object()
+
+
+def report_progress(
+    callback,
+    message="",
+    *,
+    persist=False,
+    stage=None,
+    current=None,
+    total=None,
+    budget_code=None,
+    algorithm=_PROGRESS_UNSET,
+    fold=_PROGRESS_UNSET,
+):
+    """Print a training line and, when requested, forward a durable progress event."""
+    if message:
+        print(message, flush=True)
+    if callback is None:
+        return
+    event = {
+        "stage": stage,
+        "message": message if persist else "",
+        "current": current,
+        "total": total,
+        "budget_code": budget_code,
+    }
+    if algorithm is not _PROGRESS_UNSET:
+        event["algorithm"] = algorithm
+    if fold is not _PROGRESS_UNSET:
+        event["fold"] = fold
+    try:
+        callback(event)
+    except Exception:
+        return
+
+
 def evaluate_selected_accounts(
     selected_codes,
     selected_matrix,
@@ -1949,6 +2695,7 @@ def evaluate_selected_accounts(
     observed_test_mask=None,
     interpolate_accounts=None,
     max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
+    progress_callback=None,
 ):
     requested = list(algorithms or ALGORITHMS)
     selected_codes = [str(code) for code in selected_codes]
@@ -1964,8 +2711,29 @@ def evaluate_selected_accounts(
     if account_outcomes is not None:
         for _, row in account_outcomes.iterrows():
             outcome_lookup[str(row["account_code"])] = row
+    def _finish_account(account, completed, label, algorithm=None):
+        report_progress(
+            progress_callback,
+            f"Evaluation {completed}/{len(selected_codes)} {account}: {label}",
+            persist=True,
+            stage="evaluation",
+            current=completed,
+            total=len(selected_codes),
+            budget_code=account,
+            algorithm=algorithm,
+        )
+
     for index, code in enumerate(selected_codes, 1):
-        print(f"\n[Evaluation {index}/{len(selected_codes)}] Budget Code {code}", flush=True)
+        report_progress(
+            progress_callback,
+            f"\n[Evaluation {index}/{len(selected_codes)}] Budget Code {code}",
+            persist=False,
+            stage="evaluation",
+            current=index - 1,
+            total=len(selected_codes),
+            budget_code=code,
+            algorithm=None,
+        )
         outcome_row = outcome_lookup.get(code)
         split_meta = _window_split_meta(outcome_row, history_months, split_index=split_index, test_months=test_months)
         account_months = split_meta["account_months"]
@@ -2006,14 +2774,11 @@ def evaluate_selected_accounts(
         status_reason = ""
         status_name = None
         if outcome_row is not None:
-            status_name, status_reason = _status_from_outcome(outcome_row)
-            ready = bool(outcome_row.get("ready_for_complete_data_model")) and status_name not in {
-                STATUS_INSUFFICIENT_HISTORY,
-                STATUS_ZERO_POLICY,
-                STATUS_NO_DATA,
-                STATUS_INVALID_DATA,
-                STATUS_UNRESOLVED_MISSING,
-            }
+            # Structural gate only. Do not use ready_for_complete_data_model /
+            # full-history NO_POSITIVE to skip expanding/holdout evaluation.
+            status_name, status_reason = _structural_block_for_evaluation(outcome_row)
+            if status_name:
+                ready = False
         if ready and split_meta["train_count"] < MIN_TRAIN_MONTHS:
             ready = False
             status_name = STATUS_INSUFFICIENT_HISTORY
@@ -2036,20 +2801,16 @@ def evaluate_selected_accounts(
                     )
                 )
             account_family_evaluations[code] = {}
-            print(f"  Winner: {status_name or STATUS_NOT_EVALUABLE}", flush=True)
-            print(f"Evaluation progress: status record for {code}", flush=True)
+            label = status_name or STATUS_NOT_EVALUABLE
+            print(f"  Winner: {label}", flush=True)
+            _finish_account(code, index, label, None)
             continue
 
         expected_rows += len(requested)
-        prepared = None
-        if prepared_train_by_account and code in prepared_train_by_account:
-            prepared_series = prepared_train_by_account[code]
-            if isinstance(prepared_series, pd.Series):
-                prepared = np.asarray(prepared_series.reindex(split_meta["train_months"]), dtype=float)
-            else:
-                prepared = np.asarray(prepared_series, dtype=float)
         present = set()
         try:
+            # Always recompute fold-safe prep from raw history. Do not reuse a
+            # pre-normalized 80/20 train series for selection.
             family_results, split_info, _diagnostics = evaluate_seven_models(
                 account_months,
                 series,
@@ -2062,8 +2823,11 @@ def evaluate_selected_accounts(
                 kinds=kinds,
                 interpolate=code in interpolate_set,
                 max_internal_gap=max_internal_gap,
-                prepared_train=prepared,
+                prepared_train=None,
                 test_observed_mask=test_mask,
+                progress_callback=progress_callback,
+                progress_current=index - 1,
+                progress_total=len(selected_codes),
             )
         except Exception as error:
             for algorithm in requested:
@@ -2076,15 +2840,8 @@ def evaluate_selected_accounts(
                     )
                 )
             account_family_evaluations[code] = {}
-            print(
-                f"Evaluation progress: {index * len(requested)}/{len(selected_codes) * len(requested)}",
-                flush=True,
-            )
+            _finish_account(code, index, type(error).__name__, None)
             continue
-        print(
-            f"Evaluation progress: {index * len(requested)}/{len(selected_codes) * len(requested)}",
-            flush=True,
-        )
         compact = {}
         for row in family_results:
             algorithm = row["model_name"]
@@ -2143,13 +2900,19 @@ def evaluate_selected_accounts(
         account_table = pd.DataFrame(
             [row for row in evaluation_rows if str(row.get("Budget Code")) == code]
         )
+        winner_label = "none"
+        winner_algorithm = None
         if not account_table.empty:
             scored, _ = assign_metric_wins(account_table)
             local_winners = select_account_winners(scored)
             if not local_winners.empty:
                 win = local_winners.iloc[0]
                 winner_label = win.get("Winning Algorithm") or win.get("Status") or "none"
+                raw_algorithm = win.get("Winning Algorithm")
+                if raw_algorithm is not None and not (isinstance(raw_algorithm, float) and pd.isna(raw_algorithm)):
+                    winner_algorithm = str(raw_algorithm)
                 print(f"  Winner: {winner_label}", flush=True)
+        _finish_account(code, index, winner_label, winner_algorithm)
     evaluation_table = pd.DataFrame(evaluation_rows)
     if len(evaluation_table) != expected_rows:
         raise AssertionError(

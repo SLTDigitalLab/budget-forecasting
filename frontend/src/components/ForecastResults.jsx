@@ -8,7 +8,6 @@ import { useForecast } from "../context/ForecastContext";
 import {
   chronologicalForecasts,
   isPresentAmount,
-  periodLabel,
 } from "../utils/forecastDisplay";
 import {
   changeVsHistory,
@@ -75,11 +74,12 @@ export default function ForecastResults() {
   return (
     <div className="generate-results">
       <ForecastSummary forecast={forecast} />
+      {rows.length ? (
+      <>
       <section className="charts charts-single">
         <article className="card section-card panel generate-result-card">
           <h2 className="section-card-header">Combined Monthly Forecast</h2>
           <div className="section-card-body">
-            <p className="muted">{periodLabel(forecast)}</p>
             {showInterval ? <ExpectedRangeLabel /> : null}
             <MonthlyForecastChart data={chartData} loading={loading} amountUnit={unit} />
           </div>
@@ -106,6 +106,8 @@ export default function ForecastResults() {
         expanded={showBudgetCodes}
         onToggle={() => setShowBudgetCodes((open) => !open)}
       />
+      </>
+      ) : null}
     </div>
   );
 }

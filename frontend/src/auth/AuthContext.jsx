@@ -4,6 +4,8 @@ import LoadingState from "../components/LoadingState";
 import { consumeAuthReturn, rememberAuthReturn } from "./authRouting.js";
 import { cancelSettingsAction, rememberReturnedActionToken } from "./actionAuthentication.js";
 import { resetFileSelectionAuthorization } from "../utils/fileSelectionAuth.js";
+import { clearAllFlowAuthorizations } from "../utils/flowAuthorization.js";
+import { clearMasterReview, clearUploadReview } from "../utils/settingsFlow.js";
 import {
   clearLoginSession,
   consumeOAuthCallback,
@@ -61,6 +63,9 @@ export function AuthProvider({ children }) {
   const logout = useCallback(() => {
     clearLoginSession();
     resetFileSelectionAuthorization();
+    clearAllFlowAuthorizations();
+    clearUploadReview(sessionStorage);
+    clearMasterReview(sessionStorage);
     setUser(null);
     setError("");
   }, []);

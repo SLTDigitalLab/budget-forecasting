@@ -41,6 +41,18 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    ALTER TABLE forecast_runs ALTER COLUMN overall_total DROP NOT NULL
+    """,
+    """
+    ALTER TABLE forecast_runs ALTER COLUMN monthly_average DROP NOT NULL
+    """,
+    """
+    ALTER TABLE forecast_runs ALTER COLUMN minimum_monthly_forecast DROP NOT NULL
+    """,
+    """
+    ALTER TABLE forecast_runs ALTER COLUMN maximum_monthly_forecast DROP NOT NULL
+    """,
+    """
     CREATE TABLE IF NOT EXISTS forecast_monthly_results (
         id BIGSERIAL PRIMARY KEY,
         forecast_run_id BIGINT NOT NULL REFERENCES forecast_runs(id) ON DELETE CASCADE,
@@ -137,6 +149,16 @@ SCHEMA_STATEMENTS = (
         ON dataset_previews (owner_tid, owner_oid, expires_at)
     """,
     """
+    CREATE TABLE IF NOT EXISTS dataset_preview_confirmations (
+        preview_id UUID PRIMARY KEY,
+        status TEXT NOT NULL,
+        file_id UUID,
+        message TEXT,
+        result JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS dataset_master_meta (
         id INTEGER PRIMARY KEY,
         version INTEGER NOT NULL DEFAULT 0,
@@ -175,6 +197,32 @@ SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS historical_change_records_key_idx
         ON historical_change_records (budget_code, month, id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS historical_declarations (
+        budget_code TEXT NOT NULL,
+        month TEXT NOT NULL,
+        PRIMARY KEY (budget_code, month)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS legacy_baseline_migrations (
+        baseline_hash TEXT PRIMARY KEY,
+        scope_start TEXT,
+        scope_end TEXT,
+        declaration_count INTEGER NOT NULL,
+        numeric_count INTEGER NOT NULL,
+        budget_code_count INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        applied_at TIMESTAMPTZ NOT NULL,
+        audit_event_id BIGINT
+    )
+    """,
+    """
+    ALTER TABLE historical_change_records ADD COLUMN IF NOT EXISTS previous_submission TEXT
+    """,
+    """
+    ALTER TABLE historical_change_records ADD COLUMN IF NOT EXISTS new_submission TEXT
     """,
     """
     ALTER TABLE dataset_files ADD COLUMN IF NOT EXISTS validation_summary JSONB NOT NULL DEFAULT '{}'::jsonb
@@ -277,6 +325,15 @@ SCHEMA_STATEMENTS = (
     ALTER TABLE retrain_jobs ADD COLUMN IF NOT EXISTS progress_budget_code TEXT
     """,
     """
+    ALTER TABLE retrain_jobs ADD COLUMN IF NOT EXISTS progress_algorithm TEXT
+    """,
+    """
+    ALTER TABLE retrain_jobs ADD COLUMN IF NOT EXISTS training_scope_codes JSONB
+    """,
+    """
+    ALTER TABLE retrain_jobs ADD COLUMN IF NOT EXISTS book_entry_excluded_codes JSONB
+    """,
+    """
     CREATE TABLE IF NOT EXISTS settings_action_audit (
         id TEXT PRIMARY KEY,
         occurred_at TIMESTAMPTZ NOT NULL,
@@ -293,6 +350,21 @@ SCHEMA_STATEMENTS = (
     """,
     """
     ALTER TABLE settings_action_audit ADD COLUMN IF NOT EXISTS actor_identity_source TEXT
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS book_entry_accounts (
+        budget_code TEXT PRIMARY KEY,
+        budget_name TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_by TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS book_entry_registry_state (
+        id INTEGER PRIMARY KEY,
+        initialized_at TIMESTAMPTZ NOT NULL
+    )
     """,
     """
     CREATE TABLE IF NOT EXISTS model_publication_meta (

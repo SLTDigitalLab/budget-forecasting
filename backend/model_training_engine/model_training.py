@@ -44,9 +44,15 @@ from evaluation import (
     XGBOOST_PARAMS,
     add_month_label,
     calendar_exog,
+    ARIMA_FAMILY,
     evaluate_selected_accounts,
     evaluate_seven_models,
     evaluation_results_by_code,
+    first_passing_candidate,
+    forecast_direction_warnings,
+    inspect_arima_stability,
+    parse_month_label,
+    ranked_success_algorithms,
     recursive_xgboost_forecast,
     require_successful_account_winners,
     select_account_winners,
@@ -56,11 +62,13 @@ from evaluation import (
 from conformal import CONFORMAL_ALPHA, calibrate_conformal_prediction
 from preprocessing import (
     AMOUNT_UNIT,
+    HISTORICAL_ACTUAL_POLICY,
+    HISTORICAL_ACTUAL_POLICY_VERSION,
     DEFAULT_CATEGORY,
     DEFAULT_MAX_INTERNAL_GAP,
     KIND_NUMBER,
-    MAX_FORECAST_END,
     OUTCOME_NO_DATA,
+    OUTCOME_NO_POSITIVE_YEAR_MEAN,
     OUTCOME_READY,
     OUTCOME_ZERO_POLICY,
     STATUS_FIT_FAILED,
@@ -68,12 +76,15 @@ from preprocessing import (
     STATUS_INSUFFICIENT_HISTORY,
     STATUS_INVALID_DATA,
     STATUS_NO_DATA,
+    STATUS_NO_POSITIVE_YEAR_MEAN,
     STATUS_NO_VALID_WINNER,
     STATUS_NOT_EVALUABLE,
     STATUS_UNRESOLVED_MISSING,
     STATUS_ZERO_POLICY,
     calendar_split_sizes,
     category_matches,
+    exclude_book_entry_codes,
+    negative_policy_summary,
     month_label,
     prepare_series_window,
     run_preprocessing,
@@ -91,13 +102,11 @@ TRAINING_README_NAME = "README.md"
 ENGINE_README_PATH = ENGINE_DIR / TRAINING_README_NAME
 ARTIFACT_SCHEMA_VERSION = "all_account_per_budget_code_v1"
 RUNTIME_DEPENDENCIES_MARKDOWN = """\
-`all_budget_code_models.pkl` uses the same runtime bundle schema as
+`all_budget_code_models.pkl` is the live Generate Forecast production artifact.
+It uses the same runtime bundle schema as the protected legacy file
 `international_settlement_top12_models.pkl`. Loaders and forecast services read
-those pickle fields directly. This README is an evaluation report only and is
-not a runtime data source.
-
-The live Generate Forecast path still loads `international_settlement_top12_models.pkl`
-until the all-budget artifact is explicitly activated.
+pickle fields directly. This README is an evaluation report only and is not a
+runtime data source. Retraining must not overwrite the protected IS top-12 file.
 """
 PER_BUDGET_CODE_FORECAST_TYPE = "PER_BUDGET_CODE_BEST_MODELS"
 PER_BUDGET_CODE_ALGORITHM = "PER_BUDGET_CODE"
@@ -262,16 +271,16 @@ def fit_production_model(best_result, monthly_history, history_months, label=Non
         fitted = ARIMA(
             series,
             order=tuple(parameters["order"]),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
+            enforce_stationarity=True,
+            enforce_invertibility=True,
         ).fit()
     elif name == "SARIMA":
         fitted = SARIMAX(
             series,
             order=tuple(parameters["order"]),
             seasonal_order=tuple(parameters["seasonal_order"]),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
+            enforce_stationarity=True,
+            enforce_invertibility=True,
         ).fit(disp=False)
     elif name == "XGBoost":
         from evaluation import create_xgboost_features
@@ -295,8 +304,8 @@ def fit_production_model(best_result, monthly_history, history_months, label=Non
             exog=exog_scaled,
             order=tuple(parameters["order"]),
             seasonal_order=(0, 0, 0, 0),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
+            enforce_stationarity=True,
+            enforce_invertibility=True,
         ).fit(disp=False)
         state = {
             "scaler": scaler,
@@ -312,8 +321,8 @@ def fit_production_model(best_result, monthly_history, history_months, label=Non
             exog=exog_scaled,
             order=tuple(parameters["order"]),
             seasonal_order=tuple(parameters["seasonal_order"]),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
+            enforce_stationarity=True,
+            enforce_invertibility=True,
         ).fit(disp=False)
         state = {
             "scaler": scaler,
@@ -339,6 +348,12 @@ def fit_production_model(best_result, monthly_history, history_months, label=Non
 
     if fitted is None:
         raise AssertionError("Production training did not produce a fitted model.")
+    if name in ARIMA_FAMILY:
+        root_failures = inspect_arima_stability(fitted, order=parameters.get("order"))
+        if root_failures:
+                    raise AssertionError(
+                f"{name} failed stability validation: " + "; ".join(root_failures)
+            )
     smoke = forecast_from_fitted(name, fitted, state, history_months, steps=3)
     if len(smoke) != 3 or not all(np.isfinite(smoke)):
         raise AssertionError("Production model failed the future-forecast smoke test.")
@@ -788,16 +803,28 @@ def _log(message: str = "") -> None:
     if callback is None or not message:
         return
     meta = _progress_meta.get() or {}
+    event = {
+        "stage": meta.get("stage") or "training",
+        "message": message,
+        "current": meta.get("current"),
+        "total": meta.get("total"),
+    }
+    if "budget_code" in meta:
+        event["budget_code"] = meta.get("budget_code")
+    if "algorithm" in meta:
+        event["algorithm"] = meta.get("algorithm")
     try:
-        callback(
-            {
-                "stage": meta.get("stage") or "training",
-                "message": message,
-                "current": meta.get("current"),
-                "total": meta.get("total"),
-                "budget_code": meta.get("budget_code"),
-            }
-        )
+        callback(event)
+    except Exception:
+        return
+
+
+def _relay_progress(event: dict) -> None:
+    callback = _progress_callback.get()
+    if callback is None or not isinstance(event, dict):
+        return
+    try:
+        callback(event)
     except Exception:
         return
 
@@ -1205,26 +1232,28 @@ def resolve_user_path(file_path: str | None, default_path: Path) -> Path:
 def future_month_index(history_end, forecast_months=None, forecast_end=None):
     latest = pd.Timestamp(history_end).replace(day=1)
     start = latest + pd.offsets.MonthBegin(1)
-    horizon_end = pd.Timestamp(MAX_FORECAST_END).replace(day=1)
+    horizon_end = pd.Timestamp(year=int(latest.year) + 3, month=12, day=1)
+    month_names = (
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    )
+    allowed = (
+        f"Forecast dates must be from {month_names[start.month - 1]} {start.year} "
+        f"through {month_names[horizon_end.month - 1]} {horizon_end.year}."
+    )
     if start > horizon_end:
-        raise ValueError(
-            f"The first forecast month {start.date()} is after the December 2030 horizon."
-        )
+        raise ValueError(allowed)
     if forecast_end:
         end = pd.Timestamp(forecast_end).replace(day=1)
-        if end < start:
-            raise ValueError(
-                f"--forecast-end {end.date()} is before the first forecast month {start.date()}."
-            )
-        if end > horizon_end:
-            raise ValueError("Forecast end cannot be after December 2030.")
+        if end < start or end > horizon_end:
+            raise ValueError(allowed)
         return pd.date_range(start, end, freq="MS")
     months = int(forecast_months if forecast_months is not None else DEFAULT_FORECAST_MONTHS)
     if months <= 0:
         raise ValueError("--forecast-months must be a positive integer.")
     end = start + pd.offsets.MonthBegin(months - 1)
     if end > horizon_end:
-        end = horizon_end
+        raise ValueError(allowed)
     return pd.date_range(start, end, freq="MS")
 
 
@@ -1333,6 +1362,11 @@ def verify_international_settlement_pickle(bundle: dict, selected_codes) -> list
                     failures.append(f"{code} no-data record must not include a fitted model.")
                 if not record.get("status_reason"):
                     failures.append(f"{code} no-data record is missing a reason.")
+            elif status == STATUS_NO_POSITIVE_YEAR_MEAN:
+                if fitted is not None:
+                    failures.append(f"{code} unresolved negative-value record must not include a fitted model.")
+                if not record.get("status_reason"):
+                    failures.append(f"{code} unresolved negative-value record is missing a reason.")
             elif status in {
                 STATUS_UNRESOLVED_MISSING,
                 STATUS_INVALID_DATA,
@@ -1418,11 +1452,79 @@ def _validate_with_production_loader(bundle: dict) -> None:
         raise AssertionError(f"Production artifact validation failed: {error}") from error
 
 
+def training_scope_is_consistent(
+    selected,
+    book_entry_excluded,
+    *,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
+    expected_account_count=None,
+) -> None:
+    """Validate trainable codes against a frozen post-exclusion training scope.
+
+    Prefer exact code-identity checks from the job snapshot. Count equality alone
+    is never enough when a frozen scope is available. Book Entry exclusions may
+    appear as metadata/status records but must not be treated as fitted models.
+    """
+    selected_codes = [str(code) for code in (selected or [])]
+    excluded = [str(code) for code in (book_entry_excluded or [])]
+    selected_set = set(selected_codes)
+    excluded_set = set(excluded)
+    if len(selected_codes) != len(selected_set):
+        raise AssertionError("selected_accounts must contain unique Budget Codes.")
+    if selected_set & excluded_set:
+        raise AssertionError("Book Entry accounts were included in the trainable account set.")
+    if expected_scope_codes is not None:
+        expected_scope = {str(code) for code in expected_scope_codes}
+        if selected_set != expected_scope:
+            missing = sorted(expected_scope - selected_set)
+            unexpected = sorted(selected_set - expected_scope)
+            raise AssertionError(
+                "Candidate selected_accounts do not match the frozen training scope "
+                f"(missing {len(missing)}, unexpected {len(unexpected)})."
+            )
+    if expected_excluded_codes is not None:
+        expected_excluded = {str(code) for code in expected_excluded_codes}
+        if excluded_set != expected_excluded:
+            missing = sorted(expected_excluded - excluded_set)
+            unexpected = sorted(excluded_set - expected_excluded)
+            raise AssertionError(
+                "Candidate Book Entry exclusions do not match the frozen job exclusions "
+                f"(missing {len(missing)}, unexpected {len(unexpected)})."
+            )
+    if expected_account_count is not None:
+        accounted = len(selected_set) + len(excluded_set)
+        if accounted != int(expected_account_count):
+            raise AssertionError(
+                f"Eligible accounts {len(selected_set)} plus Book Entry exclusions {len(excluded_set)} "
+                f"do not match the master snapshot count {int(expected_account_count)}."
+            )
+
+
+def account_count_is_consistent(
+    selected,
+    book_entry_excluded,
+    expected_account_count,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
+) -> None:
+    """Compatibility wrapper around training_scope_is_consistent."""
+    training_scope_is_consistent(
+        selected,
+        book_entry_excluded,
+        expected_scope_codes=expected_scope_codes,
+        expected_excluded_codes=expected_excluded_codes,
+        expected_account_count=expected_account_count,
+    )
+
+
 def publish_validated_production_pickle(
     temp_path: Path,
     destination: Path,
     bundle: dict,
     expected_account_count: int | None = None,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
 ) -> Path:
     """Validate a complete candidate, then atomically replace the destination pickle."""
     temp_path = Path(temp_path)
@@ -1436,11 +1538,13 @@ def publish_validated_production_pickle(
             raise AssertionError("Temporary pickle is empty.")
         if destination.name == CANDIDATE_ARTIFACT_NAME:
             selected = [str(code) for code in bundle.get("selected_accounts") or []]
-            if expected_account_count is not None and len(selected) != int(expected_account_count):
-                raise AssertionError(
-                    f"Trained budget-code count {len(selected)} does not match "
-                    f"the master snapshot count {int(expected_account_count)}."
-                )
+            training_scope_is_consistent(
+                selected,
+                bundle.get("book_entry_excluded_codes") or [],
+                expected_scope_codes=expected_scope_codes,
+                expected_excluded_codes=expected_excluded_codes,
+                expected_account_count=expected_account_count,
+            )
             _validate_with_production_loader(bundle)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temp_path.replace(destination)
@@ -1456,6 +1560,8 @@ def save_validated_candidate(
     destination: Path,
     bundle: dict,
     expected_account_count: int | None = None,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
 ) -> Path:
     """Validate a deferred candidate without replacing the production pickle."""
     temp_path = Path(temp_path)
@@ -1466,11 +1572,13 @@ def save_validated_candidate(
         if not temp_path.is_file() or temp_path.stat().st_size <= 0:
             raise AssertionError("Temporary pickle is empty.")
         selected = [str(code) for code in bundle.get("selected_accounts") or []]
-        if expected_account_count is not None and len(selected) != int(expected_account_count):
-            raise AssertionError(
-                f"Trained budget-code count {len(selected)} does not match "
-                f"the master snapshot count {int(expected_account_count)}."
-            )
+        training_scope_is_consistent(
+            selected,
+            bundle.get("book_entry_excluded_codes") or [],
+            expected_scope_codes=expected_scope_codes,
+            expected_excluded_codes=expected_excluded_codes,
+            expected_account_count=expected_account_count,
+        )
         _validate_with_production_loader(bundle)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temp_path.replace(destination)
@@ -1488,6 +1596,8 @@ def commit_training_artifact(
     *,
     publish_production: bool,
     expected_account_count: int | None = None,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
 ) -> Path:
     if publish_production:
         return publish_validated_production_pickle(
@@ -1495,12 +1605,16 @@ def commit_training_artifact(
             destination,
             bundle,
             expected_account_count=expected_account_count,
+            expected_scope_codes=expected_scope_codes,
+            expected_excluded_codes=expected_excluded_codes,
         )
     return save_validated_candidate(
         temp_path,
         destination,
         bundle,
         expected_account_count=expected_account_count,
+        expected_scope_codes=expected_scope_codes,
+        expected_excluded_codes=expected_excluded_codes,
     )
 
 
@@ -1577,6 +1691,8 @@ def run_training(
     regular_expense_accounts=None,
     max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
     expected_account_count: int | None = None,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
     publish_production: bool = True,
     progress_callback=None,
 ):
@@ -1597,6 +1713,8 @@ def run_training(
             regular_expense_accounts=regular_expense_accounts,
             max_internal_gap=max_internal_gap,
             expected_account_count=expected_account_count,
+            expected_scope_codes=expected_scope_codes,
+            expected_excluded_codes=expected_excluded_codes,
             publish_production=publish_production,
         )
     finally:
@@ -1617,6 +1735,8 @@ def _run_training_work(
     regular_expense_accounts=None,
     max_internal_gap: int = DEFAULT_MAX_INTERNAL_GAP,
     expected_account_count: int | None = None,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
     publish_production: bool = True,
 ):
     started = time.perf_counter()
@@ -1639,10 +1759,7 @@ def _run_training_work(
 
     interpolate_accounts = [str(code) for code in (regular_expense_accounts or [])]
     requested_category = None if category is None or str(category).strip().casefold() in {"", "all", "*"} else str(category)
-    _log(f"Original dataset: {input_path}")
-    _log(f"Training output: {output_path}")
-    _log(f"Candidate Pickle: {pickle_path}")
-    _log(f"Deployed artifact remains: {deployed_path}")
+    _log(f"Publication target: {CANDIDATE_ARTIFACT_NAME}")
     _log(f"Category: {requested_category or 'ALL'}")
     _log("Missing values: per-Budget-Code mean (zeros included, NaN excluded)")
     if test_months is not None:
@@ -1659,7 +1776,9 @@ def _run_training_work(
         regular_expense_accounts=interpolate_accounts,
         max_internal_gap=max_internal_gap,
     )
-    selected_codes = [str(code) for code in preprocessing_result["account_codes"]]
+    loaded_codes = [str(code) for code in preprocessing_result["account_codes"]]
+    selected_codes = exclude_book_entry_codes(loaded_codes)
+    book_entry_excluded = [code for code in loaded_codes if code not in set(selected_codes)]
     if not selected_codes:
         raise AssertionError("No eligible budget codes were available after preprocessing.")
     summary = preprocessing_result.get("imputation_summary") or {}
@@ -1671,6 +1790,24 @@ def _run_training_work(
         _log(f"Missing values filled using same-Budget-Code mean: {summary.get('missing_values_filled')}")
         _log(f"Unable to impute/train: {summary.get('unable_to_impute_or_train')}")
     history_months = list(preprocessing_result["history_months"])
+    negative_diagnostics = negative_policy_summary(
+        preprocessing_result["selected_matrix"],
+        preprocessing_result["kind_matrix"],
+        history_months,
+        selected_codes,
+    )
+    _log(f"Budget codes loaded: {len(loaded_codes)}")
+    _log(f"Book Entry codes excluded: {len(book_entry_excluded)}")
+    _log(f"Training-eligible codes: {len(selected_codes)}")
+    _log(f"Negative observations detected: {negative_diagnostics['negative_observations']}")
+    _log(f"Negative observations replaced: {negative_diagnostics['negative_observations_replaced']}")
+    _log(f"Code-year groups without a positive mean: {len(negative_diagnostics['code_years_without_positive_mean'])}")
+    _log(f"Unresolved negative observations: {negative_diagnostics['unresolved_observations']}")
+    _log(f"Missing values imputed: {negative_diagnostics['missing_values_imputed']}")
+    _log(f"NO_DATA accounts: {negative_diagnostics['no_data_accounts']}")
+    _log(f"ZERO_POLICY accounts: {negative_diagnostics['zero_policy_accounts']}")
+    _log(f"Blocked by unresolved preprocessing: {len(negative_diagnostics['blocked_no_positive_year_mean'])}")
+    _log(f"Accounts eligible for model evaluation: {negative_diagnostics['evaluation_eligible_accounts']}")
     history_dates = list(preprocessing_result["month_dates"])
     detected_month_count = int(preprocessing_result["detected_month_count"])
     if len(history_months) != detected_month_count:
@@ -1691,6 +1828,7 @@ def _run_training_work(
         observed_test_mask=preprocessing_result.get("observed_test_mask"),
         interpolate_accounts=interpolate_accounts,
         max_internal_gap=max_internal_gap,
+        progress_callback=_relay_progress,
     )
     evaluation_table = evaluation_payload["evaluation_table"]
     metric_winners = evaluation_payload["metric_winners"]
@@ -1760,6 +1898,7 @@ def _run_training_work(
         prepared_full, methods_full, full_outcome, full_reason = prepare_series_window(
             raw_full,
             kinds_full,
+            months=window_months,
         )
         eval_winner = winner_by_code.get(code)
         winner_row = winner_metrics.get(code)
@@ -1772,6 +1911,7 @@ def _run_training_work(
                 "current": index,
                 "total": len(selected_codes),
                 "budget_code": code,
+                "algorithm": eval_winner or None,
             }
         )
         _log("")
@@ -1863,6 +2003,47 @@ def _run_training_work(
             _log("  Status: ZERO_POLICY (explicit zero contribution, no fitted model)")
             continue
 
+        if full_outcome == OUTCOME_NO_POSITIVE_YEAR_MEAN:
+            production_status = STATUS_NO_POSITIVE_YEAR_MEAN
+            status_reason = full_reason or "NO_POSITIVE_YEAR_MEAN"
+            unavailable.append({"account_code": code, "status": production_status, "reason": status_reason})
+            record = {
+                "budget_code": code,
+                "account_name": name_map.get(code, ""),
+                "category": "" if outcome_row is None else _record_text(outcome_row, "category"),
+                "algorithm": None,
+                "model_name": None,
+                "model": None,
+                "trained_model": None,
+                "model_specification": {"policy": "NO_POSITIVE_YEAR_MEAN"},
+                "production_status": production_status,
+                "status_reason": status_reason,
+                "preprocessing_outcome": full_outcome,
+                "history_start": window_months[0],
+                "history_end": window_months[-1],
+                "history_start_source": None if outcome_row is None else _record_get(outcome_row, "history_start_source"),
+                "history_months": list(window_months),
+                "historical_values": _history_as_stored(raw_full),
+                "prepared_full_history": _history_as_stored(prepared_full),
+                "imputation_methods": [str(item) for item in methods_full],
+                "required_forecast_state": {},
+                "evaluation_metrics": {},
+                "metric_win_count": 0,
+                "training_metadata": {
+                    "training_start": window_months[0],
+                    "training_end": window_months[-1],
+                    "number_of_observations": int(len(window_months)),
+                    "frequency": "MS",
+                    "retrained_on_full_history": False,
+                    "no_positive_year_mean": True,
+                },
+            }
+            record.update(_account_split_fields(outcome_row, window_months))
+            account_records[code] = record
+            account_models[code] = record
+            _log("  Status: NO_POSITIVE_YEAR_MEAN (negative actuals have no same-year positive mean; no model was fitted)")
+            continue
+
         if full_outcome != OUTCOME_READY:
             if full_outcome == "INVALID_ENTRIES":
                 production_status = STATUS_INVALID_DATA
@@ -1945,30 +2126,60 @@ def _run_training_work(
             _log(f"  Status: {production_status}")
             continue
 
-        algorithm = eval_winner
-        family_result = (account_family_evaluations.get(code) or {}).get(algorithm) or {}
-        _log(f"  Parameters: {family_result.get('parameters')}")
-        _log(f"  Retraining on full {len(window_months)}-month history...")
-        try:
-            if family_result.get("status") != "success":
-                raise AssertionError(family_result.get("error") or f"{algorithm} has no valid configuration.")
+        ranked_algorithms = ranked_success_algorithms(evaluation_table, code) or [eval_winner]
+        family_by_algorithm = account_family_evaluations.get(code) or {}
+
+        def _validate_candidate(candidate_name):
+            candidate_family = family_by_algorithm.get(candidate_name) or {}
+            if candidate_family.get("status") != "success":
+                raise AssertionError(candidate_family.get("error") or f"{candidate_name} has no valid configuration.")
             if not np.isfinite(np.asarray(prepared_full, dtype=float)).all():
                 raise AssertionError("Prepared full-history window is not finite.")
-            fitted, parameters, state, smoke = fit_production_model(
-                {"model_name": algorithm, "parameters": dict(family_result.get("parameters") or {})},
+            _log(f"  Retraining on full {len(window_months)}-month history and validating {candidate_name}")
+            fitted_model, fitted_parameters, fitted_state, fitted_smoke = fit_production_model(
+                {"model_name": candidate_name, "parameters": dict(candidate_family.get("parameters") or {})},
                 [float(value) for value in prepared_full],
                 window_months,
                 label=f"prepared full historical window for {code}",
+                quiet=True,
             )
-            wrapper = FittedBudgetCodeModel(algorithm, fitted, state, window_months)
-            future_values = [float(value) for value in wrapper.forecast(steps=len(forecast_labels))]
+            end_year, end_month = parse_month_label(window_months[-1])
+            history_end_ts = pd.Timestamp(year=end_year, month=end_month, day=1)
+            full_index = future_month_index(
+                history_end_ts,
+                forecast_end=pd.Timestamp(year=int(history_end_ts.year) + 3, month=12, day=1),
+            )
+            full_values = [
+                float(value)
+                for value in forecast_from_fitted(
+                    candidate_name, fitted_model, fitted_state, window_months, len(full_index)
+                )
+            ]
+            if len(full_values) != len(full_index) or not all(np.isfinite(full_values)):
+                raise AssertionError("Full-horizon forecast is missing or not finite.")
+            requested_values = full_values[: len(forecast_labels)]
+            if len(requested_values) != len(forecast_labels):
+                raise AssertionError("Requested forecast is not a prefix of the allowed horizon.")
             if clip_negative:
-                future_values = [max(0.0, float(value)) for value in future_values]
-            if len(future_values) != len(forecast_labels) or not all(np.isfinite(future_values)):
-                raise AssertionError("Future forecast is missing or not finite.")
-        except Exception as error:
-            production_status = STATUS_FIT_FAILED
-            status_reason = f"{type(error).__name__}: {error}"
+                requested_values = [max(0.0, float(value)) for value in requested_values]
+            return {
+                "fitted": fitted_model,
+                "parameters": fitted_parameters,
+                "state": fitted_state,
+                "smoke": fitted_smoke,
+                "future_values": requested_values,
+                "warnings": forecast_direction_warnings(full_values, raw_full),
+                "family_result": candidate_family,
+            }
+
+        algorithm, validated, validation_attempts = first_passing_candidate(ranked_algorithms, _validate_candidate)
+        if algorithm is None:
+            production_status = STATUS_NO_VALID_WINNER
+            status_reason = "No ranked candidate passed final validation."
+            if validation_attempts:
+                status_reason = "; ".join(
+                    f"{item['algorithm']}: {item['reason']}" for item in validation_attempts
+                )
             unavailable.append({"account_code": code, "status": production_status, "reason": status_reason})
             record = {
                 "budget_code": code,
@@ -2002,12 +2213,28 @@ def _run_training_work(
                     "retrained_on_full_history": False,
                 },
             }
+            record["validation_attempts"] = validation_attempts
             record.update(_account_split_fields(outcome_row, window_months))
             account_records[code] = record
             account_models[code] = record
             _log(f"  Fit: FAILED {status_reason}")
             continue
 
+        fitted = validated["fitted"]
+        parameters = validated["parameters"]
+        state = validated["state"]
+        smoke = validated["smoke"]
+        future_values = list(validated["future_values"])
+        family_result = validated["family_result"]
+        validation_warnings = list(validated.get("warnings") or [])
+        chosen_rows = evaluation_table[
+            (evaluation_table["Budget Code"].astype(str) == str(code))
+            & (evaluation_table["Algorithm"].astype(str) == str(algorithm))
+        ]
+        if not chosen_rows.empty:
+            winner_row = chosen_rows.iloc[0]
+        if validation_warnings:
+            _log("  Forecast-quality warning: " + " ".join(validation_warnings))
         winner = winner_row
         holdout_metrics = {
             "MAE": _record_get(winner, "MAE"),
@@ -2023,6 +2250,10 @@ def _run_training_work(
             "number_of_observations": int(len(window_months)),
             "frequency": "MS",
             "retrained_on_full_history": True,
+            "validation_attempts": validation_attempts,
+            "forecast_quality_warnings": validation_warnings,
+            "objective_validation": "passed",
+            "baseline_role": "diagnostic",
         }
         record = {
             "model": fitted,
@@ -2082,8 +2313,8 @@ def _run_training_work(
         parameters_by_code[code] = dict(family_result.get("parameters") or {})
         algorithm_by_code[code] = algorithm
         conformal_histories[code] = {
-            "values": [float(value) for value in prepared_full],
-            "raw_targets": list(raw_full),
+            "values": [float(value) if np.isfinite(value) else float("nan") for value in raw_full],
+            "raw_targets": [float(value) if np.isfinite(value) else float("nan") for value in raw_full],
             "months": list(window_months),
             "kinds": list(kinds_full),
         }
@@ -2109,10 +2340,16 @@ def _run_training_work(
             return fit_production_model(spec, history, months, quiet=True)
 
         def _preprocess_origin(code, values, kinds, months):
-            del code, months
+            del code
+            kind_row = (
+                np.asarray(kinds, dtype=object)
+                if kinds is not None and len(kinds)
+                else np.full(len(values), KIND_NUMBER, dtype=object)
+            )
             return prepare_series_window(
                 np.asarray(values, dtype=float),
-                np.asarray(kinds, dtype=object) if kinds is not None and len(kinds) else np.full(len(values), KIND_NUMBER, dtype=object),
+                kind_row,
+                months=months,
             )
 
         conformal_prediction = calibrate_conformal_prediction(
@@ -2191,9 +2428,24 @@ def _run_training_work(
         "eligible_accounts": eligible_records,
         "selected_accounts": selected_codes,
         "selected_budget_codes": selected_codes,
+        "book_entry_excluded_codes": book_entry_excluded,
+        "eligible_account_count": len(selected_codes),
+        "preprocessing_diagnostics": negative_diagnostics,
         "overall_best_algorithm": PER_BUDGET_CODE_ALGORITHM,
         "evaluation_metrics": list(EVALUATION_METRICS),
-        "evaluation_label": "selection-holdout evaluation",
+        "historical_actual_policy": {
+            "version": HISTORICAL_ACTUAL_POLICY_VERSION,
+            "rule": HISTORICAL_ACTUAL_POLICY,
+        },
+        "evaluation_label": "expanding-window evaluation",
+        "validation_policy": {
+            "method": "expanding_window",
+            "folds": 3,
+            "horizon_months": 6,
+            "min_train_months": 24,
+            "short_history": "INSUFFICIENT_FOLDS; shuffled cross-validation is not used",
+            "baseline": "seasonal_naive diagnostic only; no automatic fallback",
+        },
         "metric_winners": metric_winners.to_dict(orient="records"),
         "models": models,
         "account_records": account_records,
@@ -2266,6 +2518,8 @@ def _run_training_work(
             reloaded,
             publish_production=publish_production,
             expected_account_count=expected_account_count,
+            expected_scope_codes=expected_scope_codes,
+            expected_excluded_codes=expected_excluded_codes,
         )
     finally:
         if tmp_path.exists() and tmp_path.resolve() != pickle_path.resolve():
@@ -2294,6 +2548,10 @@ def _run_training_work(
         "account_winners": account_winners.to_dict(orient="records"),
         "evaluation_results": evaluation_table.to_dict(orient="records"),
         "preprocessing": {
+            "historical_actual_policy": {
+                "version": HISTORICAL_ACTUAL_POLICY_VERSION,
+                "rule": HISTORICAL_ACTUAL_POLICY,
+            },
             "category": bundle_category,
             "history_start": preprocessing_result["history_start"],
             "history_end": preprocessing_result["history_end"],
@@ -2398,7 +2656,7 @@ def run_combined_monthly_training(input_file: str | None = None, output_dir: str
         )
 
     preprocessing_result = run_preprocessing(str(input_path))
-    selected_codes = list(preprocessing_result["account_codes"])
+    selected_codes = exclude_book_entry_codes(preprocessing_result["account_codes"])
     if len(selected_codes) != 12 or len(set(selected_codes)) != 12:
         raise AssertionError("Production bundle requires exactly 12 unique selected accounts.")
     combined_history = preprocessing_result["monthly_history"]
@@ -2621,7 +2879,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--forecast-end",
         default=None,
-        help="Optional last forecast month such as 2030-12-01. Cannot be after December 2030.",
+        help="Optional last forecast month such as 2029-12-01. Cannot be after December of the historical end year plus 3.",
     )
     parser.add_argument(
         "--output-dir",

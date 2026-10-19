@@ -33,7 +33,9 @@ from app.services.retrain_state import (
     mark_saved,
     mutate,
     public_view,
+    set_state_preparer,
     sweep,
+    _UNSET,
     utcnow,
     worker_id_for_process,
 )
@@ -43,6 +45,9 @@ _runner = None
 _maintenance_started = False
 _local_jobs: set[str] = set()
 _local_guard = threading.Lock()
+_live_guard = threading.Lock()
+_live_progress: dict[str, dict] = {}
+_LIVE_STATES = {"QUEUED", "TRAINING", "VALIDATING", "SAVING"}
 
 
 def candidate_directory() -> Path:
@@ -130,6 +135,8 @@ def _shell_job(identity, now: datetime) -> dict:
         "earliest_month": None,
         "latest_month": None,
         "budget_code_count": None,
+        "training_scope_codes": None,
+        "book_entry_excluded_codes": None,
         "candidate_path": str(candidate_directory() / f"{job_id}.pkl"),
         "candidate_sha256": None,
         "candidate_validated": False,
@@ -150,6 +157,7 @@ def _shell_job(identity, now: datetime) -> dict:
         "created_at": now,
         "updated_at": now,
         "progress_budget_code": None,
+        "progress_algorithm": None,
     }
     job["initiator_display_name"] = str(_identity_value(identity, "name") or "")[:200]
     job["initiator_tid"] = ""
@@ -166,6 +174,57 @@ def _apply_snapshot(job: dict, snapshot: dict) -> None:
     job["earliest_month"] = snapshot.get("earliest_month")
     job["latest_month"] = snapshot.get("latest_month")
     job["budget_code_count"] = snapshot.get("budget_code_count")
+    job["training_scope_codes"] = list(snapshot.get("training_scope_codes") or [])
+    job["book_entry_excluded_codes"] = list(snapshot.get("book_entry_excluded_codes") or [])
+
+
+def derive_training_scope_from_snapshot(snapshot_path: str | Path) -> dict:
+    """Read budget-code IDs from a frozen snapshot and apply Book Entry exclusion.
+
+    The resulting training scope is independent of later live master edits.
+    Counts are derived from those IDs — never hardcoded.
+    """
+    import sys
+
+    path = Path(snapshot_path)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise AssertionError(f"Training snapshot is missing: {path}")
+    engine_dir = FORECAST_ARTIFACT_PATH.parent.parent
+    if str(engine_dir) not in sys.path:
+        sys.path.insert(0, str(engine_dir))
+    from preprocessing import _collect_accounts, _load_original_excel, exclude_book_entry_codes
+
+    loaded = _load_original_excel(str(path))
+    collected = _collect_accounts(loaded)
+    loaded_codes = [str(code) for code in (collected.get("account_codes") or [])]
+    if not loaded_codes:
+        raise AssertionError("The training snapshot does not contain any Budget Codes.")
+    training_scope = exclude_book_entry_codes(loaded_codes)
+    excluded = [code for code in loaded_codes if code not in set(training_scope)]
+    if not training_scope:
+        raise AssertionError("No eligible Budget Codes remained after Book Entry exclusion.")
+    return {
+        "training_scope_codes": training_scope,
+        "book_entry_excluded_codes": excluded,
+        "budget_code_count": len(loaded_codes),
+    }
+
+
+def resolve_job_training_scope(job: dict) -> dict:
+    """Return the frozen training scope for Save/Retry, backfilling from the snapshot if needed."""
+    scope = [str(code) for code in (job.get("training_scope_codes") or []) if str(code)]
+    excluded = [str(code) for code in (job.get("book_entry_excluded_codes") or []) if str(code)]
+    if scope:
+        return {
+            "training_scope_codes": scope,
+            "book_entry_excluded_codes": excluded,
+            "budget_code_count": int(job.get("budget_code_count") or (len(scope) + len(excluded))),
+        }
+    snapshot_path = job.get("snapshot_path")
+    if not snapshot_path:
+        raise AssertionError("This job does not have a frozen training snapshot for Save Models validation.")
+    derived = derive_training_scope_from_snapshot(snapshot_path)
+    return derived
 
 
 def capture_snapshot(job_id: str) -> dict:
@@ -177,6 +236,7 @@ def capture_snapshot(job_id: str) -> dict:
     destination = candidate_directory() / f"{job_id}-snapshot.xlsx"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(snapshot["path"], destination)
+    scope = derive_training_scope_from_snapshot(destination)
     return {
         "path": str(destination),
         "fingerprint": fingerprint_master_state(state),
@@ -184,7 +244,9 @@ def capture_snapshot(job_id: str) -> dict:
         "source": snapshot.get("source"),
         "earliest_month": snapshot.get("earliest_month"),
         "latest_month": snapshot.get("latest_month"),
-        "budget_code_count": int(snapshot.get("budget_code_count") or 0),
+        "budget_code_count": int(scope["budget_code_count"]),
+        "training_scope_codes": list(scope["training_scope_codes"]),
+        "book_entry_excluded_codes": list(scope["book_entry_excluded_codes"]),
     }
 
 
@@ -219,7 +281,37 @@ def reload_published_model() -> str | None:
     return None
 
 
-def publish_candidate(candidate_path: Path, production_path: Path | None = None) -> dict:
+def master_snapshot_account_count(
+    bundle: dict,
+    expected_account_count: int | None = None,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
+) -> int | None:
+    """Resolve the master snapshot account total used by Save Models validation.
+
+    Prefer the frozen job universe (eligible plus Book Entry exclusions). Never fall
+    back to the eligible-only length alone when exclusions are known.
+    """
+    if expected_account_count is not None:
+        return int(expected_account_count)
+    if expected_scope_codes is not None or expected_excluded_codes is not None:
+        scope = {str(code) for code in (expected_scope_codes or [])}
+        excluded = {str(code) for code in (expected_excluded_codes or [])}
+        return len(scope) + len(excluded)
+    selected = [str(code) for code in (bundle.get("selected_accounts") or [])]
+    excluded = {str(code) for code in (bundle.get("book_entry_excluded_codes") or [])}
+    if not selected and not excluded:
+        return None
+    return len(selected) + len(excluded)
+
+
+def publish_candidate(
+    candidate_path: Path,
+    production_path: Path | None = None,
+    expected_account_count: int | None = None,
+    expected_scope_codes=None,
+    expected_excluded_codes=None,
+) -> dict:
     """Validate the candidate again and atomically replace only the fixed production pickle."""
     import sys
 
@@ -249,7 +341,14 @@ def publish_candidate(candidate_path: Path, production_path: Path | None = None)
             temporary,
             production,
             bundle,
-            expected_account_count=len(bundle.get("selected_accounts") or []),
+            expected_account_count=master_snapshot_account_count(
+                bundle,
+                expected_account_count,
+                expected_scope_codes=expected_scope_codes,
+                expected_excluded_codes=expected_excluded_codes,
+            ),
+            expected_scope_codes=expected_scope_codes,
+            expected_excluded_codes=expected_excluded_codes,
         )
     except Exception:
         if before is not None and production.is_file():
@@ -332,6 +431,91 @@ def start_job(identity, snapshot: dict | None = None, now: datetime | None = Non
     return {"job_id": job["id"], "state": "QUEUED"}
 
 
+def record_live_progress(job_id: str, event: dict | None) -> None:
+    """Remember the latest training event without opening a database transaction."""
+    if not job_id or not isinstance(event, dict):
+        return
+    message = str(event.get("message") or "").strip()
+    with _live_guard:
+        slot = _live_progress.setdefault(job_id, {"messages": []})
+        if message:
+            slot["messages"].append(message)
+        stage = event.get("stage")
+        if stage:
+            slot["stage"] = str(stage)
+        if event.get("current") is not None:
+            slot["current"] = int(event["current"])
+            slot["has_current"] = True
+        if event.get("total") is not None:
+            slot["total"] = int(event["total"])
+            slot["has_total"] = True
+        if "budget_code" in event:
+            code = event.get("budget_code")
+            slot["budget_code"] = str(code) if code else None
+            slot["has_budget_code"] = True
+        if "algorithm" in event:
+            algorithm = event.get("algorithm")
+            slot["algorithm"] = str(algorithm) if algorithm else None
+            slot["has_algorithm"] = True
+        if "fold" in event:
+            fold = event.get("fold")
+            slot["fold"] = str(fold) if fold else None
+            slot["has_fold"] = True
+
+
+def clear_live_progress(job_id: str) -> None:
+    with _live_guard:
+        _live_progress.pop(job_id, None)
+
+
+def merge_live_progress(state: dict) -> None:
+    """Copy coalesced progress onto the loaded job before a mutation is saved."""
+    with _live_guard:
+        pending = []
+        for job_id, slot in _live_progress.items():
+            pending.append(
+                (
+                    job_id,
+                    {
+                        "messages": list(slot.get("messages") or []),
+                        "stage": slot.get("stage"),
+                        "current": slot.get("current"),
+                        "has_current": bool(slot.get("has_current")),
+                        "total": slot.get("total"),
+                        "has_total": bool(slot.get("has_total")),
+                        "budget_code": slot.get("budget_code"),
+                        "has_budget_code": bool(slot.get("has_budget_code")),
+                        "algorithm": slot.get("algorithm"),
+                        "has_algorithm": bool(slot.get("has_algorithm")),
+                        "fold": slot.get("fold"),
+                        "has_fold": bool(slot.get("has_fold")),
+                    },
+                )
+            )
+            slot["messages"] = []
+    now = utcnow()
+    for job_id, slot in pending:
+        job = state.get("jobs", {}).get(job_id)
+        if job is None or job.get("state") not in _LIVE_STATES:
+            clear_live_progress(job_id)
+            continue
+        for message in slot["messages"]:
+            append_progress(job, message, None, None, None, now)
+        if slot["stage"] == "validating" and job.get("state") == "TRAINING":
+            job["state"] = "VALIDATING"
+        append_progress(
+            job,
+            "",
+            slot["stage"],
+            slot["current"] if slot["has_current"] else None,
+            slot["total"] if slot["has_total"] else None,
+            now,
+            slot["budget_code"] if slot["has_budget_code"] else _UNSET,
+            slot["algorithm"] if slot["has_algorithm"] else _UNSET,
+            slot["fold"] if slot["has_fold"] else _UNSET,
+        )
+
+
 def run_job_body(job_id: str) -> None:
     with _local_guard:
         _local_jobs.add(job_id)
@@ -352,6 +536,7 @@ def run_job_body(job_id: str) -> None:
 
     beater = threading.Thread(target=beat, name=f"retrain-heartbeat-{job_id}", daemon=True)
     beater.start()
+    accepting_progress = True
     try:
         def mark_training(state):
             job = state["jobs"][job_id]
@@ -366,50 +551,45 @@ def run_job_body(job_id: str) -> None:
         candidate.parent.mkdir(parents=True, exist_ok=True)
 
         def progress(event: dict) -> None:
-            def apply(state):
-                current = state["jobs"].get(job_id)
-                if current is None:
-                    return
-                if event.get("stage") == "validating" and current.get("state") == "TRAINING":
-                    current["state"] = "VALIDATING"
-                append_progress(
-                    current,
-                    str(event.get("message") or ""),
-                    event.get("stage"),
-                    event.get("current"),
-                    event.get("total"),
-                    utcnow(),
-                    event.get("budget_code"),
-                )
+            if not accepting_progress:
+                return
+            record_live_progress(job_id, event)
 
-            mutate(apply)
-
+        scope = resolve_job_training_scope(job)
         result = execute_training(
             input_file=job["snapshot_path"],
             output_dir=str(candidate.parent),
             output_file=candidate.name,
             publish_production=False,
             progress_callback=progress,
-            expected_account_count=job.get("budget_code_count"),
+            expected_account_count=scope["budget_code_count"],
+            expected_scope_codes=scope["training_scope_codes"],
+            expected_excluded_codes=scope["book_entry_excluded_codes"],
             category=None,
         )
         saved = Path(result["pickle_path"]).resolve()
         if saved.name == FORECAST_ARTIFACT_NAME or saved == production_artifact_path():
             raise AssertionError("Training published the production pickle before Save Models.")
+        progress({"stage": "validating", "message": "Validating candidate"})
         digest = _sha256(saved)
+        accepting_progress = False
 
         def ready(state):
             current = state["jobs"][job_id]
-            current["state"] = "VALIDATING"
             mark_ready(current, str(saved), digest, utcnow())
+            clear_live_progress(job_id)
 
         mutate(ready)
     except Exception as error:
+        accepting_progress = False
+
         def fail(state):
             current = state["jobs"].get(job_id)
             if current is None or current.get("state") in {"READY_TO_SAVE", "SAVED", "SAVE_FAILED"}:
+                clear_live_progress(job_id)
                 return
             fail_job(state, current, str(error), "TRAINING_FAILED", utcnow(), safe_unlink)
+            clear_live_progress(job_id)
 
         mutate(fail)
     finally:
@@ -498,7 +678,19 @@ def save_job(job_id: str, identity, now: datetime | None = None) -> dict:
         job["error_detail"] = None
         job["updated_at"] = now
         job["heartbeat_at"] = now
-        return {"idempotent": False, "candidate_path": job.get("candidate_path"), "sha": job.get("candidate_sha256")}
+        scope = resolve_job_training_scope(job)
+        # Persist backfilled scope so Retry Save reuses the same frozen IDs.
+        job["training_scope_codes"] = list(scope["training_scope_codes"])
+        job["book_entry_excluded_codes"] = list(scope["book_entry_excluded_codes"])
+        job["budget_code_count"] = int(scope["budget_code_count"])
+        return {
+            "idempotent": False,
+            "candidate_path": job.get("candidate_path"),
+            "sha": job.get("candidate_sha256"),
+            "budget_code_count": scope["budget_code_count"],
+            "training_scope_codes": list(scope["training_scope_codes"]),
+            "book_entry_excluded_codes": list(scope["book_entry_excluded_codes"]),
+        }
 
     started = mutate(begin)
     if started.get("mismatch"):
@@ -507,7 +699,12 @@ def save_job(job_id: str, identity, now: datetime | None = None) -> dict:
         job = started["job"]
         return _save_payload(job, idempotent=True)
     try:
-        published = publish_candidate(Path(started["candidate_path"]))
+        published = publish_candidate(
+            Path(started["candidate_path"]),
+            expected_account_count=started.get("budget_code_count"),
+            expected_scope_codes=started.get("training_scope_codes"),
+            expected_excluded_codes=started.get("book_entry_excluded_codes"),
+        )
     except Exception as error:
         def fail(state):
             job = state["jobs"].get(job_id)
@@ -671,6 +868,8 @@ def cli_retrain_scope():
         "earliest_month": None,
         "latest_month": None,
         "budget_code_count": None,
+        "training_scope_codes": None,
+        "book_entry_excluded_codes": None,
         "candidate_path": None,
         "candidate_sha256": None,
         "candidate_validated": False,
@@ -736,3 +935,6 @@ def cli_retrain_scope():
                 state["coordination"]["updated_at"] = utcnow()
 
         mutate(finish)
+
+
+set_state_preparer(merge_live_progress)

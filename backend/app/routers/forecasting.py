@@ -19,12 +19,15 @@ from app.schemas.forecast import (
     MonthlyForecastResponse,
 )
 from app.services.forecasting_service import (
+    BookEntryConfigurationError,
     ForecastingError,
     InvalidForecastWindowError,
     UnsupportedAccountError,
     generate_monthly_forecast,
     list_forecast_categories,
+    published_forecast_bounds,
     selected_account_codes,
+    without_book_entry_contributions,
 )
 from app.services.model_loader import get_load_error, get_model_bundle, is_model_loaded
 from app.services.system_lock import mutation_scope
@@ -47,8 +50,23 @@ def _require_model() -> dict:
 
 def _validate_complete_result(payload: dict) -> None:
     monthly = payload.get("monthly_forecasts") or []
+    coverage = payload.get("coverage") or {}
     if not monthly:
-        raise ForecastingError("Forecast monthly results are missing.")
+        forecasted = int(coverage.get("forecasted_codes") or 0)
+        if forecasted != 0:
+            raise ForecastingError("Forecast monthly results are missing.")
+        total = int(coverage.get("total_selected_codes") or payload.get("selected_account_count") or 0)
+        parts = (
+            forecasted
+            + int(coverage.get("book_entry_excluded") or 0)
+            + int(coverage.get("insufficient_data") or 0)
+            + int(coverage.get("other_unavailable") or 0)
+        )
+        if total < 1 or parts != total:
+            raise ForecastingError("Forecast coverage counts do not match the selection.")
+        if int(payload["selected_account_count"]) != len(payload.get("selected_accounts") or []):
+            raise ForecastingError("Selected Budget Code count does not match the result.")
+        return
     total = float(sum(float(item["forecast_amount"]) for item in monthly))
     expected = float(payload["overall_total"])
     if abs(total - expected) > 1e-4:
@@ -62,6 +80,12 @@ def list_accounts() -> AccountListResponse:
     bundle = _require_model()
     catalog = list_forecast_categories(bundle)
     codes = selected_account_codes(bundle)
+    bounds: dict = {}
+    bounds_error = None
+    try:
+        bounds = published_forecast_bounds(bundle)
+    except InvalidForecastWindowError as error:
+        bounds_error = str(error)
     return AccountListResponse(
         selected_account_count=len(codes),
         selected_accounts=codes,
@@ -76,6 +100,10 @@ def list_accounts() -> AccountListResponse:
         ],
         categories=catalog["categories"],
         missing_category_codes=catalog["missing_category_codes"],
+        history_end=bounds.get("history_end"),
+        min_forecast_month=bounds.get("min_forecast_month"),
+        max_forecast_end=bounds.get("max_forecast_end"),
+        forecast_bounds_error=bounds_error,
     )
 
 
@@ -95,6 +123,7 @@ def _generate_unlocked(request: MonthlyForecastRequest) -> MonthlyForecastRespon
             forecast_months=request.forecast_months,
             account_codes=request.account_codes,
             category=request.category,
+            period_type=request.period_type,
         )
         response = MonthlyForecastResponse(**payload)
         _validate_complete_result(response.model_dump())
@@ -122,7 +151,9 @@ def forecast_history(
 @router.get("/history/latest", response_model=MonthlyForecastResponse)
 def forecast_history_latest() -> MonthlyForecastResponse:
     try:
-        payload = get_latest_forecast_payload()
+        payload = without_book_entry_contributions(get_latest_forecast_payload())
+    except BookEntryConfigurationError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
     except DatabaseError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     if payload is None:
@@ -135,12 +166,16 @@ def forecast_history_latest() -> MonthlyForecastResponse:
 
 def _completed_report(run_id: int) -> dict:
     try:
-        payload = get_forecast_payload(run_id)
+        payload = without_book_entry_contributions(get_forecast_payload(run_id))
+    except BookEntryConfigurationError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
     except DatabaseError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     try:
         return build_forecast_report(payload)
     except ReportError as error:
+        if "Book Entry exclusion list" in str(error):
+            raise HTTPException(status_code=500, detail=str(error)) from error
         status = 404 if "selected" in str(error).lower() or payload is None else 409
         if payload is None:
             status = 404
@@ -187,7 +222,9 @@ def forecast_report_excel(run_id: int) -> Response:
 @router.get("/history/{run_id}", response_model=MonthlyForecastResponse)
 def forecast_history_detail(run_id: int) -> MonthlyForecastResponse:
     try:
-        payload = get_forecast_payload(run_id)
+        payload = without_book_entry_contributions(get_forecast_payload(run_id))
+    except BookEntryConfigurationError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
     except DatabaseError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     if payload is None:

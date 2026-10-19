@@ -1,7 +1,6 @@
 # Environment / secrets
 .env
 .env.*
-!.env.example
 
 # Python
 .venv/
@@ -38,3 +37,6 @@ backend/model_training_engine/dataset/original_actual_data.xlsx
 # Runtime uploaded datasets
 backend/data/dataset_files/*
 !backend/data/dataset_files/.gitkeep
+
+# Isolated local QA snapshot: database dump, datasets, and model copies
+qa-data/

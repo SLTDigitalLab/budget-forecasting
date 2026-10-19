@@ -5,17 +5,22 @@ No database access and no model training.
 
 from __future__ import annotations
 
-import sys
 from collections import defaultdict
 from typing import Any
 
-from app.config import BACKEND_DIR
-
-ENGINE_DIR = BACKEND_DIR / "model_training_engine"
-if str(ENGINE_DIR) not in sys.path:
-    sys.path.insert(0, str(ENGINE_DIR))
-
-from preprocessing import KIND_INVALID, KIND_NUMBER, parse_amount_cell  # noqa: E402
+from app.services.submission_state import (
+    SUBMISSION_ABSENT,
+    SUBMISSION_DECLARED_MISSING,
+    SUBMISSION_NUMERIC,
+    SUPPLIED_CELL_MESSAGE,
+    classify_supplied_upload_cell,
+    apply_code_boundaries,
+    apply_declarations,
+    classify_upload_cell,
+    declaration_index,
+    infer_legacy_submission,
+    pair_submission,
+)
 
 def same_amount(left: Any, right: Any) -> bool:
     if left is None or right is None:
@@ -65,7 +70,7 @@ def merge_budget_codes(
     """Keep every budget code. Clearing its last numeric actual does not remove it."""
     codes: dict[str, dict[str, str]] = {}
 
-    def remember(code: Any, description: Any = "", category: Any = "") -> None:
+    def remember(code: Any, description: Any = "", category: Any = "", bounds: dict[str, Any] | None = None) -> None:
         key = _text(code)
         if not key:
             return
@@ -74,9 +79,14 @@ def merge_budget_codes(
             entry["description"] = _text(description)
         if _text(category):
             entry["category"] = _text(category)
+        if bounds:
+            if "effective_from" in bounds:
+                entry["effective_from"] = bounds.get("effective_from") or None
+            if "effective_to" in bounds:
+                entry["effective_to"] = bounds.get("effective_to") or None
 
     for item in existing or []:
-        remember(item.get("budget_code"), item.get("description"), item.get("category"))
+        remember(item.get("budget_code"), item.get("description"), item.get("category"), item)
     for change in changes or []:
         remember(change.get("budget_code"), change.get("new_description"), change.get("new_category"))
     for item in records or []:
@@ -101,15 +111,27 @@ def extend_month_span(
 
 
 def next_master_state(state: dict[str, Any], changes: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """Apply numeric changes without dropping budget codes or shrinking the month range."""
+    """Apply numeric changes and explicit declarations without dropping untouched master state."""
     applied = list(changes or [])
     next_records = apply_changes(list(state.get("records") or []), applied)
-    earliest, latest = extend_month_span(state.get("earliest_month"), state.get("latest_month"), next_records)
+    declarations = apply_declarations(state.get("declarations"), applied)
+    earliest, latest = extend_month_span(
+        state.get("earliest_month"),
+        state.get("latest_month"),
+        [*next_records, *[{"month": item["month"]} for item in declarations]],
+    )
     return {
         "records": next_records,
-        "budget_codes": merge_budget_codes(state.get("budget_codes"), applied, next_records),
+        "declarations": declarations,
+        "budget_codes": apply_code_boundaries(
+            state.get("budget_codes"),
+            merge_budget_codes(state.get("budget_codes"), applied, next_records),
+            applied,
+        ),
         "earliest_month": earliest,
         "latest_month": latest,
+        "source": state.get("source"),
+        "version": state.get("version"),
     }
 
 
@@ -140,17 +162,50 @@ def normalize_staged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         amounts = dict(source.get("raw_amounts") or source.get("amounts") or {})
         parsed_amounts: dict[str, float | None] = {}
         invalid_months = []
+        unresolved_months = []
         missing_months = []
+        declared_months = []
+        cell_errors = []
         for month, raw in amounts.items():
-            parsed = parse_amount_cell(raw if raw != "" else None)
-            if parsed["kind"] == KIND_NUMBER:
-                parsed_amounts[str(month)] = float(parsed["value"])
+            parsed = classify_supplied_upload_cell(None if raw == "" else raw)
+            key = str(month)
+            row_label = source.get("source_row")
+            row_text = "" if row_label is None else f", row {row_label}"
+            code_text = _text(source.get("budget_code"))
+            if parsed["kind"] == SUBMISSION_NUMERIC:
+                parsed_amounts[key] = float(parsed["value"])
+            elif parsed["kind"] == SUBMISSION_DECLARED_MISSING:
+                parsed_amounts[key] = None
+                declared_months.append(key)
+            elif parsed["kind"] == "blank":
+                parsed_amounts[key] = None
+                unresolved_months.append(key)
+                missing_months.append(key)
+                cell_errors.append(
+                    {
+                        "budget_code": code_text,
+                        "month": key,
+                        "row": row_label,
+                        "kind": "unresolved_blank",
+                        "message": (
+                            f"Budget code {code_text}, {key}{row_text}: {SUPPLIED_CELL_MESSAGE}"
+                        ),
+                    }
+                )
             else:
-                parsed_amounts[str(month)] = None
-                if parsed["kind"] == KIND_INVALID:
-                    invalid_months.append(str(month))
-                else:
-                    missing_months.append(str(month))
+                parsed_amounts[key] = None
+                invalid_months.append(key)
+                cell_errors.append(
+                    {
+                        "budget_code": code_text,
+                        "month": key,
+                        "row": row_label,
+                        "kind": "invalid",
+                        "message": (
+                            f"Budget code {code_text}, {key}{row_text}: {SUPPLIED_CELL_MESSAGE}"
+                        ),
+                    }
+                )
         normalized.append(
             {
                 **source,
@@ -161,7 +216,10 @@ def normalize_staged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "amounts": parsed_amounts,
                 "raw_amounts": amounts,
                 "invalid_months": invalid_months,
+                "unresolved_months": unresolved_months,
                 "missing_months": missing_months,
+                "declared_months": declared_months,
+                "cell_errors": cell_errors,
             }
         )
     return normalized
@@ -210,9 +268,11 @@ def analyze_upload(
     budget_codes: list[dict[str, Any]] | None = None,
     earliest_month: str | None = None,
     latest_month: str | None = None,
+    declarations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     removed = {str(item) for item in (removed_stage_ids or [])}
     staged = [row for row in normalize_staged_rows(rows) if str(row.get("stage_id") or "") not in removed]
+    declared_now = declaration_index(declarations)
     existing = master_index(master_records)
     metadata = code_metadata(master_records)
     for item in budget_codes or []:
@@ -234,7 +294,7 @@ def analyze_upload(
     metadata_conflicts: list[dict[str, Any]] = []
     missing_conflicts: list[dict[str, Any]] = []
     invalid_count = 0
-    missing_count = 0
+    unresolved_blank_count = 0
     valid_count = 0
     codes = set()
     categories = set()
@@ -265,11 +325,12 @@ def analyze_upload(
                 if action not in {"keep_master", "accept_upload"}:
                     metadata_conflicts.append(conflict)
         apply_metadata = metadata_choice.get((code,)) == "accept_upload"
+        unresolved = set(row.get("unresolved_months") or row.get("missing_months") or [])
         for month, amount in row["amounts"].items():
             key = (code, month)
             prior = existing.get(key)
             current = None if prior is None else prior.get("amount")
-            if month in row["invalid_months"]:
+            if month in (row.get("invalid_months") or []):
                 invalid_count += 1
                 preview.append(
                     {
@@ -282,8 +343,29 @@ def analyze_upload(
                     }
                 )
                 continue
+            if month in unresolved:
+                unresolved_blank_count += 1
+                preview.append(
+                    {
+                        "budget_code": code,
+                        "month": month,
+                        "current": current,
+                        "uploaded": row.get("raw_amounts", {}).get(month),
+                        "result": "Unresolved blank",
+                        "stage_id": row["stage_id"],
+                    }
+                )
+                continue
+            if month in (row.get("declared_months") or []):
+                already_declared = key in declared_now and prior is None
+                if already_declared:
+                    preview.append(_preview_row(code, month, current, "DECLARED_MISSING", "Unchanged", row["stage_id"]))
+                    continue
+                preview.append(_preview_row(code, month, current, "DECLARED_MISSING", "Declared missing", row["stage_id"]))
+                changes.append(_change("DECLARE_MISSING", month, prior, None, row, apply_metadata, key in declared_now))
+                continue
             if amount is None:
-                missing_count += 1
+                # Legacy path for non-strict rows. Strict uploads resolve blanks above.
                 if prior is not None and current is not None:
                     action = missing_choice.get(key)
                     entry = {
@@ -297,11 +379,15 @@ def analyze_upload(
                     }
                     preview.append(entry)
                     if action == "clear":
-                        changes.append(_change("CLEAR", month, prior, None, row, apply_metadata))
+                        changes.append(_change("CLEAR", month, prior, None, row, apply_metadata, key in declared_now))
+                        entry["result"] = "Cleared"
                     elif action == "keep_master":
                         entry["result"] = "Unchanged"
                     elif action == "remove_staged":
                         entry["result"] = "Removed"
+                    elif action == "declare_missing":
+                        changes.append(_change("DECLARE_MISSING", month, prior, None, row, apply_metadata, key in declared_now))
+                        entry["result"] = "Declared missing"
                     else:
                         missing_conflicts.append(entry)
                 continue
@@ -320,16 +406,16 @@ def analyze_upload(
                 continue
             if prior is None:
                 preview.append(_preview_row(code, month, None, amount, "New", row["stage_id"]))
-                changes.append(_change("ADD", month, None, amount, row, True))
+                changes.append(_change("ADD", month, None, amount, row, True, key in declared_now))
             elif same_amount(current, amount):
                 preview.append(_preview_row(code, month, current, amount, "Unchanged", row["stage_id"]))
                 if apply_metadata and (
                     row["category"] != _text(prior.get("category")) or row["description"] != _text(prior.get("description"))
                 ):
-                    changes.append(_change("UPDATE", month, prior, amount, row, True))
+                    changes.append(_change("UPDATE", month, prior, amount, row, True, key in declared_now))
             else:
                 preview.append(_preview_row(code, month, current, amount, "Updated", row["stage_id"]))
-                changes.append(_change("UPDATE", month, prior, amount, row, apply_metadata))
+                changes.append(_change("UPDATE", month, prior, amount, row, apply_metadata, key in declared_now))
 
     new_codes = sorted(code for code in codes if code not in metadata)
     matched_codes = sorted(code for code in codes if code in metadata)
@@ -338,11 +424,13 @@ def analyze_upload(
     current_start, current_end = observed_period(master_records)
     current_start = earliest_month or current_start
     current_end = latest_month or current_end
+    blocking_months = lambda row: set(row.get("invalid_months") or []) | set(row.get("unresolved_months") or [])
     uploaded_months = sorted(
         month
         for row in staged
         for month, amount in row["amounts"].items()
-        if amount is not None and month not in row["invalid_months"]
+        if month not in blocking_months(row)
+        and (amount is not None or month in (row.get("declared_months") or []))
     )
     observed_months = sorted(
         {*( [current_start] if current_start else []), *( [current_end] if current_end else []), *uploaded_months}
@@ -356,7 +444,16 @@ def analyze_upload(
             *([latest_month] if latest_month else []),
         }
     )
-    blocking = bool(duplicates or metadata_conflicts or missing_conflicts or invalid_count or any(not row["budget_code"] for row in staged))
+    cell_errors = [error for row in staged for error in (row.get("cell_errors") or [])]
+    blocking = bool(
+        duplicates
+        or metadata_conflicts
+        or missing_conflicts
+        or invalid_count
+        or unresolved_blank_count
+        or cell_errors
+        or any(not row["budget_code"] for row in staged)
+    )
     structure_errors = [
         row
         for row in staged
@@ -365,19 +462,26 @@ def analyze_upload(
     new_value_count = sum(1 for item in changes if item["operation"] == "ADD")
     updated_value_count = sum(1 for item in changes if item["operation"] == "UPDATE")
     clear_count = sum(1 for item in changes if item["operation"] == "CLEAR")
+    declared_count = sum(1 for item in changes if item["operation"] == "DECLARE_MISSING")
+    explicit_missing_count = sum(len(row.get("declared_months") or []) for row in staged)
     unchanged_count = sum(1 for item in preview if item["result"] == "Unchanged")
-    can_confirm = not blocking and not structure_errors and (new_value_count + updated_value_count + clear_count) > 0
+    can_confirm = not blocking and not structure_errors and (new_value_count + updated_value_count + clear_count + declared_count) > 0
     return {
         "rows": staged,
         "can_confirm": can_confirm,
         "duplicate_conflicts": duplicates,
         "metadata_conflicts": metadata_conflicts,
         "missing_conflicts": missing_conflicts,
+        "cell_errors": cell_errors,
         "merge_preview": preview,
         "changes": changes,
         "master_version": int(master_version),
         "summary": {
-            "file_structure": "Valid" if not structure_errors and invalid_count == 0 and not duplicates else "Needs correction",
+            "file_structure": (
+                "Valid"
+                if not structure_errors and invalid_count == 0 and unresolved_blank_count == 0 and not duplicates
+                else "Needs correction"
+            ),
             "period_detected": _span(uploaded_months),
             "budget_codes_uploaded": len(codes),
             "existing_codes": len(matched_codes),
@@ -385,7 +489,10 @@ def analyze_upload(
             "new_budget_code_list": new_codes,
             "categories_represented": len(categories),
             "valid_numeric_values": valid_count,
-            "missing_values": missing_count,
+            # Explicit "-" declarations in this staged upload only (not unresolved blanks).
+            "missing_values": explicit_missing_count,
+            "declared_missing_cells": explicit_missing_count,
+            "unresolved_blank_cells": unresolved_blank_count,
             "invalid_values": invalid_count,
             "duplicate_conflicts": len(duplicates),
             "current_budget_codes": len(master_codes),
@@ -396,11 +503,13 @@ def analyze_upload(
             "updated_values": updated_value_count,
             "unchanged_values": unchanged_count,
             "clears": clear_count,
+            "declared_missing": declared_count,
         },
         "new_count": new_value_count,
         "changed_count": updated_value_count,
         "unchanged_count": unchanged_count,
         "invalid_count": invalid_count,
+        "unresolved_blank_count": unresolved_blank_count,
     }
 
 
@@ -423,8 +532,13 @@ def apply_changes(master_records: list[dict[str, Any]], changes: list[dict[str, 
     return [indexed[key] for key in sorted(indexed)]
 
 
-def plan_rollback(changes: list[dict[str, Any]], master_records: list[dict[str, Any]]) -> dict[str, Any]:
+def plan_rollback(
+    changes: list[dict[str, Any]],
+    master_records: list[dict[str, Any]],
+    declarations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     current = master_index(master_records)
+    declared = declaration_index(declarations)
     safe = []
     conflicts = []
     for change in changes:
@@ -435,7 +549,10 @@ def plan_rollback(changes: list[dict[str, Any]], master_records: list[dict[str, 
         current_amount = None if prior is None else prior.get("amount")
         introduced = change.get("new_amount")
         before = change.get("previous_amount")
-        safe_to_reverse = same_amount(current_amount, introduced)
+        introduced_submission = infer_legacy_submission(change, "new_submission")
+        previous_submission = infer_legacy_submission(change, "previous_submission")
+        current_submission = pair_submission(current_amount is not None, key in declared)
+        safe_to_reverse = same_amount(current_amount, introduced) and current_submission == introduced_submission
         entry = {
             "budget_code": key[0],
             "month": key[1],
@@ -444,8 +561,11 @@ def plan_rollback(changes: list[dict[str, Any]], master_records: list[dict[str, 
             "current_master_value": current_amount,
             "proposed_rollback": before if safe_to_reverse else None,
             "conflict_status": "safe" if safe_to_reverse else "later_revision_conflict",
-            "operation": "REMOVE" if before is None else "RESTORE",
+            "operation": "REMOVE" if before is None and previous_submission != SUBMISSION_DECLARED_MISSING else "RESTORE",
             "change_id": change.get("id"),
+            "introduced_submission": introduced_submission,
+            "previous_submission": previous_submission,
+            "current_submission": current_submission,
         }
         if safe_to_reverse:
             safe.append(entry)
@@ -466,6 +586,8 @@ def plan_rollback(changes: list[dict[str, Any]], master_records: list[dict[str, 
                 "month": item["month"],
                 "previous_amount": item["current_master_value"],
                 "new_amount": item["proposed_rollback"],
+                "previous_submission": item["introduced_submission"],
+                "new_submission": item["previous_submission"],
                 "previous_description": "",
                 "new_description": "",
                 "previous_category": "",
@@ -495,13 +617,29 @@ def _change(
     new_amount: Any,
     row: dict[str, Any],
     apply_metadata: bool,
+    declared_before: bool = False,
 ) -> dict[str, Any]:
+    previous_amount = None if prior is None else prior.get("amount")
+    if previous_amount is not None:
+        previous_submission = SUBMISSION_NUMERIC
+    elif declared_before:
+        previous_submission = SUBMISSION_DECLARED_MISSING
+    else:
+        previous_submission = SUBMISSION_ABSENT
+    if operation in {"ADD", "UPDATE"}:
+        new_submission = SUBMISSION_NUMERIC
+    elif operation == "DECLARE_MISSING":
+        new_submission = SUBMISSION_DECLARED_MISSING
+    else:
+        new_submission = SUBMISSION_ABSENT
     return {
         "operation": operation,
         "budget_code": row["budget_code"],
         "month": month,
-        "previous_amount": None if prior is None else prior.get("amount"),
+        "previous_amount": previous_amount,
         "new_amount": new_amount,
+        "previous_submission": previous_submission,
+        "new_submission": new_submission,
         "previous_description": "" if prior is None else _text(prior.get("description")),
         "previous_category": "" if prior is None else _text(prior.get("category")),
         "new_description": row["description"] if apply_metadata or prior is None else _text((prior or {}).get("description")),
@@ -524,8 +662,10 @@ def manual_edit_plan(
     *,
     master_version: int = 0,
     budget_codes: list[dict[str, Any]] | None = None,
+    declarations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     existing = master_index(master_records)
+    declared = declaration_index(declarations)
     known = {
         _text(item.get("budget_code")): item
         for item in (budget_codes or [])
@@ -540,21 +680,46 @@ def manual_edit_plan(
         if not code or not month:
             errors.append("Each edit needs a Budget Code and month.")
             continue
-        parsed = parse_amount_cell(edit.get("amount"))
+        parsed = classify_upload_cell(edit.get("amount"))
         prior = existing.get((code, month))
         current = None if prior is None else prior.get("amount")
         expected = edit.get("expected_amount", current)
         if not same_amount(expected, current):
             errors.append(f"{code} {month} changed since it was loaded. Refresh and review again.")
             continue
-        if parsed["kind"] == KIND_INVALID:
+        if parsed["kind"] == "invalid":
             errors.append(f"{code} {month} has an invalid amount.")
             continue
         known_meta = known.get(code) or {}
         description = _text(edit.get("description") or (prior or {}).get("description") or known_meta.get("description"))
         category = _text(edit.get("category") or (prior or {}).get("category") or known_meta.get("category"))
-        if parsed["kind"] != KIND_NUMBER:
-            if prior is None:
+        declared_before = (code, month) in declared
+        previous_submission = (
+            SUBMISSION_NUMERIC if current is not None else SUBMISSION_DECLARED_MISSING if declared_before else SUBMISSION_ABSENT
+        )
+        if parsed["kind"] == SUBMISSION_DECLARED_MISSING:
+            if declared_before and current is None:
+                preview.append({"budget_code": code, "month": month, "current": current, "proposed": None, "result": "Unchanged"})
+                continue
+            preview.append({"budget_code": code, "month": month, "current": current, "proposed": "DECLARED_MISSING", "result": "Declared missing"})
+            changes.append(
+                {
+                    "operation": "DECLARE_MISSING",
+                    "budget_code": code,
+                    "month": month,
+                    "previous_amount": current,
+                    "new_amount": None,
+                    "previous_submission": previous_submission,
+                    "new_submission": SUBMISSION_DECLARED_MISSING,
+                    "previous_description": _text((prior or {}).get("description")),
+                    "new_description": description,
+                    "previous_category": _text((prior or {}).get("category")),
+                    "new_category": category,
+                }
+            )
+            continue
+        if parsed["kind"] != SUBMISSION_NUMERIC:
+            if prior is None and not declared_before:
                 continue
             preview.append({"budget_code": code, "month": month, "current": current, "proposed": None, "result": "Clear"})
             changes.append(
@@ -564,6 +729,8 @@ def manual_edit_plan(
                     "month": month,
                     "previous_amount": current,
                     "new_amount": None,
+                    "previous_submission": previous_submission,
+                    "new_submission": SUBMISSION_ABSENT,
                     "previous_description": _text((prior or {}).get("description")),
                     "new_description": description,
                     "previous_category": _text((prior or {}).get("category")),
@@ -587,6 +754,8 @@ def manual_edit_plan(
                 "month": month,
                 "previous_amount": current,
                 "new_amount": amount,
+                "previous_submission": previous_submission,
+                "new_submission": SUBMISSION_NUMERIC,
                 "previous_description": "" if prior is None else _text(prior.get("description")),
                 "new_description": description,
                 "previous_category": "" if prior is None else _text(prior.get("category")),
@@ -600,7 +769,7 @@ def manual_edit_plan(
         "changes": changes,
         "master_version": int(master_version),
         "new_count": sum(1 for item in changes if item["operation"] == "ADD"),
-        "changed_count": sum(1 for item in changes if item["operation"] in {"UPDATE", "CLEAR"}),
+        "changed_count": sum(1 for item in changes if item["operation"] in {"UPDATE", "CLEAR", "DECLARE_MISSING"}),
     }
 
 

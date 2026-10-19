@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+import sys
 from calendar import month_name
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 UNAVAILABLE = "Unavailable"
@@ -27,6 +29,7 @@ ALL_CATEGORIES_LABEL = "All Categories"
 ALL_CATEGORIES_TOKENS = {"", "all", "all categories", "*", "__all__", ALL_CATEGORIES_LABEL.casefold()}
 UNAVAILABLE_EXPORT_STATUSES = {
     "NO_DATA",
+    "NO_POSITIVE_YEAR_MEAN",
     "ALL_MISSING",
     "NOT_EVALUABLE",
     "NO_VALID_WINNER",
@@ -232,26 +235,159 @@ def _month_values_for_code(item: dict[str, Any], months: list[str], account_map:
     return values
 
 
+def _optional_amount(value: Any) -> float | None:
+    if is_finite_amount(value):
+        return float(value)
+    return None
+
+
+def _reason_label(item: dict[str, Any]) -> str:
+    code = str(item.get("reason_code") or item.get("reason") or "").strip()
+    labels = {
+        "BOOK_ENTRY_ACCOUNT": "Book Entry Account",
+        "INSUFFICIENT_HISTORICAL_DATA": "Insufficient Historical Data",
+        "NO_VALID_MODEL": "No Valid Model",
+    }
+    if code in labels:
+        return labels[code]
+    status = str(item.get("source_status") or item.get("production_status") or "").strip()
+    if status == "NO_POSITIVE_YEAR_MEAN":
+        return "Preprocessing policy decision required"
+    if status in {"NO_DATA", "ALL_MISSING", "NOT_EVALUABLE", "UNRESOLVED_MISSING", "INSUFFICIENT_HISTORY"}:
+        return "Insufficient Historical Data"
+    if status == "NO_VALID_WINNER":
+        return "No Valid Model"
+    label = str(item.get("reason_label") or "").strip()
+    if label:
+        return label
+    text = str(item.get("reason") or "").strip()
+    return text or "Forecast unavailable"
+
+
+def _exclusion_bucket(item: dict[str, Any]) -> str:
+    stored = str(item.get("exclusion") or "").strip()
+    if stored in {"book_entry", "insufficient", "other"}:
+        return stored
+    label = _reason_label(item)
+    if label == "Book Entry Account":
+        return "book_entry"
+    if label == "Insufficient Historical Data":
+        return "insufficient"
+    return "other"
+
+
+def _book_entry_codes() -> set[str]:
+    engine = Path(__file__).resolve().parents[2] / "model_training_engine"
+    if str(engine) not in sys.path:
+        sys.path.insert(0, str(engine))
+    from preprocessing import BookEntryConfigurationError, book_entry_account_codes
+    try:
+        return book_entry_account_codes()
+    except BookEntryConfigurationError as error:
+        raise ReportError(str(error)) from error
+
+
+def coverage_export(payload: dict[str, Any]) -> dict[str, Any]:
+    """Read the forecast response coverage. Counts are not recalculated with a second rule."""
+    blocked = _book_entry_codes()
+    selected = [str(code) for code in payload.get("selected_accounts") or [] if str(code)]
+    metadata = _code_metadata(payload)
+    supplied = payload.get("unavailable_accounts")
+    if not isinstance(supplied, list):
+        detailed = payload.get("forecast_coverage") if isinstance(payload.get("forecast_coverage"), dict) else {}
+        supplied = detailed.get("unavailable_accounts") if isinstance(detailed.get("unavailable_accounts"), list) else []
+    rows = []
+    seen: set[str] = set()
+    for item in supplied:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("budget_code") or item.get("account_code") or "")
+        if not code or code not in set(selected) or code in seen:
+            continue
+        seen.add(code)
+        source = dict(metadata.get(code) or {})
+        source.update(item)
+        category = str(source.get("category") or "").strip()
+        rows.append({
+            "budget_code": code,
+            "account_name": str(source.get("budget_name") or source.get("account_name") or ""),
+            "category": category,
+            "status": "UNAVAILABLE",
+            "reason": _reason_label(source),
+            "exclusion": _exclusion_bucket(source),
+        })
+    for code in selected:
+        if code in seen:
+            continue
+        item = dict(metadata.get(code) or {})
+        book_entry = code in blocked or str(item.get("reason") or "") == "BOOK_ENTRY_ACCOUNT" or str(item.get("reason_code") or "") == "BOOK_ENTRY_ACCOUNT"
+        values = _month_values_for_code(item, export_month_isos(payload), {})
+        if not book_entry and not _is_unavailable_code(item, values):
+            continue
+        if book_entry:
+            item = {**item, "reason_code": "BOOK_ENTRY_ACCOUNT", "reason": "BOOK_ENTRY_ACCOUNT"}
+        seen.add(code)
+        rows.append({
+            "budget_code": code,
+            "account_name": str(item.get("budget_name") or item.get("account_name") or ""),
+            "category": str(item.get("category") or "").strip(),
+            "status": "UNAVAILABLE",
+            "reason": _reason_label(item),
+            "exclusion": _exclusion_bucket(item),
+        })
+    coverage = payload.get("coverage") if isinstance(payload.get("coverage"), dict) else {}
+    detailed = payload.get("forecast_coverage") if isinstance(payload.get("forecast_coverage"), dict) else {}
+    source = {**detailed, **coverage}
+    has_split = any(key in source for key in ("book_entry_excluded", "insufficient_data", "other_unavailable", "forecasted_codes"))
+    if has_split:
+        total = int(source.get("total_selected_codes") or source.get("total_budget_codes") or source.get("requested_account_count") or len(selected))
+        forecasted = int(source.get("forecasted_codes") if source.get("forecasted_codes") is not None else source.get("forecasted_budget_codes") or 0)
+        book_entry = int(source.get("book_entry_excluded") or 0)
+        insufficient = int(source.get("insufficient_data") or 0)
+        other = int(source.get("other_unavailable") or 0)
+    else:
+        book_entry = sum(1 for row in rows if row["exclusion"] == "book_entry")
+        insufficient = sum(1 for row in rows if row["exclusion"] == "insufficient")
+        other = sum(1 for row in rows if row["exclusion"] == "other")
+        total = len(selected)
+        forecasted = max(0, total - book_entry - insufficient - other)
+    return {
+        "rows": [
+            ["Total Budget Codes in Selection", total],
+            ["Successfully Forecasted", forecasted],
+            ["Book Entry Accounts Excluded", book_entry],
+            ["Unavailable - Insufficient Historical Data", insufficient],
+            ["Other Unavailable Accounts", other],
+        ],
+        "total": total,
+        "forecasted": forecasted,
+        "book_entry": book_entry,
+        "insufficient": insufficient,
+        "other": other,
+        "unavailable_accounts": rows,
+        "forecast_available": forecasted > 0,
+    }
+
+
 def build_excel_forecast_model(payload: dict[str, Any]) -> dict[str, Any]:
     months = export_month_isos(payload)
     selected = [str(code) for code in payload.get("selected_accounts") or [] if str(code)]
     metadata = _code_metadata(payload)
     account_maps = _monthly_map_from_account_rows(payload)
     report_category = str(payload.get("category") or "")
+    blocked = _book_entry_codes()
     catalog: list[dict[str, Any]] = []
     for code in selected:
         item = dict(metadata.get(code) or {})
+        if code in blocked or str(item.get("reason") or "") == "BOOK_ENTRY_ACCOUNT" or str(item.get("reason_code") or "") == "BOOK_ENTRY_ACCOUNT":
+            continue
         values = _month_values_for_code(item, months, account_maps.get(code) or {})
-        unavailable = _is_unavailable_code(item, values)
-        if unavailable:
-            values = [None for _ in months]
+        if _is_unavailable_code(item, values):
+            continue
         zero_policy = (
-            not unavailable
-            and (
-                str(item.get("forecast_type") or "") == "ZERO_POLICY"
-                or str(item.get("production_status") or "") == "ZERO_POLICY"
-                or str(item.get("display_status") or "") == "Zero Policy"
-            )
+            str(item.get("forecast_type") or "") == "ZERO_POLICY"
+            or str(item.get("production_status") or "") == "ZERO_POLICY"
+            or str(item.get("display_status") or "") == "Zero Policy"
         )
         finite = [float(value) for value in values if is_finite_amount(value)]
         catalog.append({
@@ -259,8 +395,8 @@ def build_excel_forecast_model(payload: dict[str, Any]) -> dict[str, Any]:
             "account_name": str(item.get("account_name") or ""),
             "category": _resolve_category(item, report_category),
             "months": values,
-            "ytd": None if unavailable else float(sum(finite)),
-            "unavailable": unavailable,
+            "ytd": float(sum(finite)),
+            "unavailable": False,
             "zero_policy": zero_policy,
             "source_months": dict(account_maps.get(code) or {}),
         })
@@ -287,12 +423,18 @@ def build_excel_forecast_model(payload: dict[str, Any]) -> dict[str, Any]:
         })
     start = str(payload.get("requested_start_month") or (months[0] if months else ""))
     end = str(payload.get("requested_end_month") or (months[-1] if months else ""))
+    coverage = coverage_export(payload)
     return {
         "title": excel_report_title(start, end),
         "filename_stem": excel_filename_stem(payload),
         "months": months,
         "month_headers": month_column_headers(months),
         "sections": sections,
+        "coverage_rows": coverage["rows"],
+        "unavailable_accounts": coverage["unavailable_accounts"],
+        "forecast_available": bool(sections),
+        "no_forecast_message": "No forecast available for the selected category.",
+        "no_unavailable_message": "No excluded or unavailable budget codes.",
     }
 
 
@@ -521,10 +663,10 @@ def build_forecast_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "period": period_label(payload),
         "month_count": len(months),
-        "overall_total": float(payload["overall_total"]),
-        "monthly_average": float(payload["monthly_average"]),
-        "minimum_monthly_forecast": float(payload["minimum_monthly_forecast"]),
-        "maximum_monthly_forecast": float(payload["maximum_monthly_forecast"]),
+        "overall_total": _optional_amount(payload.get("overall_total")),
+        "monthly_average": _optional_amount(payload.get("monthly_average")),
+        "minimum_monthly_forecast": _optional_amount(payload.get("minimum_monthly_forecast")),
+        "maximum_monthly_forecast": _optional_amount(payload.get("maximum_monthly_forecast")),
         "peak_month": str(peak["month"]) if peak else "",
         "trough_month": str(trough["month"]) if trough else "",
         "historical_average": trend["historical_average"],
@@ -587,13 +729,22 @@ def monthly_report_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def require_completed_forecast(payload: dict[str, Any] | None) -> dict[str, Any]:
     if not payload:
         raise ReportError("No completed forecast selected.")
-    months = chronological_forecasts(payload)
-    if not months:
-        raise ReportError("Only a completed forecast can be exported.")
-    if payload.get("overall_total") is None:
-        raise ReportError("Only a completed forecast can be exported.")
+    if payload.get("book_entry_recalculation_blocked"):
+        raise ReportError(
+            "This saved forecast includes Book Entry amounts that cannot be separated from the combined totals. "
+            "The export was not created."
+        )
     selected = [str(code) for code in payload.get("selected_accounts") or [] if str(code)]
     if not selected:
+        raise ReportError("Only a completed forecast can be exported.")
+    months = chronological_forecasts(payload)
+    coverage = payload.get("coverage") if isinstance(payload.get("coverage"), dict) else {}
+    coverage_only = bool(payload.get("coverage_only")) or (
+        not months and int(coverage.get("forecasted_codes") or 0) == 0 and bool(payload.get("unavailable_accounts"))
+    )
+    if not months and not coverage_only:
+        raise ReportError("Only a completed forecast can be exported.")
+    if payload.get("overall_total") is None and not coverage_only:
         raise ReportError("Only a completed forecast can be exported.")
     return payload
 
@@ -605,6 +756,7 @@ def build_forecast_report(payload: dict[str, Any] | None) -> dict[str, Any]:
     monthly = monthly_report_rows(stored)
     comparison = build_forecast_comparison(stored)
     selected = [str(code) for code in stored.get("selected_accounts") or [] if str(code)]
+    excel_model = build_excel_forecast_model(stored)
     return {
         "title": "AI Budget Forecast Report",
         "filename_stem": report_filename_stem(stored),
@@ -624,10 +776,15 @@ def build_forecast_report(payload: dict[str, Any] | None) -> dict[str, Any]:
         "account_monthly_forecasts": list(stored.get("account_monthly_forecasts") or []),
         "account_yearly_forecasts": list(stored.get("account_yearly_forecasts") or []),
         "combined_yearly_forecasts": list(stored.get("combined_yearly_forecasts") or []),
-        "overall_total": float(stored["overall_total"]),
-        "monthly_average": float(stored["monthly_average"]),
+        "overall_total": _optional_amount(stored.get("overall_total")),
+        "monthly_average": _optional_amount(stored.get("monthly_average")),
         "amount_unit": str(stored.get("amount_unit") or "LKR_MILLIONS"),
         "chart_months": chronological_forecasts(stored),
-        "excel_forecast": build_excel_forecast_model(stored),
+        "excel_forecast": excel_model,
         "excel_filename_stem": excel_filename_stem(stored),
+        "coverage_rows": excel_model["coverage_rows"],
+        "unavailable_accounts": excel_model["unavailable_accounts"],
+        "forecast_available": excel_model["forecast_available"],
+        "no_forecast_message": excel_model["no_forecast_message"],
+        "no_unavailable_message": excel_model["no_unavailable_message"],
     }

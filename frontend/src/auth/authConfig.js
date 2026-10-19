@@ -35,7 +35,7 @@ export function getAuthConfigError(env = import.meta.env) {
 export function formatAuthStartupError(cause) {
   const message = String(cause?.errorMessage || cause?.message || cause || "").trim();
   if (/AADSTS50011/i.test(message) || /redirect.?uri/i.test(message)) {
-    return "Microsoft rejected this app's redirect URL. Ask an administrator to add http://localhost:5174 as a Single-page application redirect URI. The Tenant ID and Client ID are unchanged.";
+    return "Microsoft rejected this app's redirect URL. Ask an administrator to add http://localhost:3003 as a Single-page application redirect URI. The Tenant ID and Client ID are unchanged.";
   }
   if (message) {
     return `Microsoft authentication could not start. ${message}`;

@@ -13,7 +13,11 @@ from app.routers.datasets import router as datasets_router
 from app.routers.retraining import router as retraining_router
 from app.services.retrain_state import CoordinationError
 from app.schemas.forecast import HealthResponse
-from app.services.forecasting_service import list_forecast_categories, parse_month, to_iso_month
+from app.services.forecasting_service import (
+    InvalidForecastWindowError,
+    list_forecast_categories,
+    published_forecast_bounds,
+)
 from app.services.model_loader import (
     ModelLoadError,
     get_model_bundle,
@@ -32,12 +36,28 @@ async def lifespan(app: FastAPI):
         pass
     try:
         ensure_forecast_tables()
+        from app.services.dataset_service import ensure_book_entry_registry
+
+        ensure_book_entry_registry()
         from app.services.dataset_storage import cleanup_temp_files, ensure_storage_dir
-        from app.services.dataset_service import import_legacy_workbook
+        from app.services.dataset_service import import_legacy_workbook, migrate_original_baseline
 
         ensure_storage_dir()
         cleanup_temp_files()
-        import_legacy_workbook()
+        migration = migrate_original_baseline()
+        logger.info(
+            "Original baseline migration hash=%s changed=%s declarations=%s numeric=%s codes=%s scope=%s..%s ambiguous=%s",
+            migration.get("baseline_hash"),
+            migration.get("changed"),
+            migration.get("declaration_count"),
+            migration.get("numeric_count"),
+            migration.get("budget_code_count"),
+            migration.get("scope_start"),
+            migration.get("scope_end"),
+            migration.get("ambiguous_count"),
+        )
+        if not migration.get("skipped_locked"):
+            import_legacy_workbook()
     except DatabaseError:
         logger.exception("Forecast schema initialization failed")
     except Exception:
@@ -79,17 +99,31 @@ async def coordination_error(_request, error: CoordinationError) -> JSONResponse
     )
 
 
+def _historical_actual_policy(bundle):
+    from app.services.dataset_master import _import_engine
+
+    _import_engine()
+    from preprocessing import historical_actual_policy_status
+
+    return historical_actual_policy_status(bundle)
+
+
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     loaded = is_model_loaded()
     bundle = get_model_bundle() or {}
     history_end = None
-    historical_end = bundle.get("historical_end") or bundle.get("history_end")
-    if loaded and historical_end:
+    min_forecast_month = None
+    max_forecast_end = None
+    forecast_bounds_error = None
+    if loaded:
         try:
-            history_end = to_iso_month(*parse_month(str(historical_end)))
-        except Exception:
-            history_end = None
+            bounds = published_forecast_bounds(bundle)
+            history_end = bounds["history_end"]
+            min_forecast_month = bounds["min_forecast_month"]
+            max_forecast_end = bounds["max_forecast_end"]
+        except InvalidForecastWindowError as error:
+            forecast_bounds_error = str(error)
     categories = None
     selected_count = None
     if loaded:
@@ -105,9 +139,12 @@ def health() -> HealthResponse:
         model_loaded=loaded,
         forecast_type=bundle.get("forecast_type") if loaded else None,
         history_end=history_end,
-        max_forecast_end="2030-12",
+        min_forecast_month=min_forecast_month,
+        max_forecast_end=max_forecast_end,
+        forecast_bounds_error=forecast_bounds_error,
         category=bundle.get("category") if loaded else None,
         overall_best_algorithm=bundle.get("overall_best_algorithm") if loaded else None,
         selected_account_count=selected_count,
         categories=categories,
+        historical_actual_policy=_historical_actual_policy(bundle if loaded else None),
     )

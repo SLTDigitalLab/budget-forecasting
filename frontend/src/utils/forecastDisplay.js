@@ -22,6 +22,9 @@ export function formatBoundAmount(value, amountUnit = "LKR") {
 }
 
 export function formatAmount(value, amountUnit = "LKR") {
+  if (value == null || value === "") {
+    return "LKR —";
+  }
   const amount = Number(value);
   const unit = (amountUnit || "LKR").trim() || "LKR";
   if (!Number.isFinite(amount)) {

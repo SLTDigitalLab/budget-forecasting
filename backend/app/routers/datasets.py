@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, File, Form, Header, Query, UploadFile
 from fastapi.responses import Response
 
@@ -45,6 +47,12 @@ def dataset_confirm(payload: dict | None = None, authorization: str | None = Hea
     result = dataset_service.confirm_upload(preview_id, body, actor)
     record_action(actor, "dataset_confirm", "succeeded", revision_id=str(result.get("file_id") or preview_id))
     return result
+
+
+@router.get("/previews/{preview_id}/confirmation")
+def dataset_preview_confirmation(preview_id: str, authorization: str | None = Header(default=None)) -> dict:
+    require_editor(authorization)
+    return dataset_service.preview_confirmation_status(preview_id)
 
 
 @router.post("/previews/{preview_id}/stage")
@@ -140,3 +148,67 @@ def dataset_edits(file_id: str, payload: dict, authorization: str | None = Heade
     result = dataset_service.save_edits(file_id, payload, actor)
     record_action(actor, "dataset_edit", "succeeded", revision_id=file_id)
     return result
+
+
+def _book_entry_audit(actor, action: str, result: dict) -> None:
+    record_action(
+        actor,
+        action,
+        json.dumps(
+            {
+                "budget_code": (result.get("account") or result.get("previous") or {}).get("budget_code"),
+                "previous": result.get("previous"),
+                "new": result.get("new"),
+            },
+            default=str,
+        ),
+        revision_id=(result.get("account") or {}).get("budget_code"),
+    )
+
+
+@router.get("/book-entries")
+def book_entries(
+    search: str = Query(default=""),
+    category: str = Query(default=""),
+    name: str = Query(default=""),
+) -> dict:
+    return dataset_service.list_book_entries(search, category, name)
+
+
+@router.get("/book-entries/lookup")
+def book_entry_lookup(budget_code: str = Query(...)) -> dict:
+    return dataset_service.lookup_book_entry_code(budget_code)
+
+
+@router.get("/book-entries/workbook")
+def book_entry_workbook() -> Response:
+    data = dataset_service.book_entry_workbook_bytes()
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="Book entry accounts.xlsx"'},
+    )
+
+
+@router.post("/book-entries")
+def create_book_entry(payload: dict, authorization: str | None = Header(default=None)) -> dict:
+    actor = require_editor(authorization)
+    result = dataset_service.add_book_entry(payload, actor)
+    _book_entry_audit(actor, "BOOK_ENTRY_ADD", result)
+    return result["account"]
+
+
+@router.put("/book-entries/{budget_code}")
+def edit_book_entry(budget_code: str, payload: dict, authorization: str | None = Header(default=None)) -> dict:
+    actor = require_editor(authorization)
+    result = dataset_service.update_book_entry(budget_code, payload, actor)
+    _book_entry_audit(actor, "BOOK_ENTRY_EDIT", result)
+    return result["account"]
+
+
+@router.delete("/book-entries/{budget_code}")
+def remove_book_entry(budget_code: str, authorization: str | None = Header(default=None)) -> dict:
+    actor = require_editor(authorization)
+    result = dataset_service.delete_book_entry(budget_code)
+    _book_entry_audit(actor, "BOOK_ENTRY_DELETE", result)
+    return {"removed": budget_code}

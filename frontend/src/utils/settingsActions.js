@@ -24,6 +24,13 @@ export function isAuthorizationCancellation(error) {
   return /cancelled/i.test(String(error?.message || ""));
 }
 
+export function confirmDatasetPayload(previewId) {
+  if (typeof previewId !== "string" || previewId.trim() === "") {
+    throw new TypeError("Confirm & Save requires a preview id.");
+  }
+  return { previewId };
+}
+
 export function authorizedFileSelection(openPicker) {
   if (typeof openPicker === "function") {
     openPicker();

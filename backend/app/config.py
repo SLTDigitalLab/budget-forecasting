@@ -46,7 +46,7 @@ def _split_origins(value: str) -> list[str]:
 CORS_ORIGINS = _split_origins(
     os.getenv(
         "CORS_ORIGINS",
-        "http://localhost,http://localhost:80,http://localhost:3000,http://localhost:5173",
+        "http://localhost,http://localhost:80,http://localhost:3000,http://localhost:3003,http://localhost:5173",
     )
 )
 
@@ -58,6 +58,6 @@ DATABASE_URL = os.getenv(
 DATASET_STORAGE_DIR = Path(
     os.getenv("DATASET_STORAGE_DIR", str(BACKEND_DIR / "data" / "dataset_files"))
 )
-DATASET_MAX_UPLOAD_BYTES = int(os.getenv("DATASET_MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))
+DATASET_MAX_UPLOAD_BYTES = int(os.getenv("DATASET_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 DATASET_PREVIEW_TTL_SECONDS = int(os.getenv("DATASET_PREVIEW_TTL_SECONDS", "7200"))
 
