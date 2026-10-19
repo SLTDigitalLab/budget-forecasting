@@ -1,0 +1,1 @@
+"""Lightweight FastAPI forecasting tests."""
