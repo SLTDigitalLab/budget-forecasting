@@ -1,36 +1,20 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { generateForecast, getHealth } from "../api/forecastApi";
-import { getDatasetSummary } from "../api/datasetApi";
 import { ALL_CATEGORIES_ID, ALL_CATEGORIES_LABEL, requestCategoryValue } from "../utils/forecastCategory";
 import { inclusiveMonthCount } from "../utils/months";
 import {
   MAX_FORECAST_MONTHS,
   PERIOD_TYPE,
-  firstValidForecastIso,
   monthYearPlain,
-  remainingMonthsFromLatestActual,
+  remainingMonthsFromPublishedModel,
   resolveForecastPeriod,
   validatePeriodTypeSelection,
 } from "../utils/forecastPeriod";
 
 const ForecastContext = createContext(null);
 
-function pickLatestActualMonth(summary) {
-  const available = summary?.latest_available_month;
-  if (/^\d{4}-\d{2}$/.test(available || "")) {
-    return available;
-  }
-  const latest = summary?.latest_month;
-  if (/^\d{4}-\d{2}$/.test(latest || "")) {
-    return latest;
-  }
-  return "";
-}
-
 export function ForecastProvider({ children, enabled = true }) {
   const [health, setHealth] = useState(null);
-  const [latestActualMonth, setLatestActualMonth] = useState("");
-  const [historyMetaLoading, setHistoryMetaLoading] = useState(enabled);
   const [boundsLoading, setBoundsLoading] = useState(enabled);
   const [boundsError, setBoundsError] = useState("");
   const [periodType, setPeriodType] = useState(PERIOD_TYPE.REMAINING_YEAR);
@@ -45,13 +29,16 @@ export function ForecastProvider({ children, enabled = true }) {
   const selectionRef = useRef({ startMonth: "", endMonth: "", periodType: PERIOD_TYPE.REMAINING_YEAR });
   selectionRef.current = { startMonth, endMonth, periodType };
 
-  const earliestMonth = health?.min_forecast_month || firstValidForecastIso(health?.history_end) || "";
+  const earliestMonth = health?.min_forecast_month || "";
   const maximumMonth = health?.max_forecast_end || "";
+  const historyEnd = /^\d{4}-\d{2}$/.test(health?.history_end || "") ? health.history_end : "";
 
-  const applyDefaultPeriod = useCallback((minimum, maximum, latestActual, preferredType) => {
-    const remaining = remainingMonthsFromLatestActual(latestActual, {
+  const applyDefaultPeriod = useCallback((minimum, maximum, publishedHistoryEnd, preferredType, publishedBoundsError) => {
+    const remaining = remainingMonthsFromPublishedModel({
+      historyEnd: publishedHistoryEnd,
       earliestIso: minimum,
       maximumIso: maximum,
+      boundsError: publishedBoundsError,
     });
     let nextType = preferredType || PERIOD_TYPE.REMAINING_YEAR;
     if (nextType === PERIOD_TYPE.REMAINING_YEAR && !remaining.available) {
@@ -61,7 +48,8 @@ export function ForecastProvider({ children, enabled = true }) {
       periodType: nextType,
       earliestIso: minimum,
       maximumIso: maximum,
-      latestActualIso: latestActual,
+      historyEnd: publishedHistoryEnd,
+      boundsError: publishedBoundsError,
     });
     setPeriodType(nextType);
     setStartMonth(resolved.startIso || "");
@@ -76,26 +64,32 @@ export function ForecastProvider({ children, enabled = true }) {
   const refreshBounds = useCallback(async () => {
     if (!enabled) {
       setBoundsLoading(false);
-      setHistoryMetaLoading(false);
       return;
     }
     setBoundsLoading(true);
-    setHistoryMetaLoading(true);
     try {
-      const [healthResponse, summary] = await Promise.all([
-        getHealth(),
-        getDatasetSummary().catch(() => null),
-      ]);
-      const minimum = healthResponse.min_forecast_month || firstValidForecastIso(healthResponse.history_end) || "";
-      const maximum = healthResponse.max_forecast_end || "";
-      const latestActual = pickLatestActualMonth(summary);
+      const healthResponse = await getHealth();
+      const minimum = /^\d{4}-\d{2}$/.test(healthResponse.min_forecast_month || "")
+        ? healthResponse.min_forecast_month
+        : "";
+      const maximum = /^\d{4}-\d{2}$/.test(healthResponse.max_forecast_end || "")
+        ? healthResponse.max_forecast_end
+        : "";
+      const publishedHistoryEnd = /^\d{4}-\d{2}$/.test(healthResponse.history_end || "")
+        ? healthResponse.history_end
+        : "";
       const problem = healthResponse.forecast_bounds_error
         || (!healthResponse.model_loaded
           ? "The forecast model is not loaded."
-          : (!minimum || !maximum ? "The published model did not provide a forecast period." : ""));
-      setHealth(healthResponse);
-      setLatestActualMonth(latestActual);
-      setHistoryMetaLoading(false);
+          : (!minimum || !maximum || !publishedHistoryEnd
+            ? "The published model did not provide a forecast period."
+            : ""));
+      setHealth({
+        ...healthResponse,
+        min_forecast_month: minimum,
+        max_forecast_end: maximum,
+        history_end: publishedHistoryEnd,
+      });
       if (problem) {
         setBoundsError(problem);
         return;
@@ -103,12 +97,13 @@ export function ForecastProvider({ children, enabled = true }) {
       setBoundsError("");
       setError("");
       const current = selectionRef.current;
-      if (!current.startMonth || !current.endMonth) {
-        applyDefaultPeriod(minimum, maximum, latestActual, current.periodType);
-        return;
-      }
-      if (current.periodType === PERIOD_TYPE.REMAINING_YEAR) {
-        const remaining = remainingMonthsFromLatestActual(latestActual, {
+      if (!current.startMonth || !current.endMonth || current.periodType === PERIOD_TYPE.REMAINING_YEAR) {
+        if (!current.startMonth || !current.endMonth) {
+          applyDefaultPeriod(minimum, maximum, publishedHistoryEnd, current.periodType, "");
+          return;
+        }
+        const remaining = remainingMonthsFromPublishedModel({
+          historyEnd: publishedHistoryEnd,
           earliestIso: minimum,
           maximumIso: maximum,
         });
@@ -132,7 +127,6 @@ export function ForecastProvider({ children, enabled = true }) {
       setValidation("");
     } catch (cause) {
       setBoundsError(cause.message || "Unable to load the forecast period.");
-      setHistoryMetaLoading(false);
     } finally {
       setBoundsLoading(false);
     }
@@ -143,7 +137,7 @@ export function ForecastProvider({ children, enabled = true }) {
   }, [refreshBounds]);
 
   const validate = useCallback(() => {
-    if (boundsLoading || historyMetaLoading) {
+    if (boundsLoading) {
       return "The forecast period is still loading.";
     }
     if (boundsError) {
@@ -154,9 +148,8 @@ export function ForecastProvider({ children, enabled = true }) {
       startIso: startMonth,
       endIso: endMonth,
       earliestIso: earliestMonth,
-      historyEnd: health?.history_end,
+      historyEnd,
       maximumIso: maximumMonth,
-      latestActualIso: latestActualMonth,
     });
     if (periodMessage) {
       return periodMessage;
@@ -175,15 +168,13 @@ export function ForecastProvider({ children, enabled = true }) {
     boundsLoading,
     earliestMonth,
     endMonth,
-    health?.history_end,
-    historyMetaLoading,
-    latestActualMonth,
+    historyEnd,
     maximumMonth,
     periodType,
     startMonth,
   ]);
 
-  const canSubmit = !boundsLoading && !historyMetaLoading && !boundsError && !validate();
+  const canSubmit = !boundsLoading && !boundsError && !validate();
 
   const runForecast = useCallback(async () => {
     const message = validate();
@@ -244,8 +235,7 @@ export function ForecastProvider({ children, enabled = true }) {
     setEndMonth,
     earliestMonth,
     maximumMonth,
-    latestActualMonth,
-    historyMetaLoading,
+    historyEnd,
     boundsLoading,
     boundsError,
     refreshBounds,

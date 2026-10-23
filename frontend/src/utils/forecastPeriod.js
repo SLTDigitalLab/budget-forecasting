@@ -1,4 +1,4 @@
-import { earliestForecastIso, inclusiveMonthCount, isoToLabel } from "./months.js";
+import { addMonths, earliestForecastIso, inclusiveMonthCount, isoToLabel, labelToIso } from "./months.js";
 
 export const MONTH_OPTIONS = [
   { number: 1, value: "01", label: "January" },
@@ -138,7 +138,7 @@ export function periodTypeHelp(periodType) {
     return "Forecast one selected month after the model history end.";
   }
   if (periodType === PERIOD_TYPE.REMAINING_YEAR) {
-    return "Forecast every month after the latest stored actual through December of that same year.";
+    return "Forecast every month after the published model's historical cutoff through December of that same year.";
   }
   if (periodType === PERIOD_TYPE.FINANCIAL_YEARS) {
     return "Forecast complete January–December financial years.";
@@ -219,22 +219,48 @@ export function remainingMonthsOfYear(year, earliestIso) {
   return { startIso, endIso: yearEnd };
 }
 
+export function publishedHistoryIso(historyEnd) {
+  const value = String(historyEnd || "").trim();
+  if (/^\d{4}-\d{2}$/.test(value)) {
+    return value;
+  }
+  return labelToIso(value) || "";
+}
+
 /**
- * Remaining months of the year: month after the latest stored actual through
- * December of that same year. Does not invent a period when metadata is missing.
+ * Remaining months of the published model's cutoff year.
+ * Start is the month after history_end and the end is December of that year.
+ * Does not use the live dataset, the browser date, or a hardcoded month.
  */
-export function remainingMonthsFromLatestActual(latestActualIso, { earliestIso = "", maximumIso = "" } = {}) {
-  if (!/^\d{4}-\d{2}$/.test(latestActualIso || "")) {
+export function remainingMonthsFromPublishedModel({
+  historyEnd,
+  earliestIso = "",
+  maximumIso = "",
+  boundsError = "",
+} = {}) {
+  if (boundsError) {
+    return {
+      available: false,
+      reason: "bounds_error",
+      startIso: "",
+      endIso: "",
+      historyEndIso: "",
+      message: String(boundsError),
+    };
+  }
+  const historyIso = publishedHistoryIso(historyEnd);
+  const maximum = lastAllowedIso(maximumIso);
+  if (!historyIso || !/^\d{4}-\d{2}$/.test(earliestIso || "") || !maximum) {
     return {
       available: false,
       reason: "missing",
       startIso: "",
       endIso: "",
-      latestActualIso: "",
-      message: "Remaining months cannot be derived until the latest stored actual month is available.",
+      historyEndIso: historyIso,
+      message: "Remaining months are unavailable until the published model provides a historical cutoff and forecast bounds.",
     };
   }
-  const { year, month } = splitIsoMonth(latestActualIso);
+  const { year, month } = splitIsoMonth(historyIso);
   const monthNumber = Number(month);
   const yearNumber = Number(year);
   if (monthNumber === 12) {
@@ -243,46 +269,31 @@ export function remainingMonthsFromLatestActual(latestActualIso, { earliestIso =
       reason: "december",
       startIso: "",
       endIso: "",
-      latestActualIso,
-      message: `There are no remaining months after ${monthYearPlain(latestActualIso)}. Use Future financial years instead.`,
+      historyEndIso: historyIso,
+      message: `There are no remaining months after ${monthYearPlain(historyIso)}. Use Future financial years instead.`,
     };
   }
-  const startIso = toIsoMonth(yearNumber, monthNumber + 1);
+  const startIso = addMonths(historyIso, 1);
   const endIso = toIsoMonth(yearNumber, 12);
+  if (startIso.slice(0, 4) !== String(yearNumber) || monthNumber < 1 || monthNumber > 12) {
+    return {
+      available: false,
+      reason: "invalid",
+      startIso: "",
+      endIso: "",
+      historyEndIso: historyIso,
+      message: "Remaining months are unavailable because the published historical cutoff is invalid.",
+    };
+  }
   const span = inclusiveMonthCount(startIso, endIso);
-  if (span < 1 || span > MAX_FORECAST_MONTHS) {
-    return {
-      available: false,
-      reason: "span",
-      startIso,
-      endIso,
-      latestActualIso,
-      message: "The remaining-months period is outside the supported forecast horizon.",
-    };
-  }
-  const maximum = lastAllowedIso(maximumIso);
-  if (earliestIso && (startIso < earliestIso || endIso < earliestIso)) {
+  if (span < 1 || span > MAX_FORECAST_MONTHS || startIso < earliestIso || endIso > maximum) {
     return {
       available: false,
       reason: "model_horizon",
       startIso,
       endIso,
-      latestActualIso,
-      message: maximum
-        ? `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model. Choose a period from ${monthYearPlain(earliestIso)} through ${monthYearPlain(maximum)}.`
-        : `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model.`,
-    };
-  }
-  if (maximum && (startIso > maximum || endIso > maximum)) {
-    return {
-      available: false,
-      reason: "model_horizon",
-      startIso,
-      endIso,
-      latestActualIso,
-      message: earliestIso
-        ? `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model. Choose a period from ${monthYearPlain(earliestIso)} through ${monthYearPlain(maximum)}.`
-        : `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model.`,
+      historyEndIso: historyIso,
+      message: `Remaining months ${formatCompactPeriodRange(startIso, endIso)} are not available from the published model. Choose a period from ${monthYearPlain(earliestIso)} through ${monthYearPlain(maximum)}.`,
     };
   }
   return {
@@ -290,7 +301,7 @@ export function remainingMonthsFromLatestActual(latestActualIso, { earliestIso =
     reason: "",
     startIso,
     endIso,
-    latestActualIso,
+    historyEndIso: historyIso,
     message: "",
   };
 }
@@ -371,7 +382,8 @@ export function resolveForecastPeriod({
   endYear,
   earliestIso,
   maximumIso,
-  latestActualIso,
+  historyEnd,
+  boundsError,
   currentStartIso,
   currentEndIso,
 }) {
@@ -388,9 +400,11 @@ export function resolveForecastPeriod({
     return { startIso: iso, endIso: iso };
   }
   if (periodType === PERIOD_TYPE.REMAINING_YEAR) {
-    const remaining = remainingMonthsFromLatestActual(latestActualIso, {
+    const remaining = remainingMonthsFromPublishedModel({
+      historyEnd,
       earliestIso,
       maximumIso: maximum,
+      boundsError,
     });
     if (remaining.available) {
       return { startIso: remaining.startIso, endIso: remaining.endIso };
@@ -413,21 +427,23 @@ export function validatePeriodTypeSelection({
   earliestIso,
   historyEnd,
   maximumIso,
-  latestActualIso,
+  boundsError,
 }) {
   if (!periodType) {
     return "Forecast period type is required.";
   }
   if (periodType === PERIOD_TYPE.REMAINING_YEAR) {
-    const remaining = remainingMonthsFromLatestActual(latestActualIso, {
+    const remaining = remainingMonthsFromPublishedModel({
+      historyEnd,
       earliestIso,
       maximumIso,
+      boundsError,
     });
     if (!remaining.available) {
       return remaining.message;
     }
     if (remaining.startIso !== startIso || remaining.endIso !== endIso) {
-      return `Remaining months must be ${formatSelectedPeriodDisplay(remaining.startIso, remaining.endIso)} based on the latest stored actual (${monthYearPlain(latestActualIso)}).`;
+      return `Remaining months must be ${formatSelectedPeriodDisplay(remaining.startIso, remaining.endIso)} based on the published model historical cutoff (${monthYearPlain(remaining.historyEndIso)}).`;
     }
   }
   const periodMessage = validateForecastPeriod({

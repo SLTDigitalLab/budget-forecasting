@@ -1,3 +1,4 @@
+import { X } from "lucide-react";
 import {
   BarChart3,
   Download,
@@ -22,7 +23,7 @@ const items = [
   { to: "/forecast-history", label: "Forecast History", icon: History },
 ];
 
-export default function Sidebar({ open, onNavigate }) {
+export default function Sidebar({ sidebarRef, open, drawer = false, collapsed = false, onNavigate, onClose }) {
   const { user, logout } = useAuth();
   const { resetSession } = useForecast();
 
@@ -32,7 +33,16 @@ export default function Sidebar({ open, onNavigate }) {
   }
 
   return (
-    <aside className={`sidebar ${open ? "open" : ""}`} aria-label="Main navigation">
+    <aside
+      ref={sidebarRef}
+      id="app-navigation"
+      className={`sidebar ${open ? "open" : ""}`}
+      aria-label="Main navigation"
+      role={drawer ? "dialog" : undefined}
+      aria-modal={drawer ? "true" : undefined}
+      aria-hidden={collapsed ? "true" : undefined}
+      inert={collapsed ? "" : undefined}
+    >
       <div className="brand">
         <div className="brand-lockup">
           <div className="brand-logo-frame">
@@ -43,6 +53,15 @@ export default function Sidebar({ open, onNavigate }) {
             <p className="brand-subtitle">AI Budget Forecasting System</p>
           </div>
         </div>
+        <button
+          type="button"
+          className="sidebar-close"
+          data-drawer-close="true"
+          aria-label="Close navigation"
+          onClick={onClose}
+        >
+          <X size={18} aria-hidden="true" />
+        </button>
       </div>
       <nav className="nav-list">
         {items.map((item) => {
