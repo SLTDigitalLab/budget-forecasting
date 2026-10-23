@@ -180,67 +180,65 @@ def published_forecast_bounds(bundle: dict) -> dict[str, str]:
     }
 
 
-def authoritative_latest_actual_month() -> str | None:
-    """Latest stored actual month from live historical metadata (not the published model)."""
-    try:
-        from app.services.dataset_master import load_master_state
-        from app.services.submission_state import coverage_report
-
-        report = coverage_report(load_master_state())
-        latest = report.get("latest_available_month")
-        if latest and _ISO_MONTH.match(str(latest)):
-            return str(latest)
-    except Exception:
-        pass
-    try:
-        from app.services.dataset_repository import historical_summary
-
-        summary = historical_summary()
-        latest = summary.get("latest_month")
-        if latest and _ISO_MONTH.match(str(latest)):
-            return str(latest)
-    except Exception:
-        pass
-    return None
-
-
-def remaining_months_from_latest_actual(latest_actual: str | None) -> dict[str, str | bool]:
+def remaining_months_from_history_end(history_end: str | None) -> dict[str, str | bool]:
     """
-    Remaining months: month after the latest stored actual through December of that year.
-    Does not invent a period when metadata is missing or the latest month is December.
+    Remaining months follow the published model's historical cutoff through December
+    of that same year. A newer uploaded dataset is not a cutoff.
     """
-    if not latest_actual or not _ISO_MONTH.match(str(latest_actual)):
+    if not history_end or not str(history_end).strip():
         return {
             "available": False,
             "reason": "missing",
             "start_month": "",
             "end_month": "",
-            "latest_actual_month": "",
+            "history_end": "",
             "message": (
-                "Remaining months cannot be derived because historical actuals metadata is unavailable."
+                "Remaining months are unavailable until the published model provides a historical cutoff."
             ),
         }
-    latest = parse_month_timestamp(str(latest_actual))
-    if int(latest.month) == 12:
+    try:
+        cutoff = parse_month_timestamp(str(history_end))
+    except InvalidForecastWindowError:
+        return {
+            "available": False,
+            "reason": "invalid",
+            "start_month": "",
+            "end_month": "",
+            "history_end": "",
+            "message": "Remaining months are unavailable because the published historical cutoff is invalid.",
+        }
+    if int(cutoff.month) == 12:
         return {
             "available": False,
             "reason": "december",
             "start_month": "",
             "end_month": "",
-            "latest_actual_month": timestamp_to_iso(latest),
+            "history_end": timestamp_to_iso(cutoff),
             "message": (
-                f"There are no remaining months after {month_phrase(latest)}. "
+                f"There are no remaining months after {month_phrase(cutoff)}. "
                 "Use Future financial years instead."
             ),
         }
-    start = latest + pd.offsets.MonthBegin(1)
-    end = pd.Timestamp(year=int(latest.year), month=12, day=1)
+    start = cutoff + pd.offsets.MonthBegin(1)
+    if int(start.year) != int(cutoff.year):
+        return {
+            "available": False,
+            "reason": "december",
+            "start_month": "",
+            "end_month": "",
+            "history_end": timestamp_to_iso(cutoff),
+            "message": (
+                f"There are no remaining months after {month_phrase(cutoff)}. "
+                "Use Future financial years instead."
+            ),
+        }
+    end = pd.Timestamp(year=int(cutoff.year), month=12, day=1)
     return {
         "available": True,
         "reason": "",
         "start_month": timestamp_to_iso(start),
         "end_month": timestamp_to_iso(end),
-        "latest_actual_month": timestamp_to_iso(latest),
+        "history_end": timestamp_to_iso(cutoff),
         "message": "",
     }
 
@@ -249,12 +247,18 @@ def validate_remaining_year_request(
     start_month: str | None,
     end_month: str | None,
     *,
-    latest_actual: str | None = None,
     bundle: dict | None = None,
+    history_end: str | None = None,
+    min_forecast_month: str | None = None,
+    max_forecast_end: str | None = None,
 ) -> dict[str, str]:
-    """Reject Remaining months requests that do not match the authoritative cutoff."""
-    cutoff = latest_actual if latest_actual is not None else authoritative_latest_actual_month()
-    expected = remaining_months_from_latest_actual(cutoff)
+    """Reject Remaining months requests that do not match the published model cutoff."""
+    if bundle is not None:
+        bounds = published_forecast_bounds(bundle)
+        history_end = bounds["history_end"]
+        min_forecast_month = bounds["min_forecast_month"]
+        max_forecast_end = bounds["max_forecast_end"]
+    expected = remaining_months_from_history_end(history_end)
     if not expected["available"]:
         raise InvalidForecastWindowError(str(expected["message"]))
     if start_month != expected["start_month"] or end_month != expected["end_month"]:
@@ -262,27 +266,25 @@ def validate_remaining_year_request(
             "Remaining months must be "
             f"{month_phrase(parse_month_timestamp(str(expected['start_month'])))} through "
             f"{month_phrase(parse_month_timestamp(str(expected['end_month'])))} "
-            f"based on the latest stored actual "
-            f"({month_phrase(parse_month_timestamp(str(expected['latest_actual_month'])))})."
+            f"based on the published model historical cutoff "
+            f"({month_phrase(parse_month_timestamp(str(expected['history_end'])))})."
         )
-    if bundle is not None:
-        bounds = published_forecast_bounds(bundle)
-        if (
-            str(expected["start_month"]) < bounds["min_forecast_month"]
-            or str(expected["end_month"]) > bounds["max_forecast_end"]
-        ):
-            raise InvalidForecastWindowError(
-                "Remaining months "
-                f"{month_phrase(parse_month_timestamp(str(expected['start_month'])))} through "
-                f"{month_phrase(parse_month_timestamp(str(expected['end_month'])))} "
-                "are not available from the published model. "
-                f"Choose a period from {month_phrase(parse_month_timestamp(bounds['min_forecast_month']))} "
-                f"through {month_phrase(parse_month_timestamp(bounds['max_forecast_end']))}."
-            )
+    if min_forecast_month and max_forecast_end and (
+        str(expected["start_month"]) < str(min_forecast_month)
+        or str(expected["end_month"]) > str(max_forecast_end)
+    ):
+        raise InvalidForecastWindowError(
+            "Remaining months "
+            f"{month_phrase(parse_month_timestamp(str(expected['start_month'])))} through "
+            f"{month_phrase(parse_month_timestamp(str(expected['end_month'])))} "
+            "are not available from the published model. "
+            f"Choose a period from {month_phrase(parse_month_timestamp(str(min_forecast_month)))} "
+            f"through {month_phrase(parse_month_timestamp(str(max_forecast_end)))}."
+        )
     return {
         "start_month": str(expected["start_month"]),
         "end_month": str(expected["end_month"]),
-        "latest_actual_month": str(expected["latest_actual_month"]),
+        "history_end": str(expected["history_end"]),
     }
 
 
@@ -878,7 +880,6 @@ def generate_monthly_forecast(
     account_codes: list[str] | None = None,
     category: str | None = None,
     period_type: str | None = None,
-    latest_actual: str | None = None,
 ) -> dict:
     """Generate account-wise and combined monthly/yearly forecasts. Predict-only."""
     try:
@@ -891,7 +892,6 @@ def generate_monthly_forecast(
         validated = validate_remaining_year_request(
             start_month,
             end_month,
-            latest_actual=latest_actual,
             bundle=bundle,
         )
         start_month = validated["start_month"]

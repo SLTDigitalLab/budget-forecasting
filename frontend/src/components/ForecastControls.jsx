@@ -17,7 +17,7 @@ import {
   formatSelectedPeriodDisplay,
   lastAllowedIso,
   monthYearPlain,
-  remainingMonthsFromLatestActual,
+  remainingMonthsFromPublishedModel,
   resolveForecastPeriod,
   splitIsoMonth,
   yearOptions,
@@ -36,8 +36,7 @@ export default function ForecastControls() {
     setEndMonth,
     earliestMonth,
     maximumMonth,
-    latestActualMonth,
-    historyMetaLoading,
+    historyEnd,
     boundsLoading,
     boundsError,
     refreshBounds,
@@ -63,11 +62,13 @@ export default function ForecastControls() {
   const categoryId = String(category?.id || ALL_CATEGORIES_ID);
   const selectedCategory = categories.find((item) => String(item.id) === categoryId) || category;
   const categoryReady = isForecastableCategory(selectedCategory);
-  const boundsReady = !boundsLoading && !historyMetaLoading && !boundsError && Boolean(latestMonth);
+  const boundsReady = !boundsLoading && !boundsError && Boolean(latestMonth) && Boolean(historyEnd);
   const periodLocked = !categoryReady || categoriesLoading || !boundsReady;
-  const remainingPeriod = remainingMonthsFromLatestActual(latestActualMonth, {
+  const remainingPeriod = remainingMonthsFromPublishedModel({
+    historyEnd,
     earliestIso: earliestMonth,
     maximumIso: maximumMonth,
+    boundsError,
   });
   const periodHelp = compactPeriodHelp({
     startIso: startMonth,
@@ -127,8 +128,7 @@ export default function ForecastControls() {
       periodType: nextType,
       earliestIso: earliestMonth,
       maximumIso: maximumMonth,
-      latestActualIso: latestActualMonth,
-      // Clear stale year/month selections from the previous mode.
+      historyEnd,
       currentStartIso: "",
       currentEndIso: "",
     }));
@@ -168,30 +168,21 @@ export default function ForecastControls() {
   }
 
   function remainingOptionDisabled() {
-    if (periodLocked) {
-      return true;
-    }
-    if (historyMetaLoading) {
+    if (periodLocked || boundsLoading) {
       return true;
     }
     return !remainingPeriod.available;
   }
 
   function remainingOptionNote() {
-    if (historyMetaLoading) {
-      return "Loading latest stored actuals…";
+    if (boundsLoading) {
+      return "Loading published model bounds…";
     }
-    if (remainingPeriod.reason === "december") {
+    if (!remainingPeriod.available) {
       return remainingPeriod.message;
     }
-    if (remainingPeriod.reason === "missing") {
-      return remainingPeriod.message;
-    }
-    if (remainingPeriod.reason === "model_horizon") {
-      return remainingPeriod.message;
-    }
-    if (remainingPeriod.available && latestActualMonth) {
-      return `After ${monthYearPlain(latestActualMonth)} through December ${latestActualMonth.slice(0, 4)}`;
+    if (historyEnd) {
+      return `After ${monthYearPlain(historyEnd)} through December ${historyEnd.slice(0, 4)}`;
     }
     return "";
   }
@@ -347,8 +338,8 @@ export default function ForecastControls() {
                   </p>
                   <p className="generate-remaining-period-help">
                     {remainingPeriod.available
-                      ? `Automatically set from the latest stored actual (${monthYearPlain(latestActualMonth)}) through December of that year. Year selection is not offered in this mode.`
-                      : (remainingPeriod.message || "Remaining months are unavailable until historical metadata loads.")}
+                      ? `Automatically set from the published model historical cutoff (${monthYearPlain(historyEnd)}) through December of that year. Year selection is not offered in this mode.`
+                      : (remainingPeriod.message || "Remaining months are unavailable until the published model bounds load.")}
                   </p>
                 </div>
               ) : null}
@@ -403,14 +394,14 @@ export default function ForecastControls() {
             <button
               className="generate-button"
               type="submit"
-              disabled={periodLocked || !canSubmit || loading || boundsLoading || historyMetaLoading || Boolean(boundsError)}
+              disabled={periodLocked || !canSubmit || loading || boundsLoading || Boolean(boundsError)}
             >
               {loading ? <Loader2 className="spin" size={18} aria-hidden="true" /> : null}
               {loading ? "Generating Forecast..." : "Generate Forecast"}
             </button>
           </div>
           {periodHelp ? <p className="generate-period-help">{periodHelp}</p> : null}
-          {boundsLoading || historyMetaLoading ? (
+          {boundsLoading ? (
             <p className="generate-period-help">Loading the published forecast period.</p>
           ) : null}
           {boundsError ? (

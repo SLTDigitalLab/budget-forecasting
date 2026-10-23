@@ -1,6 +1,5 @@
 import { useAuth } from "../auth/AuthContext";
 import ErrorState from "../components/ErrorState";
-import LoadingState from "../components/LoadingState";
 
 export function ActionAuthenticationOverlay({ onSignIn, onCancel, busy = false, error = "" }) {
   return (
@@ -13,7 +12,7 @@ export function ActionAuthenticationOverlay({ onSignIn, onCancel, busy = false, 
           </h1>
           <p className="login-prompt">Please authenticate to make changes</p>
           {error ? <ErrorState message={error} /> : null}
-          <button type="button" className="login-microsoft-button" onClick={onSignIn} disabled={busy}>
+          <button type="button" className="login-microsoft-button" onClick={onSignIn} disabled={busy} aria-busy={busy}>
             <MicrosoftMark />
             <span>Sign in with Microsoft</span>
           </button>
@@ -39,13 +38,13 @@ export function AuthenticationOverlay() {
             AI Budget Forecasting System
           </h1>
           <p className="login-prompt">Please authenticate to continue</p>
-          {busy ? <LoadingState label="Contacting Microsoft..." /> : null}
           {error ? <ErrorState message={error} /> : null}
           <button
             type="button"
             className="login-microsoft-button"
             onClick={error ? retry : login}
             disabled={busy}
+            aria-busy={busy}
           >
             <MicrosoftMark />
             <span>{error ? "Retry" : "Sign in with Microsoft"}</span>

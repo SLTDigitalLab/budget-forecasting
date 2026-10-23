@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import LoadingState from "../components/LoadingState";
 import { consumeAuthReturn, rememberAuthReturn } from "./authRouting.js";
@@ -21,6 +21,7 @@ export function AuthProvider({ children }) {
   const [error, setError] = useState("");
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
+  const loginStart = useRef(false);
 
   useEffect(() => {
     let live = true;
@@ -49,12 +50,17 @@ export function AuthProvider({ children }) {
   }, [navigate]);
 
   const login = useCallback(() => {
+    if (loginStart.current) {
+      return;
+    }
+    loginStart.current = true;
     setError("");
     setBusy(true);
     try {
       rememberAuthReturn(window.location.pathname, sessionStorage);
       startMicrosoftLogin();
     } catch (cause) {
+      loginStart.current = false;
       setBusy(false);
       setError(String(cause?.message || cause || "Microsoft sign-in could not be started."));
     }

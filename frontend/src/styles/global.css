@@ -184,6 +184,14 @@ a:focus-visible {
 .brand {
   margin-bottom: 1.15rem;
   padding: 0.05rem 0.1rem 0.15rem;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.sidebar-close {
+  display: none;
 }
 
 .brand-lockup {
@@ -471,6 +479,10 @@ a:focus-visible {
   padding: 1.5rem 1.8rem 2.4rem;
   overflow-x: clip;
   overflow-y: auto;
+}
+
+.content-main {
+  min-width: 0;
 }
 
 .page-header {
@@ -3491,14 +3503,39 @@ td {
 @media (max-width: 860px) {
   .sidebar {
     position: fixed;
-    height: 100vh;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(var(--sidebar-width), 88vw);
+    flex: 0 0 auto;
     height: 100dvh;
+    max-height: 100dvh;
     transform: translateX(-110%);
     transition: transform 0.2s ease;
+    z-index: 40;
   }
 
   .sidebar.open {
     transform: translateX(0);
+  }
+
+  .sidebar-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: #fff;
+    cursor: pointer;
+  }
+
+  .nav-link {
+    min-height: 44px;
   }
 
   .menu-button,
@@ -3508,16 +3545,27 @@ td {
     justify-content: center;
   }
 
+  .menu-button {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+
   .backdrop {
     position: fixed;
     inset: 0;
     background: rgba(4, 18, 37, 0.45);
     border: 0;
-    z-index: 15;
+    z-index: 30;
+  }
+
+  .content.nav-locked {
+    overflow: hidden;
   }
 
   .content {
-    padding: 1rem;
+    width: 100%;
+    padding: 0.85rem;
   }
 
   .page-header,
@@ -3608,6 +3656,80 @@ td {
   .export-report-meta,
   .export-download-bar {
     grid-template-columns: 1fr;
+  }
+
+  .page-header h1 {
+    font-size: 1.55rem;
+    overflow-wrap: anywhere;
+  }
+
+  .page-header p,
+  .period-type-card-title,
+  .generate-category-help,
+  .generate-remaining-period-help {
+    overflow-wrap: anywhere;
+  }
+
+  .field input,
+  .field select,
+  .generate-form .field input,
+  .generate-form .field select,
+  .book-entry-filters input,
+  .book-entry-filters select,
+  .book-entry-form input,
+  .book-entry-form select,
+  .book-entry-form label {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .book-entry-filters,
+  .book-entry-form,
+  .book-entry-actions,
+  .settings-access-actions,
+  .settings-panel-header,
+  .export-download-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .table-wrap,
+  .data-scroll,
+  .book-entry-card .table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .overview-chart-card,
+  .analytics-chart,
+  .chart-card,
+  .bar-chart-body,
+  .recharts-responsive-container {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .login-modal,
+  .settings-dialog,
+  .system-lock-card,
+  .retrain-confirm-dialog {
+    width: min(100%, calc(100vw - 1.5rem));
+    max-height: calc(100dvh - 1.5rem);
+    overflow: auto;
+  }
+
+  .retrain-modal {
+    width: min(100%, calc(100vw - 1.5rem));
+    max-height: calc(100dvh - 1.5rem);
+  }
+
+  .settings-dialog-backdrop,
+  .system-lock-layer,
+  .retrain-confirm-backdrop,
+  .login-modal-layer {
+    padding: 0.75rem;
   }
 }
 
