@@ -50,7 +50,7 @@ export default function Sidebar({ sidebarRef, open, drawer = false, collapsed = 
           </div>
           <div className="brand-copy">
             <h1 className="brand-title">SLT-Mobitel</h1>
-            <p className="brand-subtitle">AI Budget Forecasting System</p>
+            <p className="brand-subtitle">Next Budget</p>
           </div>
         </div>
         <button

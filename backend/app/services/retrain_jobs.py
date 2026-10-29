@@ -115,6 +115,26 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _record_training_outcome(job: dict | None, action: str, result: str, details: dict | None = None) -> None:
+    current = job or {}
+    actor = {
+        "tenant_id": current.get("initiator_tid") or "",
+        "object_id": current.get("initiator_oid") or "",
+        "name": current.get("initiator_display_name") or "",
+        "email": current.get("initiator_username") or "",
+        "identity_source": current.get("initiator_identity_source") or "",
+    }
+    job_id = str(current.get("id") or "")
+    record_action(
+        actor,
+        action,
+        result,
+        job_id=job_id or None,
+        target=job_id or "retrain",
+        details=details or {},
+    )
+
+
 def _shell_job(identity, now: datetime) -> dict:
     from app.services.retrain_state import _identity_value
 
@@ -407,8 +427,15 @@ def start_job(identity, snapshot: dict | None = None, now: datetime | None = Non
             current = state["jobs"].get(job["id"])
             if current is not None:
                 fail_job(state, current, str(error), "SNAPSHOT_FAILED", utcnow(), safe_unlink)
+            return current
 
-        mutate(fail)
+        failed = mutate(fail)
+        _record_training_outcome(
+            failed or job,
+            "retrain_failed",
+            "failed",
+            {"error": str(error)[:500], "code": "SNAPSHOT_FAILED"},
+        )
         raise
 
     def store(state):
@@ -424,10 +451,24 @@ def start_job(identity, snapshot: dict | None = None, now: datetime | None = Non
             current = state["jobs"].get(job["id"])
             if current is not None:
                 fail_job(state, current, f"Retraining could not be started: {error}", "START_FAILED", utcnow(), safe_unlink)
+            return current
 
-        mutate(fail)
+        failed = mutate(fail)
+        _record_training_outcome(
+            failed or job,
+            "retrain_failed",
+            "failed",
+            {"error": str(error)[:500], "code": "START_FAILED"},
+        )
         raise
-    record_action(identity, "retrain_start", "succeeded", job_id=job["id"])
+    record_action(
+        identity,
+        "retrain_start",
+        "succeeded",
+        job_id=job["id"],
+        target=job["id"],
+        details={"state": "QUEUED"},
+    )
     return {"job_id": job["id"], "state": "QUEUED"}
 
 
@@ -578,8 +619,10 @@ def run_job_body(job_id: str) -> None:
             current = state["jobs"][job_id]
             mark_ready(current, str(saved), digest, utcnow())
             clear_live_progress(job_id)
+            return current
 
-        mutate(ready)
+        finished = mutate(ready)
+        _record_training_outcome(finished or {"id": job_id}, "retrain_complete", "succeeded", {"digest": digest})
     except Exception as error:
         accepting_progress = False
 
@@ -587,11 +630,19 @@ def run_job_body(job_id: str) -> None:
             current = state["jobs"].get(job_id)
             if current is None or current.get("state") in {"READY_TO_SAVE", "SAVED", "SAVE_FAILED"}:
                 clear_live_progress(job_id)
-                return
+                return None
             fail_job(state, current, str(error), "TRAINING_FAILED", utcnow(), safe_unlink)
             clear_live_progress(job_id)
+            return current
 
-        mutate(fail)
+        failed = mutate(fail)
+        if failed is not None:
+            _record_training_outcome(
+                failed,
+                "retrain_failed",
+                "failed",
+                {"error": str(error)[:500], "code": "TRAINING_FAILED"},
+            )
     finally:
         stop.set()
         with _local_guard:
@@ -755,7 +806,14 @@ def save_job(job_id: str, identity, now: datetime | None = None) -> dict:
 
     job, candidate_path = mutate(finish)
     safe_unlink(candidate_path)
-    record_action(identity, "retrain_save", "succeeded", job_id=job_id)
+    record_action(
+        identity,
+        "retrain_save",
+        "succeeded",
+        job_id=job_id,
+        target=job_id,
+        details={"publication_status": "published"},
+    )
     return _save_payload(job, idempotent=False)
 
 
@@ -781,7 +839,14 @@ def cancel_job(job_id: str, identity, now: datetime | None = None) -> dict:
         return public_view(state, identity, now)
 
     view = mutate(apply)
-    record_action(identity, "retrain_discard", "succeeded", job_id=job_id)
+    record_action(
+        identity,
+        "retrain_discard",
+        "succeeded",
+        job_id=job_id,
+        target=job_id,
+        details={"state": (view or {}).get("state")},
+    )
     return view
 
 
@@ -796,7 +861,14 @@ def retry_job(job_id: str, identity) -> dict:
         return True
 
     mutate(apply)
-    record_action(identity, "retrain_retry", "succeeded", job_id=job_id)
+    record_action(
+        identity,
+        "retrain_retry",
+        "succeeded",
+        job_id=job_id,
+        target=job_id,
+        details={},
+    )
     return start_job(identity)
 
 

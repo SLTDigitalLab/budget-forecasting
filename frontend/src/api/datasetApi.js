@@ -101,8 +101,19 @@ export function listRevisions(page = 1, pageSize = 10) {
   return datasetRequest(`/api/datasets/revisions?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`);
 }
 
-export function viewRevision(revisionId) {
-  return datasetRequest(`/api/datasets/revisions/${encodeURIComponent(revisionId)}`);
+export function listActivityEvents({ page = 1, pageSize = 20, day } = {}) {
+  const query = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  if (day) {
+    query.set("day", day);
+  }
+  return datasetRequest(`/api/datasets/activity?${query.toString()}`);
+}
+
+export function viewRevision(revisionId, token) {
+  return datasetRequest(`/api/datasets/revisions/${encodeURIComponent(revisionId)}`, { token });
 }
 
 export function previewRollback(revisionId, reason, token) {
@@ -130,8 +141,8 @@ export function viewDatasetFile(fileId, search = "") {
   return datasetRequest(`/api/datasets/files/${encodeURIComponent(fileId)}${query}`);
 }
 
-export async function downloadDatasetFile(fileId, fallbackName) {
-  const response = await datasetRequest(`/api/datasets/files/${encodeURIComponent(fileId)}/download`);
+export async function downloadDatasetFile(fileId, fallbackName, token) {
+  const response = await datasetRequest(`/api/datasets/files/${encodeURIComponent(fileId)}/download`, { token });
   const blob = await response.blob();
   const header = response.headers.get("Content-Disposition") || "";
   const matched = header.match(/filename="([^"]+)"/i);

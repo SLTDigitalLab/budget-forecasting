@@ -156,7 +156,7 @@ export default function ForecastReportPreview({ report }) {
           {hasBounds ? (
             <li>
               <span className="export-legend-swatch is-range" />
-              Expected Range (90%)
+              90% expected range
             </li>
           ) : null}
         </ul>

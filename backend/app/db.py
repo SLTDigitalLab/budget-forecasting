@@ -355,6 +355,16 @@ SCHEMA_STATEMENTS = (
     ALTER TABLE settings_action_audit ADD COLUMN IF NOT EXISTS actor_identity_source TEXT
     """,
     """
+    ALTER TABLE settings_action_audit ADD COLUMN IF NOT EXISTS target TEXT
+    """,
+    """
+    ALTER TABLE settings_action_audit ADD COLUMN IF NOT EXISTS details JSONB NOT NULL DEFAULT '{}'::jsonb
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS settings_action_audit_occurred_at_idx
+        ON settings_action_audit (occurred_at DESC, id DESC)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS book_entry_accounts (
         budget_code TEXT PRIMARY KEY,
         budget_name TEXT NOT NULL,

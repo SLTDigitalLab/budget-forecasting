@@ -1,8 +1,8 @@
 import { Info } from "lucide-react";
 
-export const EXPECTED_RANGE_LABEL = "Expected Range (90%)";
+export const EXPECTED_RANGE_LABEL = "90% expected range";
 export const EXPECTED_RANGE_TOOLTIP =
-  "The shaded area shows the expected range around the forecast based on historical forecasting performance.";
+  "Prediction interval around the forecast based on historical forecasting performance. This is a prediction range, not a claim of 90% accuracy.";
 export const EXPECTED_RANGE_UNAVAILABLE = "Expected range is not available for this month.";
 
 export default function ExpectedRangeLabel() {

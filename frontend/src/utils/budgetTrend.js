@@ -1,5 +1,5 @@
 import { mergeHistoricalActuals } from "./forecastComparison.js";
-import { isoToLabel } from "./months.js";
+import { addMonths, isoToLabel } from "./months.js";
 
 function chronologicalForecastMonths(forecast) {
   return (Array.isArray(forecast?.monthly_forecasts) ? forecast.monthly_forecasts.slice() : [])
@@ -46,6 +46,39 @@ export function seriesDirection(values) {
   return { direction: "down", percent, label: "Falling" };
 }
 
+function emptyPoint(month) {
+  return {
+    month,
+    label: isoToLabel(month),
+    actual: null,
+    forecast: null,
+    lower: null,
+    upper: null,
+    interval_status: null,
+  };
+}
+
+/**
+ * Fill every calendar month from first to last so missing months stay null gaps.
+ */
+export function fillContinuousMonthAxis(points) {
+  const source = (Array.isArray(points) ? points : [])
+    .filter((row) => isIsoMonth(row?.month))
+    .sort((left, right) => String(left.month).localeCompare(String(right.month)));
+  if (!source.length) {
+    return [];
+  }
+  const byMonth = new Map(source.map((row) => [row.month, row]));
+  const filled = [];
+  let cursor = source[0].month;
+  const end = source[source.length - 1].month;
+  while (cursor <= end) {
+    filled.push(byMonth.get(cursor) || emptyPoint(cursor));
+    cursor = addMonths(cursor, 1);
+  }
+  return filled;
+}
+
 export function buildBudgetTrend({ monthlyActuals, forecast }) {
   const actuals = mergeHistoricalActuals(monthlyActuals, forecast?.historical_actuals);
   const forecasts = chronologicalForecastMonths(forecast);
@@ -82,6 +115,7 @@ export function buildBudgetTrend({ monthlyActuals, forecast }) {
   });
 
   points.sort((left, right) => String(left.month).localeCompare(String(right.month)));
+  const continuousPoints = fillContinuousMonthAxis(points);
 
   const historicalValues = actuals.map((row) => Number(row.actual_amount));
   const forecastValues = forecasts
@@ -104,8 +138,17 @@ export function buildBudgetTrend({ monthlyActuals, forecast }) {
       ? null
       : (difference / historicalAverage) * 100;
 
+  const historyStart = actuals[0]?.month || null;
+  const historyEnd = actuals[actuals.length - 1]?.month || null;
+  const forecastStart = forecastValues.length
+    ? forecasts.find((row) => isIsoMonth(row.month) && !actualMonths.has(row.month))?.month
+    : null;
+  const forecastEnd = forecastValues.length
+    ? [...forecasts].reverse().find((row) => isIsoMonth(row.month) && !actualMonths.has(row.month))?.month
+    : null;
+
   return {
-    points,
+    points: continuousPoints,
     historical_average: historicalAverage,
     forecast_average: forecastAverage,
     difference,
@@ -114,7 +157,12 @@ export function buildBudgetTrend({ monthlyActuals, forecast }) {
     forecast_trend: seriesDirection(forecastValues),
     historical_month_count: historicalValues.length,
     forecast_month_count: forecastValues.length,
-    has_expected_range: points.some(
+    history_start: historyStart,
+    history_end: historyEnd,
+    forecast_start: forecastStart || null,
+    forecast_end: forecastEnd || null,
+    category: forecast?.category || null,
+    has_expected_range: continuousPoints.some(
       (row) => Number.isFinite(row.lower) && Number.isFinite(row.upper)
     ),
   };
