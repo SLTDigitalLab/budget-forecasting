@@ -496,11 +496,284 @@ def detect_monthly_columns(column_names, history_start=HISTORY_START):
     return monthly_columns, expected
 
 
-def assign_categories(df, account_code_col, account_name_col):
+def normalize_category_key(value) -> str:
+    """Trim, collapse internal whitespace, and casefold for category label compares."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>"}:
+        return ""
+    return re.sub(r"\s+", " ", text).casefold()
+
+
+def _font_is_bold(font) -> bool:
+    return bool(getattr(font, "bold", False))
+
+
+def _excel_cell_is_blank(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _excel_cell_is_formula(cell) -> bool:
+    data_type = str(getattr(cell, "data_type", "") or "").lower()
+    if data_type == "f":
+        return True
+    raw = getattr(cell, "value", None)
+    return isinstance(raw, str) and raw.startswith("=")
+
+
+def _excel_data_cell_is_empty(cell) -> bool:
+    """Data cells with formulas are non-empty even when the cached result is blank."""
+    if _excel_cell_is_formula(cell):
+        return False
+    return _excel_cell_is_blank(getattr(cell, "value", None))
+
+
+def resolve_header_column_indices(header_values: Sequence[Any]) -> dict[str, int]:
+    """Map normalized header labels to 0-based column indices."""
+    indices: dict[str, int] = {}
+    for index, value in enumerate(header_values):
+        key = label_key(value)
+        if key and key not in indices:
+            indices[key] = int(index)
+    return indices
+
+
+def data_column_indices_from_headers(header_values: Sequence[Any], *, code_key: str, name_key: str) -> list[int]:
+    """
+    Monthly actuals columns used to decide whether a heading row is empty.
+
+    Skips ACT CODE / ACT NAME / CATEGORY labels, YTD/annual excluded actuals columns,
+    and any header that is not a monthly Actuals column. Category section totals often
+    carry YTD formulas even on heading rows; those must not disqualify a bold heading.
+    """
+    skip = {code_key, name_key, "CATEGORY", "CATEGORIES"}
+    indices: list[int] = []
+    for index, value in enumerate(header_values):
+        key = label_key(value)
+        if not key or key in skip:
+            continue
+        label = normalize_label(value)
+        if not label or is_excluded_actuals_column(label):
+            continue
+        if pd.isna(parse_month_header(label)):
+            continue
+        indices.append(int(index))
+    return indices
+
+
+def detect_category_headings_from_worksheet(
+    worksheet,
+    *,
+    header_row_idx: int,
+    code_col_idx: int,
+    name_col_idx: int,
+    data_col_indices: Sequence[int],
+    end_excel_row: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Category heading rows (workbook order):
+    - ACT CODE blank
+    - ACT NAME non-empty and bold
+    - every identified data/actuals cell empty (formulas count as non-empty)
+    """
+    headings: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    max_column = max([code_col_idx, name_col_idx, *(data_col_indices or [0])], default=0) + 1
+    sheet_max = int(getattr(worksheet, "max_row", 0) or 0)
+    if end_excel_row is not None:
+        max_row = int(end_excel_row)
+    else:
+        max_row = sheet_max
+    if max_row < int(header_row_idx) + 2:
+        max_row = int(header_row_idx) + 2
+    # Prefer an explicit end bound; otherwise cap runaway sheet dimensions.
+    if end_excel_row is None:
+        max_row = min(max_row, int(header_row_idx) + 2 + 50000)
+    for excel_row in range(int(header_row_idx) + 2, max_row + 1):
+        row = [
+            worksheet.cell(row=excel_row, column=column_index + 1)
+            for column_index in range(max_column)
+        ]
+        if code_col_idx >= len(row) or name_col_idx >= len(row):
+            continue
+        code_cell = row[code_col_idx]
+        name_cell = row[name_col_idx]
+        if not _excel_cell_is_blank(code_cell.value) or _excel_cell_is_formula(code_cell):
+            continue
+        name_value = name_cell.value
+        if _excel_cell_is_blank(name_value) or _excel_cell_is_formula(name_cell):
+            continue
+        if not _font_is_bold(name_cell.font):
+            continue
+        data_empty = True
+        for idx in data_col_indices:
+            if idx >= len(row):
+                continue
+            if not _excel_data_cell_is_empty(row[idx]):
+                data_empty = False
+                break
+        if not data_empty:
+            continue
+        name = str(name_value).strip()
+        key = normalize_category_key(name)
+        headings.append({"excel_row": int(excel_row), "name": name, "key": key})
+        if key:
+            seen_keys.add(key)
+    return headings
+
+
+def detect_category_headings_from_workbook(
+    excel_path: Path | str,
+    sheet_name: str,
+    header_row_idx: int,
+    header_values: Sequence[Any] | None = None,
+    *,
+    end_excel_row: int | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect openpyxl formatting/formulas before relying on DataFrame values."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as error:
+        raise RuntimeError("openpyxl is required to detect budget category headings.") from error
+    path = Path(excel_path)
+    workbook = load_workbook(path, read_only=False, data_only=False)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise KeyError(f"Worksheet {sheet_name!r} was not found in {path.name}.")
+        worksheet = workbook[sheet_name]
+        if header_values is None:
+            header_cells = next(
+                worksheet.iter_rows(
+                    min_row=int(header_row_idx) + 1,
+                    max_row=int(header_row_idx) + 1,
+                    values_only=True,
+                )
+            )
+            header_values = list(header_cells)
+        indices = resolve_header_column_indices(header_values)
+        code_col_idx = indices.get("ACT CODE")
+        name_col_idx = indices.get("ACT NAME")
+        if code_col_idx is None or name_col_idx is None:
+            # Upload aliases
+            code_col_idx = next(
+                (indices[key] for key in ("ACT CODE", "BUDGET CODE", "ACCOUNT CODE") if key in indices),
+                None,
+            )
+            name_col_idx = next(
+                (indices[key] for key in ("ACT NAME", "DESCRIPTION", "ACCOUNT NAME") if key in indices),
+                None,
+            )
+        if code_col_idx is None or name_col_idx is None:
+            return []
+        # Recompute skip using the resolved code/name labels actually present.
+        code_key = next(key for key, idx in indices.items() if idx == code_col_idx)
+        name_key = next(key for key, idx in indices.items() if idx == name_col_idx)
+        data_cols = data_column_indices_from_headers(
+            header_values,
+            code_key=code_key,
+            name_key=name_key,
+        )
+        return detect_category_headings_from_worksheet(
+            worksheet,
+            header_row_idx=int(header_row_idx),
+            code_col_idx=int(code_col_idx),
+            name_col_idx=int(name_col_idx),
+            data_col_indices=data_cols,
+            end_excel_row=end_excel_row,
+        )
+    finally:
+        workbook.close()
+
+
+def category_order_from_headings(headings: Sequence[dict[str, Any]] | Sequence[str]) -> list[str]:
+    """Preserve first-seen workbook order; drop blank/duplicate labels."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in headings:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item or "").strip()
+        key = normalize_category_key(name)
+        if not name or not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(name)
+    return ordered
+
+
+def sort_categories_by_order(names: Sequence[str], category_order: Sequence[str] | None = None) -> list[str]:
+    """Order discovered names by workbook/master order; unknowns keep relative discovery order."""
+    order_keys = {
+        normalize_category_key(name): index
+        for index, name in enumerate(category_order or ())
+        if normalize_category_key(name)
+    }
+    ranked: list[tuple[int, int, str]] = []
+    for discovery_index, name in enumerate(names):
+        text = str(name or "").strip()
+        if not text:
+            continue
+        key = normalize_category_key(text)
+        if key in order_keys:
+            ranked.append((0, order_keys[key], text))
+        else:
+            ranked.append((1, discovery_index, text))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked]
+
+
+def assign_categories(
+    df,
+    account_code_col,
+    account_name_col,
+    *,
+    category_heading_excel_rows: Sequence[int] | None = None,
+    category_heading_mask: pd.Series | None = None,
+):
+    """
+    Assign categories from workbook heading rows.
+
+    When Excel heading rows are provided (preferred), only those rows start categories.
+    Notes/summaries without heading markers do not interrupt the current category.
+    Without heading markers, no blank-code row is treated as a category heading.
+    """
     cleaned_code = df[account_code_col].map(clean_account_code)
     numeric_account_code = pd.to_numeric(df[account_code_col], errors="coerce")
     account_name = df[account_name_col].astype("string").str.strip()
-    is_category_row = cleaned_code.isna() & account_name.notna() & account_name.ne("")
+    if category_heading_mask is not None:
+        is_category_row = category_heading_mask.reindex(df.index).fillna(False).astype(bool)
+    elif category_heading_excel_rows is not None:
+        heading_rows = {int(row) for row in category_heading_excel_rows}
+        if "_source_row" in df.columns:
+            is_category_row = df["_source_row"].map(lambda value: int(value) in heading_rows if pd.notna(value) else False)
+        else:
+            is_category_row = pd.Series(False, index=df.index)
+    elif "is_category_row" in df.columns:
+        is_category_row = df["is_category_row"].fillna(False).astype(bool)
+    else:
+        is_category_row = pd.Series(False, index=df.index)
+    is_category_row = (
+        is_category_row
+        & cleaned_code.isna()
+        & account_name.notna()
+        & account_name.ne("")
+    )
     category = account_name.where(is_category_row).ffill()
     assigned = df.copy()
     assigned["category"] = category
@@ -691,6 +964,15 @@ def _load_original_excel(input_file: str):
     account_name_col = column_lookup["ACT NAME"]
     monthly_columns, month_dates = detect_monthly_columns(df.columns.tolist())
     excel_errors = _collect_excel_error_cells(excel_path, sheet_name, header_row_idx, monthly_columns)
+    category_headings = detect_category_headings_from_workbook(
+        excel_path,
+        sheet_name,
+        header_row_idx,
+        header_values=raw.iloc[header_row_idx].tolist(),
+        end_excel_row=int(header_row_idx) + 1 + len(df),
+    )
+    category_heading_excel_rows = [int(item["excel_row"]) for item in category_headings]
+    category_order = category_order_from_headings(category_headings)
 
     df[account_code_col] = df[account_code_col].map(clean_account_code)
     df[account_name_col] = df[account_name_col].map(
@@ -705,6 +987,9 @@ def _load_original_excel(input_file: str):
         "sheet_name": sheet_name,
         "header_row_idx": header_row_idx,
         "excel_errors": excel_errors,
+        "category_headings": category_headings,
+        "category_heading_excel_rows": category_heading_excel_rows,
+        "category_order": category_order,
     }
 
 
@@ -1310,7 +1595,12 @@ def preprocess_account_panel(
 
 
 def _collect_accounts(loaded) -> dict[str, Any]:
-    df = assign_categories(loaded["df"], loaded["account_code_col"], loaded["account_name_col"])
+    df = assign_categories(
+        loaded["df"],
+        loaded["account_code_col"],
+        loaded["account_name_col"],
+        category_heading_excel_rows=loaded.get("category_heading_excel_rows"),
+    )
     account_code_col = loaded["account_code_col"]
     account_name_col = loaded["account_name_col"]
     monthly_columns = loaded["monthly_columns"]

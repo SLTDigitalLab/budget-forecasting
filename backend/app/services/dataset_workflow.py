@@ -128,6 +128,11 @@ def next_master_state(state: dict[str, Any], changes: list[dict[str, Any]] | Non
             merge_budget_codes(state.get("budget_codes"), applied, next_records),
             applied,
         ),
+        "category_order": [
+            str(item).strip()
+            for item in (state.get("category_order") or [])
+            if str(item or "").strip()
+        ],
         "earliest_month": earliest,
         "latest_month": latest,
         "source": state.get("source"),

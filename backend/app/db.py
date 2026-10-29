@@ -261,6 +261,9 @@ SCHEMA_STATEMENTS = (
     ALTER TABLE dataset_master_meta ADD COLUMN IF NOT EXISTS budget_codes JSONB NOT NULL DEFAULT '[]'::jsonb
     """,
     """
+    ALTER TABLE dataset_master_meta ADD COLUMN IF NOT EXISTS category_order JSONB NOT NULL DEFAULT '[]'::jsonb
+    """,
+    """
     CREATE TABLE IF NOT EXISTS system_coordination (
         id INTEGER PRIMARY KEY,
         retrain_job_id TEXT,

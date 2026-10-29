@@ -77,7 +77,10 @@ from evaluation import ARIMA_FAMILY, inspect_arima_stability  # noqa: E402
 from preprocessing import (  # noqa: E402
     BookEntryConfigurationError,
     book_entry_account_codes,
+    category_order_from_headings,
     effective_historical_actual,
+    normalize_category_key,
+    sort_categories_by_order,
 )
 from model_training import forecast_from_fitted  # noqa: E402
 
@@ -426,23 +429,70 @@ def _unavailable_record(code, account_name, category_name, status, reason, reaso
     }
 
 
+def _master_category_maps() -> tuple[list[str], dict[str, str]]:
+    """Current master category order and code→category mapping when available."""
+    order: list[str] = []
+    mapping: dict[str, str] = {}
+    try:
+        from app.services.dataset_master import load_master_state
+
+        state = load_master_state()
+        order = [str(item).strip() for item in (state.get("category_order") or []) if str(item or "").strip()]
+        mapping = {
+            str(item.get("budget_code")): str(item.get("category") or "").strip()
+            for item in (state.get("budget_codes") or [])
+            if item.get("budget_code") and str(item.get("category") or "").strip()
+        }
+        if not order and mapping:
+            order = category_order_from_headings(list(mapping.values()))
+        if order or mapping:
+            return order, mapping
+    except Exception:
+        pass
+    try:
+        from app.services.dataset_master import authoritative_workbook_path, master_identity_from_workbook_path
+
+        identity = master_identity_from_workbook_path(authoritative_workbook_path())
+        order = [str(item).strip() for item in (identity.get("category_order") or []) if str(item or "").strip()]
+        mapping = {
+            str(item.get("budget_code")): str(item.get("category") or "").strip()
+            for item in (identity.get("budget_codes") or [])
+            if item.get("budget_code") and str(item.get("category") or "").strip()
+        }
+        if not order and mapping:
+            order = category_order_from_headings(list(mapping.values()))
+        return order, mapping
+    except Exception:
+        return [], {}
+
+
 def list_forecast_categories(bundle: dict) -> dict:
-    """Discover categories from stored Budget Code metadata. Does not invent names."""
+    """
+    Categories for Generate Forecast.
+
+    Uses the current master catalog/order for labels when available, while restricting
+    forecastable membership to model-backed selected accounts (Book Entry exclusions
+    already applied by the artifact). Master-only categories with no model-backed
+    accounts are returned as unavailable — not omitted and not invented as forecasts.
+    """
     selected = selected_account_codes(bundle)
     names = _account_name_map(bundle)
-    seen: list[str] = []
+    master_order, master_map = _master_category_maps()
     counts: dict[str, int] = {}
+    label_by_key: dict[str, str] = {}
     missing: list[dict] = []
     accounts = []
     for code in selected:
         record = _account_record(bundle, code)
-        category = account_category(bundle, code)
+        pickle_category = account_category(bundle, code)
+        category = master_map.get(str(code)) or pickle_category
         status = production_status_of(record)
         if category:
-            if category not in counts:
-                seen.append(category)
-                counts[category] = 0
-            counts[category] += 1
+            key = normalize_category_key(category)
+            if key not in label_by_key:
+                label_by_key[key] = category
+                counts[key] = 0
+            counts[key] += 1
         else:
             missing.append({"budget_code": code, "account_name": names.get(code) or None})
         accounts.append({
@@ -451,11 +501,38 @@ def list_forecast_categories(bundle: dict) -> dict:
             "category": category or None,
             "production_status": status or None,
         })
+    discovered_labels = [label_by_key[key] for key in label_by_key]
+    ordered_labels = sort_categories_by_order(discovered_labels, master_order or discovered_labels)
+    # Preserve master-only categories in workbook/master order.
+    for name in master_order:
+        key = normalize_category_key(name)
+        if not key:
+            continue
+        if key not in label_by_key:
+            label_by_key[key] = name
+            counts[key] = 0
+            ordered_labels.append(name)
+    ordered_labels = sort_categories_by_order(ordered_labels, master_order or ordered_labels)
+    categories = []
+    for name in ordered_labels:
+        key = normalize_category_key(name)
+        count = int(counts.get(key) or 0)
+        available = count > 0
+        categories.append(
+            {
+                "id": name,
+                "name": name,
+                "budget_code_count": count,
+                "available": available,
+                "unavailable_reason": (
+                    None
+                    if available
+                    else "No trained model-backed budget codes are available in this category yet."
+                ),
+            }
+        )
     return {
-        "categories": [
-            {"id": name, "name": name, "budget_code_count": counts[name]}
-            for name in seen
-        ],
+        "categories": categories,
         "missing_category_codes": missing,
         "accounts": accounts,
     }
@@ -466,9 +543,19 @@ def accounts_for_category(bundle: dict, category: str | None = None) -> list[str
     if is_all_categories(category):
         return selected
     requested = str(category).strip()
-    matched = [code for code in selected if _categories_match(account_category(bundle, code), requested)]
+    _order, master_map = _master_category_maps()
+
+    def resolved_category(code: str) -> str:
+        return master_map.get(str(code)) or account_category(bundle, code)
+
+    matched = [code for code in selected if _categories_match(resolved_category(code), requested)]
     if matched:
         return matched
+    # Master category with no model-backed accounts: explicit empty scope error.
+    if master_map and any(_categories_match(name, requested) for name in (_order or master_map.values())):
+        raise ForecastingError(
+            f"Requested category {category!r} has no trained model-backed accounts in the loaded artifact."
+        )
     bundle_category = str(bundle.get("category") or "").strip()
     if bundle_category and _categories_match(bundle_category, requested) and bundle_category.casefold() not in {"all", "*"}:
         return selected

@@ -71,23 +71,36 @@ def historical_summary() -> dict[str, Any]:
 
 def load_master_identity() -> dict[str, Any]:
     """Budget-code catalog and month range stored beside the numeric actuals."""
-    empty = {"budget_codes": [], "earliest_month": None, "latest_month": None}
+    empty = {"budget_codes": [], "category_order": [], "earliest_month": None, "latest_month": None}
     try:
         with get_connection() as connection:
-            row = connection.execute(
-                """
-                SELECT earliest_month, latest_month, budget_codes
-                FROM dataset_master_meta
-                WHERE id = 1
-                """
-            ).fetchone()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT earliest_month, latest_month, budget_codes, category_order
+                    FROM dataset_master_meta
+                    WHERE id = 1
+                    """
+                ).fetchone()
+            except psycopg.Error:
+                row = connection.execute(
+                    """
+                    SELECT earliest_month, latest_month, budget_codes
+                    FROM dataset_master_meta
+                    WHERE id = 1
+                    """
+                ).fetchone()
         if not row:
             return empty
         codes = row["budget_codes"] or []
         if isinstance(codes, str):
             codes = []
+        order = row.get("category_order") or []
+        if isinstance(order, str):
+            order = []
         return {
             "budget_codes": [dict(item) for item in codes if isinstance(item, dict)],
+            "category_order": [str(item).strip() for item in order if str(item or "").strip()],
             "earliest_month": row["earliest_month"],
             "latest_month": row["latest_month"],
         }
@@ -570,6 +583,7 @@ def commit_master_state(
     file_status_update: dict[str, Any] | None = None,
     reversed_change_ids: list[int] | None = None,
     budget_codes: list[dict[str, Any]] | None = None,
+    category_order: list[str] | None = None,
     earliest_month: str | None = None,
     latest_month: str | None = None,
     declarations: list[dict[str, Any]] | None = None,
@@ -739,6 +753,7 @@ def commit_master_state(
                         """
                         UPDATE dataset_master_meta
                         SET budget_codes = %s,
+                            category_order = %s,
                             earliest_month = %s,
                             latest_month = %s
                         WHERE id = 1
@@ -757,8 +772,28 @@ def commit_master_state(
                                     if item.get("budget_code")
                                 ]
                             ),
+                            Jsonb(
+                                [
+                                    str(item).strip()
+                                    for item in (category_order or [])
+                                    if str(item or "").strip()
+                                ]
+                            ),
                             earliest_month,
                             latest_month,
+                        ),
+                    )
+                elif category_order is not None:
+                    connection.execute(
+                        """
+                        UPDATE dataset_master_meta
+                        SET category_order = %s
+                        WHERE id = 1
+                        """,
+                        (
+                            Jsonb(
+                                [str(item).strip() for item in category_order if str(item or "").strip()]
+                            ),
                         ),
                     )
                 if confirmation and confirmation.get("preview_id"):

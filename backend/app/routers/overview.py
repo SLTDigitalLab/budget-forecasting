@@ -33,8 +33,10 @@ from preprocessing import (  # noqa: E402
     ACTUALS_DISPLAY_LABEL,
     _load_original_excel,
     assign_categories,
+    category_order_from_headings,
     detect_monthly_columns,
     normalize_historical_actuals,
+    sort_categories_by_order,
 )
 
 DEFAULT_CATEGORY_ID = "international_settlement"
@@ -411,30 +413,79 @@ def _load_workbook() -> dict:
     if not actuals_path.exists():
         raise OverviewDataError(f"Historical Actuals workbook was not found: {actuals_path}")
     loaded = _load_original_excel(str(actuals_path))
-    assigned = assign_categories(loaded["df"], loaded["account_code_col"], loaded["account_name_col"])
+    assigned = assign_categories(
+        loaded["df"],
+        loaded["account_code_col"],
+        loaded["account_name_col"],
+        category_heading_excel_rows=loaded.get("category_heading_excel_rows"),
+    )
     monthly_columns, month_dates = detect_monthly_columns(assigned.columns.tolist())
     _workbook = {
         **loaded,
         "assigned": assigned,
         "monthly_columns": list(monthly_columns),
         "month_dates": [pd.Timestamp(item).replace(day=1) for item in month_dates],
+        "category_order": list(loaded.get("category_order") or []),
     }
     return _workbook
+
+
+def _master_category_catalog() -> tuple[list[str], dict[str, str]]:
+    """Return (category_order, code->category) from the current master when available."""
+    try:
+        from app.services.dataset_master import load_master_state
+
+        state = load_master_state()
+        order = [str(item).strip() for item in (state.get("category_order") or []) if str(item or "").strip()]
+        mapping = {
+            str(item.get("budget_code")): str(item.get("category") or "").strip()
+            for item in (state.get("budget_codes") or [])
+            if item.get("budget_code") and str(item.get("category") or "").strip()
+        }
+        if not order:
+            order = category_order_from_headings(list(mapping.values()))
+        return order, mapping
+    except Exception:
+        return [], {}
 
 
 def _list_categories() -> dict:
     global _categories
     if _categories is None:
-        assigned = _load_workbook()["assigned"]
-        names = []
+        workbook = _load_workbook()
+        assigned = workbook["assigned"]
         seen = set()
+        source_names: list[str] = []
         for raw in assigned.loc[~assigned["is_category_row"], "category"].dropna():
             name = str(raw).strip()
+            if not name:
+                continue
             ident = _category_slug(name)
-            if not name or ident in seen:
+            if ident in seen:
                 continue
             seen.add(ident)
-            names.append({"id": ident, "name": _display_category_name(name), "source_name": name})
+            source_names.append(name)
+        master_order, _mapping = _master_category_catalog()
+        workbook_order = list(workbook.get("category_order") or [])
+        ordered_sources = sort_categories_by_order(
+            source_names,
+            master_order or workbook_order or category_order_from_headings(source_names),
+        )
+        # Include master-only categories (no current numeric rows) in workbook/master order.
+        for name in master_order or []:
+            ident = _category_slug(name)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            ordered_sources.append(name)
+        ordered_sources = sort_categories_by_order(
+            ordered_sources,
+            master_order or workbook_order or ordered_sources,
+        )
+        names = [
+            {"id": _category_slug(name), "name": _display_category_name(name), "source_name": name}
+            for name in ordered_sources
+        ]
         if not names:
             raise OverviewDataError("No categories were found in the historical Actuals workbook.")
         _categories = names
