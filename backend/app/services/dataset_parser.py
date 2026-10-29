@@ -8,6 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 
@@ -27,7 +28,9 @@ from preprocessing import (  # noqa: E402
     KIND_MISSING,
     KIND_NUMBER,
     assign_categories,
+    category_order_from_headings,
     clean_account_code,
+    detect_category_headings_from_workbook,
     is_excluded_actuals_column,
     label_key,
     normalize_label,
@@ -423,19 +426,42 @@ def parse_historical_dataset(
     omitted_formula_cells = 0
 
     working = df.copy()
+    working["_source_row"] = np.arange(header_row_idx + 2, header_row_idx + 2 + len(working))
     working[code_col] = working[code_col].map(clean_account_code)
     working[name_col] = working[name_col].map(
         lambda value: "" if _is_blank(value) else str(value).strip()
     )
-    if category_col:
+    category_headings: list[dict] = []
+    category_order: list[str] = []
+    if loaded["kind"] == "xlsx":
+        category_headings = detect_category_headings_from_workbook(
+            path,
+            sheet,
+            header_row_idx,
+            header_values=raw.iloc[header_row_idx].tolist(),
+            end_excel_row=int(header_row_idx) + 1 + len(working),
+        )
+        category_order = category_order_from_headings(category_headings)
+        assigned = assign_categories(
+            working,
+            code_col,
+            name_col,
+            category_heading_excel_rows=[int(item["excel_row"]) for item in category_headings],
+        )
+        working = assigned
+        working["category"] = working["category"].fillna("").astype(str).str.strip()
+    elif category_col:
+        # CSV/text uploads cannot expose bold headings; use an explicit Category column only.
         working["category"] = working[category_col].map(
             lambda value: "" if _is_blank(value) else str(value).strip()
         )
         working["is_category_row"] = False
+        category_order = category_order_from_headings(
+            [value for value in working["category"].tolist() if str(value or "").strip()]
+        )
     else:
-        assigned = assign_categories(working, code_col, name_col)
-        working = assigned
-        working["category"] = working["category"].fillna("").astype(str).str.strip()
+        working["category"] = ""
+        working["is_category_row"] = False
 
     parsed_rows: list[dict] = []
     codes_to_rows: dict[str, list[int]] = defaultdict(list)
@@ -599,6 +625,10 @@ def parse_historical_dataset(
     ]
 
     blocking = [item for item in errors if item.get("message")]
+    if not category_order:
+        category_order = category_order_from_headings(
+            [str(row.get("category") or "").strip() for row in parsed_rows]
+        )
     return {
         "ok": not blocking,
         "needs_sheet_selection": False,
@@ -617,4 +647,9 @@ def parse_historical_dataset(
         "name_column": name_col,
         "category_column": category_col,
         "month_columns": month_columns,
+        "category_headings": [
+            {"name": item.get("name"), "excel_row": item.get("excel_row")}
+            for item in category_headings
+        ],
+        "category_order": category_order,
     }

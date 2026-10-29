@@ -129,6 +129,8 @@ class ForecastCategoryItem(BaseModel):
     id: str
     name: str
     budget_code_count: int = 0
+    available: bool = True
+    unavailable_reason: Optional[str] = None
 
 
 class AccountListResponse(BaseModel):

@@ -99,10 +99,20 @@ def load_master_state() -> dict:
             earliest = numeric_months[0]
         if not latest and numeric_months:
             latest = numeric_months[-1]
+        codes = merge_budget_codes(identity["budget_codes"], [], stored)
+        order = list(identity.get("category_order") or [])
+        if not order:
+            _import_engine()
+            from preprocessing import category_order_from_headings
+
+            order = category_order_from_headings(
+                [str(item.get("category") or "") for item in codes]
+            )
         return {
             "records": stored,
             "declarations": list_declarations(),
-            "budget_codes": merge_budget_codes(identity["budget_codes"], [], stored),
+            "budget_codes": codes,
+            "category_order": order,
             "earliest_month": earliest,
             "latest_month": latest,
             "version": version,
@@ -119,14 +129,26 @@ def master_identity_from_workbook_path(path: Path) -> dict:
 
     loaded = _load_original_excel(str(path))
     collected = _collect_accounts(loaded)
-    assigned = assign_categories(loaded["df"], loaded["account_code_col"], loaded["account_name_col"])
+    assigned = assign_categories(
+        loaded["df"],
+        loaded["account_code_col"],
+        loaded["account_name_col"],
+        category_heading_excel_rows=loaded.get("category_heading_excel_rows"),
+    )
     accounts = assigned[(~assigned["is_category_row"].fillna(False)) & assigned[loaded["account_code_col"]].notna()]
     metadata = collected["metadata"]
+    category_order = list(loaded.get("category_order") or [])
     codes = []
-    for code in collected["raw_matrix"].index.tolist():
+    seen_codes: set[str] = set()
+    # Preserve workbook account order for stable category discovery downstream.
+    for _, row in accounts.iterrows():
+        code = str(row.get("cleaned_account_code") or row.get(loaded["account_code_col"]) or "").strip()
+        if not code or code.lower() == "nan" or code in seen_codes:
+            continue
+        seen_codes.add(code)
         meta = metadata.loc[str(code)] if str(code) in metadata.index else None
         description = "" if meta is None else str(meta.get("account_name") or "")
-        category = "" if meta is None else str(meta.get("category") or "")
+        category = str(row.get("category") or ("" if meta is None else meta.get("category") or "")).strip()
         if description.lower() == "nan":
             description = ""
         if category.lower() == "nan":
@@ -160,6 +182,7 @@ def master_identity_from_workbook_path(path: Path) -> dict:
         "records": records,
         "declarations": [],
         "budget_codes": codes,
+        "category_order": category_order,
         "earliest_month": months[0],
         "latest_month": months[-1],
     }
@@ -223,6 +246,7 @@ def export_training_snapshot(
     records: list[dict],
     *,
     budget_codes: list[dict] | None = None,
+    category_order: list[str] | None = None,
     earliest_month: str | None = None,
     latest_month: str | None = None,
     declarations: list[dict] | None = None,
@@ -232,6 +256,7 @@ def export_training_snapshot(
         temp = prepare_managed_master(
             records,
             budget_codes=budget_codes,
+            category_order=category_order,
             earliest_month=earliest_month,
             latest_month=latest_month,
             declarations=declarations,
@@ -254,6 +279,7 @@ def prepare_managed_master(
     records: list[dict],
     *,
     budget_codes: list[dict] | None = None,
+    category_order: list[str] | None = None,
     earliest_month: str | None = None,
     latest_month: str | None = None,
     declarations: list[dict] | None = None,
@@ -317,15 +343,29 @@ def prepare_managed_master(
     worksheet.title = "Historical Actuals"
     headers = ["ACT CODE", "ACT NAME", "Category", *[actuals_header_for_month(month) for month in ordered_months]]
     worksheet.append(headers)
+    from openpyxl.styles import Font
+
+    _import_engine()
+    from preprocessing import category_order_from_headings, sort_categories_by_order
+
     by_category: dict[str, list[str]] = {}
     for code in sorted(grouped):
         by_category.setdefault(str(grouped[code]["category"] or ""), []).append(code)
+    discovered = category_order_from_headings([name for name in by_category if name])
+    ordered_categories = sort_categories_by_order(discovered, category_order)
+    # Keep uncategorized accounts last, without inventing a heading.
+    if "" in by_category:
+        ordered_categories = [*ordered_categories, ""]
+    heading_font = Font(bold=True)
     category_headers = 0
-    for category in sorted(by_category):
+    for category in ordered_categories:
         if category:
             category_headers += 1
-            worksheet.append([None, category, category, *([None] * len(ordered_months))])
-        for code in by_category[category]:
+            # Heading format: blank ACT CODE, bold ACT NAME, empty Category + actuals cells.
+            worksheet.append([None, category, None, *([None] * len(ordered_months))])
+            name_cell = worksheet.cell(worksheet.max_row, 2)
+            name_cell.font = heading_font
+        for code in by_category.get(category, []):
             bucket = grouped[code]
             worksheet.append(
                 [
@@ -454,7 +494,12 @@ def extract_original_baseline(path: Path) -> dict:
     )
 
     loaded = _load_original_excel(str(path))
-    assigned = assign_categories(loaded["df"], loaded["account_code_col"], loaded["account_name_col"])
+    assigned = assign_categories(
+        loaded["df"],
+        loaded["account_code_col"],
+        loaded["account_name_col"],
+        category_heading_excel_rows=loaded.get("category_heading_excel_rows"),
+    )
     header_row = loaded["header_row_idx"] + 1
 
     def _sheet_rows(data_only: bool) -> tuple[list, list]:

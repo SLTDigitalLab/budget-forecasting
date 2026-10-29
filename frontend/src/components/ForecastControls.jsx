@@ -220,15 +220,22 @@ export default function ForecastControls() {
               disabled={categoriesLoading}
             >
               {categories.map((item) => (
-                <option key={item.id} value={item.id}>
+                <option key={item.id} value={item.id} disabled={item.available === false}>
                   {forecastCategoryOptionLabel(item)}
                 </option>
               ))}
             </select>
           </div>
           <p id={categoryHelpId} className="generate-category-help">
-            Forecast every trained Budget Code, or choose one discovered category.
+            Forecast every trained Budget Code, or choose one master category with trained codes.
+            Categories without model-backed codes are listed as unavailable.
           </p>
+          {selectedCategory && selectedCategory.available === false ? (
+            <p className="validation generate-inline-validation" role="status">
+              {selectedCategory.unavailable_reason
+                || "No trained model-backed budget codes are available in this category yet."}
+            </p>
+          ) : null}
           {categoryError || categoriesLoadError ? (
             <p id={categoryErrorId} className="validation generate-inline-validation" role="alert">
               {categoryError || categoriesLoadError}

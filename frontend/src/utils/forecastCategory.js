@@ -47,6 +47,9 @@ export function isForecastableCategory(category) {
   if (typeof category !== "object") {
     return Boolean(String(category).trim());
   }
+  if (category.available === false) {
+    return false;
+  }
   return Boolean(String(category.id || category.name || category.source_name || "").trim());
 }
 
@@ -54,7 +57,11 @@ export function forecastCategoryOptionLabel(category) {
   if (isAllCategories(category)) {
     return ALL_CATEGORIES_LABEL;
   }
-  return String(category?.name || category?.source_name || category?.id || "").trim() || "Category";
+  const name = String(category?.name || category?.source_name || category?.id || "").trim() || "Category";
+  if (category && typeof category === "object" && category.available === false) {
+    return `${name} (unavailable)`;
+  }
+  return name;
 }
 
 export function requestCategoryValue(category) {
@@ -81,12 +88,14 @@ export function withAllCategoriesOption(categories = []) {
         id: String(item.id || name),
         name,
         budget_code_count: Number(item.budget_code_count) || 0,
+        available: item.available !== false,
+        unavailable_reason: item.unavailable_reason || "",
       };
     })
     .filter(Boolean)
     .filter((item) => !isAllCategories(item));
   return [
-    { id: ALL_CATEGORIES_ID, name: ALL_CATEGORIES_LABEL, budget_code_count: 0 },
+    { id: ALL_CATEGORIES_ID, name: ALL_CATEGORIES_LABEL, budget_code_count: 0, available: true },
     ...discovered,
   ];
 }

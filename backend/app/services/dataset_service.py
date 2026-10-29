@@ -123,6 +123,8 @@ def _preview_payload(parsed: dict[str, Any], classification: dict[str, Any] | No
         "duplicate_codes": parsed.get("duplicate_codes") or [],
         "months": parsed.get("months") or [],
         "rows": parsed.get("rows") or [],
+        "category_order": list(parsed.get("category_order") or []),
+        "category_headings": list(parsed.get("category_headings") or []),
         "can_confirm": bool(parsed.get("can_confirm")),
         "new_count": 0,
         "changed_count": 0,
@@ -313,6 +315,13 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
     stored_filename = stored_name(file_id, preview["original_filename"])
     now = _utc_now()
     next_state = next_master_state(state, analysis["changes"])
+    uploaded_order = [
+        str(item).strip()
+        for item in (payload.get("category_order") or [])
+        if str(item or "").strip()
+    ]
+    if uploaded_order:
+        next_state["category_order"] = uploaded_order
     from app.services.submission_state import MasterTransitionError, assert_transition_preserves_master
 
     try:
@@ -458,6 +467,7 @@ def _public_analysis(analysis: dict[str, Any], errors: list[dict[str, Any]]) -> 
 def _identity_kwargs(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "budget_codes": state.get("budget_codes") or [],
+        "category_order": list(state.get("category_order") or []),
         "earliest_month": state.get("earliest_month"),
         "latest_month": state.get("latest_month"),
         "declarations": list(state.get("declarations") or []),
@@ -468,6 +478,7 @@ def _prepare_from_state(state: dict[str, Any]):
     return prepare_managed_master(
         state.get("records") or [],
         budget_codes=state.get("budget_codes") or [],
+        category_order=list(state.get("category_order") or []),
         earliest_month=state.get("earliest_month"),
         latest_month=state.get("latest_month"),
         declarations=state.get("declarations") or [],
