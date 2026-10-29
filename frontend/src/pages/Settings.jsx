@@ -23,6 +23,7 @@ import {
 } from "../api/datasetApi";
 import { claimReturnedActionToken, consumeSettingsActionResume, jsonSafeData, requestSettingsAction, subscribeActionPrompt, takeActionFailure, takeReturnedActionExpiry } from "../auth/actionAuthentication";
 import { getModelStatus, startRetrain } from "../api/retrainApi";
+import ActivityLogPanel from "../components/ActivityLogPanel";
 import { MasterSection, PreviewWorkspace, RevisionDetail, RollbackDialog } from "../components/HistoricalDataPanels";
 import SummaryCard from "../components/SummaryCard";
 import { formatHistoryPeriod } from "../utils/historyPeriod";
@@ -41,6 +42,12 @@ import {
 import { confirmDatasetPayload, isAuthorizationCancellation } from "../utils/settingsActions";
 
 const BOOK_ENTRY_REMOVAL_WARNING = "Removing this account will make it eligible for forecasting again, subject to model and historical data availability.";
+
+const SETTINGS_TABS = [
+  { id: "data-management", label: "Data Management" },
+  { id: "revision-history", label: "Revision History" },
+  { id: "activity-log", label: "Activity Log" },
+];
 
 function BookEntrySection({ protect, setError, setNotice, actionPending, actionsRef }) {
   const [entries, setEntries] = useState({ count: 0, accounts: [], categories: [] });
@@ -529,6 +536,7 @@ export default function Settings() {
   const [rollbackReview, setRollbackReview] = useState(null);
   const [reviewingRollback, setReviewingRollback] = useState(false);
   const [actionPending, setActionPending] = useState(false);
+  const [activeTab, setActiveTab] = useState("data-management");
   const [fileAuth, setFileAuth] = useState(initialFileSelection);
   const fileAuthRef = useRef(fileAuth);
   const previewRef = useRef(null);
@@ -666,6 +674,8 @@ export default function Settings() {
       "add-book-entry",
       "edit-book-entry",
       "delete-book-entry",
+      "view-revision",
+      "download-revision",
     ]));
     if (!outcome || outcome.mode === "drop") {
       return;
@@ -1053,14 +1063,35 @@ export default function Settings() {
     }
   }
 
-  async function openView(record) {
+  function openView(record) {
     setError("");
-    try {
-      const payload = await viewRevision(record.id);
-      setViewer(payload);
-    } catch (cause) {
-      setError(cause.message || "Unable to open the saved file.");
-    }
+    return protect("view-revision", { revisionId: record.id }, async (token) => {
+      try {
+        const payload = await viewRevision(record.id, token);
+        setViewer(payload);
+        return true;
+      } catch (cause) {
+        setError(cause.message || "Unable to open the saved file.");
+        return false;
+      }
+    });
+  }
+
+  function downloadRevision(record) {
+    setError("");
+    return protect(
+      "download-revision",
+      { revisionId: record.id, fileName: record.file_name || "" },
+      async (token) => {
+        try {
+          await downloadDatasetFile(record.id, record.file_name, token);
+          return true;
+        } catch (cause) {
+          setError(cause.message || "Unable to download the saved file.");
+          return false;
+        }
+      },
+    );
   }
 
   async function refreshMaster(page = 1, filter = masterFilter, highlight = masterHighlight, options = {}) {
@@ -1428,6 +1459,12 @@ export default function Settings() {
     if (resume.kind === "delete-book-entry") {
       return bookEntryActions.current.beginDelete?.(payload);
     }
+    if (resume.kind === "view-revision") {
+      return openView({ id: payload.revisionId });
+    }
+    if (resume.kind === "download-revision") {
+      return downloadRevision({ id: payload.revisionId, file_name: payload.fileName });
+    }
     claimReturnedActionToken();
     return Promise.resolve(false);
   }
@@ -1456,6 +1493,34 @@ export default function Settings() {
         </p>
       ) : null}
 
+      <div className="analytics-toolbar settings-toolbar">
+        <div className="analytics-toolbar-tabs">
+          <div className="analytics-tabs" role="tablist" aria-label="Settings views">
+            {SETTINGS_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                id={`settings-tab-${tab.id}`}
+                aria-selected={activeTab === tab.id}
+                aria-controls={`settings-panel-${tab.id}`}
+                className={activeTab === tab.id ? "active" : ""}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div
+        className="analytics-tab-panel settings-tab-panel"
+        role="tabpanel"
+        id="settings-panel-data-management"
+        aria-labelledby="settings-tab-data-management"
+        hidden={activeTab !== "data-management"}
+      >
       <article className="card section-card">
         <h2>Current Data Summary</h2>
         {loading ? <p className="settings-loading">Loading historical data…</p> : null}
@@ -1629,7 +1694,15 @@ export default function Settings() {
           Retrain Models
         </button>
       </article>
+      </div>
 
+      <div
+        className="analytics-tab-panel settings-tab-panel"
+        role="tabpanel"
+        id="settings-panel-revision-history"
+        aria-labelledby="settings-tab-revision-history"
+        hidden={activeTab !== "revision-history"}
+      >
       <article className="card section-card">
         <h2>Revision History</h2>
         {loadFailed ? (
@@ -1677,9 +1750,7 @@ export default function Settings() {
                         <button
                           type="button"
                           className="export-button-secondary"
-                          onClick={() =>
-                            downloadDatasetFile(record.id, record.file_name).catch((cause) => setError(cause.message))
-                          }
+                          onClick={() => downloadRevision(record)}
                         >
                           Download
                         </button>
@@ -1705,6 +1776,17 @@ export default function Settings() {
           </div>
         ) : null}
       </article>
+      </div>
+
+      <div
+        className="analytics-tab-panel settings-tab-panel"
+        role="tabpanel"
+        id="settings-panel-activity-log"
+        aria-labelledby="settings-tab-activity-log"
+        hidden={activeTab !== "activity-log"}
+      >
+        <ActivityLogPanel active={activeTab === "activity-log"} />
+      </div>
 
       {viewer ? <RevisionDetail detail={viewer} onClose={() => setViewer(null)} /> : null}
       {rollbackTarget ? (

@@ -1,3 +1,5 @@
+import { addMonths } from "./months.js";
+
 const MONTH_LABELS = [
   "Jan",
   "Feb",
@@ -12,6 +14,9 @@ const MONTH_LABELS = [
   "Nov",
   "Dec",
 ];
+
+export const HISTORY_RANGE_LAST_24 = "last24";
+export const HISTORY_RANGE_ALL = "all";
 
 function isIsoMonth(value) {
   return /^\d{4}-\d{2}$/.test(String(value || ""));
@@ -46,21 +51,15 @@ function monthIndex(year, month) {
 }
 
 /**
- * Resolve the Historical Budget Analysis display window from the latest stored
- * historical month (not the system clock).
- *
- * - December latest → start January of the previous year
- * - Otherwise → start January two years before the latest year
- * - End at the latest stored month
- * - Clamp to available history when less data exists
+ * Last 24 months ending at the latest stored actual month (not today's date).
+ * Example: latest Sep 2026 → Oct 2024 – Sep 2026.
  */
-export function resolveHistoricalDisplayWindow(latestIsoMonth, historyStartIso) {
+export function resolveLast24MonthsWindow(latestIsoMonth, historyStartIso) {
   const latest = parseIsoMonth(latestIsoMonth);
   if (!latest) {
     return null;
   }
-  const startYear = latest.month === 12 ? latest.year - 1 : latest.year - 2;
-  let startIso = `${startYear}-01`;
+  let startIso = addMonths(latest.iso, -23);
   const availableStart = parseIsoMonth(historyStartIso);
   if (availableStart && startIso < availableStart.iso) {
     startIso = availableStart.iso;
@@ -74,7 +73,43 @@ export function resolveHistoricalDisplayWindow(latestIsoMonth, historyStartIso) 
     startYear: parseIsoMonth(startIso).year,
     endYear: latest.year,
     endMonth: latest.month,
+    mode: HISTORY_RANGE_LAST_24,
   };
+}
+
+/**
+ * Full available history for the selected category/code.
+ */
+export function resolveAllHistoryWindow(latestIsoMonth, historyStartIso) {
+  const latest = parseIsoMonth(latestIsoMonth);
+  if (!latest) {
+    return null;
+  }
+  const availableStart = parseIsoMonth(historyStartIso);
+  const startIso = availableStart && availableStart.iso <= latest.iso ? availableStart.iso : latest.iso;
+  return {
+    startIso,
+    endIso: latest.iso,
+    startYear: parseIsoMonth(startIso).year,
+    endYear: latest.year,
+    endMonth: latest.month,
+    mode: HISTORY_RANGE_ALL,
+  };
+}
+
+/**
+ * Resolve a historical display window.
+ * Default mode is Last 24 months anchored on the latest stored actual month.
+ */
+export function resolveHistoricalDisplayWindow(
+  latestIsoMonth,
+  historyStartIso,
+  rangeMode = HISTORY_RANGE_LAST_24
+) {
+  if (rangeMode === HISTORY_RANGE_ALL) {
+    return resolveAllHistoryWindow(latestIsoMonth, historyStartIso);
+  }
+  return resolveLast24MonthsWindow(latestIsoMonth, historyStartIso);
 }
 
 export function countCalendarMonthsInWindow(window) {
@@ -94,6 +129,13 @@ export function formatHistoricalPeriodLabel(window) {
     return "Historical period: unavailable";
   }
   return `Historical period: ${longMonthLabel(window.startIso)} – ${longMonthLabel(window.endIso)}`;
+}
+
+export function formatDisplayedRangeLabel(window) {
+  if (!window?.startIso || !window?.endIso) {
+    return "Displayed range: unavailable";
+  }
+  return `Displayed range: ${longMonthLabel(window.startIso)} – ${longMonthLabel(window.endIso)}`;
 }
 
 export function filterMonthlyActualsToWindow(monthlyActuals, window) {
@@ -195,10 +237,10 @@ function completeTotalsFromMonthly(rows) {
 }
 
 /**
- * Build Historical Budget Analysis metrics for the auto display window.
+ * Build Historical Budget Analysis metrics for the selected display range.
  * Baseline months before the window are used only for YoY matching-month growth.
  */
-export function buildHistoricalDisplayAnalysis(history) {
+export function buildHistoricalDisplayAnalysis(history, { rangeMode = HISTORY_RANGE_LAST_24 } = {}) {
   if (!history) {
     return null;
   }
@@ -208,7 +250,7 @@ export function buildHistoricalDisplayAnalysis(history) {
     || (Array.isArray(history.monthly_actuals) && history.monthly_actuals.length
       ? history.monthly_actuals[history.monthly_actuals.length - 1].month
       : null);
-  const window = resolveHistoricalDisplayWindow(latestIso, history.history_start);
+  const window = resolveHistoricalDisplayWindow(latestIso, history.history_start, rangeMode);
   if (!window) {
     return null;
   }
@@ -235,7 +277,9 @@ export function buildHistoricalDisplayAnalysis(history) {
 
   return {
     window,
+    rangeMode: window.mode || rangeMode,
     periodLabel: formatHistoricalPeriodLabel(window),
+    displayedRangeLabel: formatDisplayedRangeLabel(window),
     calendarMonthCount: countCalendarMonthsInWindow(window),
     monthly_actuals: displayMonths,
     overall_total: overallTotal,
@@ -245,7 +289,7 @@ export function buildHistoricalDisplayAnalysis(history) {
     seasonal_profile: seasonalProfile,
     latest_year_growth_percent: latestYearGrowthPercent,
     // Budget-code recurring totals require per-code months; the analysis API
-    // already windows these with the same display rule.
+    // already windows these with the same display rule for the default range.
     budget_codes: Array.isArray(history.budget_codes) ? history.budget_codes : [],
     recurring_count: history.recurring_count,
     budget_code_count: history.budget_code_count,

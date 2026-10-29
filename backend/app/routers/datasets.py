@@ -2,16 +2,62 @@
 
 from __future__ import annotations
 
-import json
-
 from fastapi import APIRouter, File, Form, Header, Query, UploadFile
 from fastapi.responses import Response
 
 from app.services import dataset_service
-from app.services.action_audit import record_action
-from app.services.microsoft_auth import require_editor
+from app.services.action_audit import list_activity_events, record_action
+from app.services.microsoft_auth import describe_caller, require_editor
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
+
+
+def _edit_details(payload: dict | None, result: dict | None = None) -> dict:
+    body = payload or {}
+    edits = list(body.get("edits") or [])
+    compact = []
+    for item in edits[:40]:
+        if not isinstance(item, dict):
+            continue
+        compact.append(
+            {
+                "budget_code": item.get("budget_code"),
+                "month": item.get("month"),
+                "before": item.get("previous_amount", item.get("existing_amount", item.get("previous"))),
+                "after": item.get("new_amount", item.get("amount", item.get("new"))),
+                "operation": item.get("operation"),
+            }
+        )
+    details = {"edits": compact, "edit_count": len(edits)}
+    if isinstance(result, dict):
+        for key in ("inserted", "changed", "revision_id", "file_id", "revision", "message"):
+            if key in result and result.get(key) is not None:
+                details[key] = result.get(key)
+    return details
+
+
+def _book_entry_audit(actor, action: str, result: dict) -> None:
+    account = result.get("account") or {}
+    previous = result.get("previous")
+    new = result.get("new") or account
+    code = str((account or previous or new or {}).get("budget_code") or "")
+    record_action(
+        actor,
+        action,
+        "succeeded",
+        revision_id=code or None,
+        target=code or "book-entry",
+        details={"before": previous, "after": new, "budget_code": code},
+    )
+
+
+def _optional_actor(authorization: str | None):
+    if not authorization:
+        return None
+    try:
+        return describe_caller(authorization)
+    except Exception:
+        return None
 
 
 @router.get("/summary")
@@ -26,6 +72,16 @@ def dataset_editor_access(authorization: str | None = Header(default=None)) -> d
     return {"authorized": True, "object_id": actor.object_id}
 
 
+@router.get("/activity")
+def dataset_activity(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=50),
+    day: str | None = Query(default=None),
+) -> dict:
+    """Append-only Settings activity log. Newest first; day uses Asia/Colombo boundaries."""
+    return list_activity_events(page=page, page_size=page_size, day=day)
+
+
 @router.post("/preview")
 async def dataset_preview(
     file: UploadFile = File(...),
@@ -34,8 +90,21 @@ async def dataset_preview(
 ) -> dict:
     actor = require_editor(authorization)
     data = await file.read()
-    result = dataset_service.preview_upload(file.filename or "dataset.xlsx", data, sheet_name, actor)
-    record_action(actor, "dataset_preview", "succeeded")
+    filename = file.filename or "dataset.xlsx"
+    result = dataset_service.preview_upload(filename, data, sheet_name, actor)
+    record_action(
+        actor,
+        "dataset_preview",
+        "succeeded" if result.get("can_confirm") or result.get("needs_sheet_selection") else "failed",
+        target=filename,
+        details={
+            "filename": filename,
+            "sheet_name": sheet_name or result.get("selected_sheet"),
+            "needs_sheet_selection": bool(result.get("needs_sheet_selection")),
+            "can_confirm": bool(result.get("can_confirm")),
+            "preview_id": result.get("preview_id"),
+        },
+    )
     return result
 
 
@@ -45,7 +114,20 @@ def dataset_confirm(payload: dict | None = None, authorization: str | None = Hea
     body = payload or {}
     preview_id = str(body.get("preview_id") or "")
     result = dataset_service.confirm_upload(preview_id, body, actor)
-    record_action(actor, "dataset_confirm", "succeeded", revision_id=str(result.get("file_id") or preview_id))
+    file_id = str(result.get("file_id") or preview_id)
+    record_action(
+        actor,
+        "dataset_confirm",
+        "succeeded",
+        revision_id=file_id,
+        target=file_id,
+        details={
+            "preview_id": preview_id,
+            "inserted": result.get("inserted"),
+            "changed": result.get("changed"),
+            "message": result.get("message"),
+        },
+    )
     return result
 
 
@@ -59,7 +141,14 @@ def dataset_preview_confirmation(preview_id: str, authorization: str | None = He
 def dataset_stage(preview_id: str, payload: dict | None = None, authorization: str | None = Header(default=None)) -> dict:
     actor = require_editor(authorization)
     result = dataset_service.stage_upload(preview_id, payload or {})
-    record_action(actor, "dataset_stage", "succeeded", revision_id=preview_id)
+    record_action(
+        actor,
+        "dataset_stage",
+        "succeeded",
+        revision_id=preview_id,
+        target=preview_id,
+        details={"preview_id": preview_id},
+    )
     return result
 
 
@@ -77,16 +166,32 @@ def dataset_master(
 @router.post("/master/preview")
 def dataset_master_preview(payload: dict | None = None, authorization: str | None = Header(default=None)) -> dict:
     actor = require_editor(authorization)
-    result = dataset_service.preview_manual_edits(payload or {})
-    record_action(actor, "master_preview", "succeeded")
+    body = payload or {}
+    result = dataset_service.preview_manual_edits(body)
+    record_action(
+        actor,
+        "master_preview",
+        "succeeded",
+        target="historical-master",
+        details=_edit_details(body, result),
+    )
     return result
 
 
 @router.post("/master/confirm")
 def dataset_master_confirm(payload: dict | None = None, authorization: str | None = Header(default=None)) -> dict:
     actor = require_editor(authorization)
-    result = dataset_service.confirm_manual_edits(payload or {}, actor)
-    record_action(actor, "master_confirm", "succeeded", revision_id=str(result.get("revision_id") or ""))
+    body = payload or {}
+    result = dataset_service.confirm_manual_edits(body, actor)
+    revision_id = str(result.get("revision_id") or "")
+    record_action(
+        actor,
+        "master_confirm",
+        "succeeded",
+        revision_id=revision_id,
+        target=revision_id or "historical-master",
+        details=_edit_details(body, result),
+    )
     return result
 
 
@@ -99,23 +204,49 @@ def dataset_revisions(
 
 
 @router.get("/revisions/{revision_id}")
-def dataset_revision(revision_id: str) -> dict:
-    return dataset_service.view_revision(revision_id)
+def dataset_revision(revision_id: str, authorization: str | None = Header(default=None)) -> dict:
+    result = dataset_service.view_revision(revision_id)
+    actor = _optional_actor(authorization)
+    if actor is not None:
+        record_action(
+            actor,
+            "revision_view",
+            "succeeded",
+            revision_id=revision_id,
+            target=revision_id,
+            details={"file_name": (result.get("revision") or {}).get("file_name")},
+        )
+    return result
 
 
 @router.post("/revisions/{revision_id}/rollback/preview")
 def dataset_rollback_preview(revision_id: str, payload: dict | None = None, authorization: str | None = Header(default=None)) -> dict:
     actor = require_editor(authorization)
     result = dataset_service.preview_rollback(revision_id, payload or {})
-    record_action(actor, "rollback_preview", "succeeded", revision_id=revision_id)
+    record_action(
+        actor,
+        "rollback_preview",
+        "succeeded",
+        revision_id=revision_id,
+        target=revision_id,
+        details={"reason": (payload or {}).get("reason")},
+    )
     return result
 
 
 @router.post("/revisions/{revision_id}/rollback/confirm")
 def dataset_rollback_confirm(revision_id: str, payload: dict | None = None, authorization: str | None = Header(default=None)) -> dict:
     actor = require_editor(authorization)
-    result = dataset_service.confirm_rollback(revision_id, payload or {}, actor)
-    record_action(actor, "rollback_confirm", "succeeded", revision_id=revision_id)
+    body = payload or {}
+    result = dataset_service.confirm_rollback(revision_id, body, actor)
+    record_action(
+        actor,
+        "rollback_confirm",
+        "succeeded",
+        revision_id=revision_id,
+        target=revision_id,
+        details={"reason": body.get("reason"), "message": result.get("message") if isinstance(result, dict) else None},
+    )
     return result
 
 
@@ -133,8 +264,18 @@ def dataset_view(file_id: str, search: str | None = Query(default=None)) -> dict
 
 
 @router.get("/files/{file_id}/download")
-def dataset_download(file_id: str) -> Response:
+def dataset_download(file_id: str, authorization: str | None = Header(default=None)) -> Response:
     data, filename, content_type = dataset_service.download_file(file_id)
+    actor = _optional_actor(authorization)
+    if actor is not None:
+        record_action(
+            actor,
+            "revision_download",
+            "succeeded",
+            revision_id=file_id,
+            target=file_id,
+            details={"filename": filename, "bytes": len(data)},
+        )
     return Response(
         content=data,
         media_type=content_type,
@@ -146,24 +287,15 @@ def dataset_download(file_id: str) -> Response:
 def dataset_edits(file_id: str, payload: dict, authorization: str | None = Header(default=None)) -> dict:
     actor = require_editor(authorization)
     result = dataset_service.save_edits(file_id, payload, actor)
-    record_action(actor, "dataset_edit", "succeeded", revision_id=file_id)
-    return result
-
-
-def _book_entry_audit(actor, action: str, result: dict) -> None:
     record_action(
         actor,
-        action,
-        json.dumps(
-            {
-                "budget_code": (result.get("account") or result.get("previous") or {}).get("budget_code"),
-                "previous": result.get("previous"),
-                "new": result.get("new"),
-            },
-            default=str,
-        ),
-        revision_id=(result.get("account") or {}).get("budget_code"),
+        "dataset_edit",
+        "succeeded",
+        revision_id=file_id,
+        target=file_id,
+        details=_edit_details(payload, result),
     )
+    return result
 
 
 @router.get("/book-entries")

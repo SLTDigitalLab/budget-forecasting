@@ -20,6 +20,7 @@ import {
   formatAmount,
   formatAxisTick,
   formatPercentChange,
+  periodLabel,
 } from "../utils/forecastDisplay";
 import { isoToLabel } from "../utils/months";
 
@@ -31,14 +32,14 @@ function ChartTooltip({ children }) {
   return <div className="chart-tooltip chart-tooltip-overlay">{children}</div>;
 }
 
-function differenceClass(value) {
-  if (!Number.isFinite(value) || value === 0) {
-    return "";
-  }
-  return value > 0 ? "analytics-growth-up" : "analytics-growth-down";
-}
-
-export default function ForecastComparison({ rows, amountUnit }) {
+export default function ForecastComparison({
+  rows,
+  amountUnit,
+  forecast = null,
+  historyStart = null,
+  historyEnd = null,
+  coverageNote = "",
+}) {
   const palette = useChartPalette();
   const hostRef = useRef(null);
   const [active, setActive] = useState(null);
@@ -76,32 +77,55 @@ export default function ForecastComparison({ rows, amountUnit }) {
       <div>
         <AnalyticsSectionHeading
           id="analytics-comparison-heading"
-          title="Historical vs Forecast Comparison"
+          title="Same-month historical average vs forecast"
         />
         <p className="muted">
-          Each forecast month is compared with the same-calendar-month historical average.
-          The exact historical months used in that average are listed for full transparency.
+          Each forecast month is compared with the monthly average of the same calendar month in prior actual years.
+          This is a monthly-average comparison, not annual year-over-year growth.
         </p>
       </div>
+
+      <section className="analytics-meta-grid" aria-label="Comparison context">
+        <div className="analytics-meta-item">
+          <span>Forecast category</span>
+          <strong>{forecast?.category || "—"}</strong>
+        </div>
+        <div className="analytics-meta-item">
+          <span>Actual historical period used</span>
+          <strong>
+            {historyStart && historyEnd
+              ? `${monthTitle(historyStart)} – ${monthTitle(historyEnd)}`
+              : "—"}
+          </strong>
+        </div>
+        <div className="analytics-meta-item">
+          <span>Forecast period</span>
+          <strong>{periodLabel(forecast) || "—"}</strong>
+        </div>
+      </section>
+      {coverageNote ? <p className="analytics-partial-note">{coverageNote}</p> : null}
 
       <ul className="analytics-kpis" aria-label="Comparison snapshot">
         <li>
           <span>Forecast total</span>
           <strong>{formatAmount(totals.forecast_total, amountUnit)}</strong>
+          <em className="analytics-kpi-note">Sum of forecast months only</em>
         </li>
         <li>
-          <span>Historical baseline</span>
+          <span>Same-month historical monthly averages (sum)</span>
           <strong>{formatAmount(totals.historical_total, amountUnit)}</strong>
+          <em className="analytics-kpi-note">Not a full-year actual total</em>
         </li>
         <li>
-          <span>Difference</span>
-          <strong className={differenceClass(totals.difference)}>
+          <span>Monthly-average difference</span>
+          <strong className="analytics-comparison-delta">
             {formatAmount(totals.difference, amountUnit)}
           </strong>
+          <em className="analytics-kpi-note">Informational; higher spend is not scored as better</em>
         </li>
         <li>
-          <span>Change</span>
-          <strong className={differenceClass(totals.difference_percent)}>
+          <span>Relative change</span>
+          <strong className="analytics-comparison-delta">
             {formatPercentChange(totals.difference_percent)}
           </strong>
         </li>
@@ -110,16 +134,16 @@ export default function ForecastComparison({ rows, amountUnit }) {
       <article className="card analytics-main">
         <div className="analytics-main-head">
           <div>
-            <h3>Historical average vs forecast</h3>
+            <h3>Monthly-average comparison by forecast month</h3>
             <p className="muted">
-              Historical bars are the average of the same calendar month in prior actual years, not the forecast month itself.
+              Historical bars are the average of matching calendar months in prior actual years for the active forecast category.
             </p>
           </div>
         </div>
         <div
           className="analytics-chart analytics-chart-wide"
           role="img"
-          aria-label="Historical average versus forecast"
+          aria-label="Historical monthly average versus forecast"
           ref={hostRef}
         >
           <ResponsiveContainer width="100%" height="100%">
@@ -146,7 +170,7 @@ export default function ForecastComparison({ rows, amountUnit }) {
               <YAxis {...valueYAxisProps(unit, { axisFill: palette.axis })} tickFormatter={formatAxisTick} />
               <Tooltip cursor={{ fill: palette.cursor }} content={() => null} wrapperStyle={{ display: "none" }} />
               <Legend wrapperStyle={{ fontSize: 12, color: palette.legend }} />
-              <Bar dataKey="historical_average" name="Historical average" fill={palette.historical} radius={SOLID_BAR_RADIUS} maxBarSize={22} isAnimationActive={false} />
+              <Bar dataKey="historical_average" name="Historical monthly average" fill={palette.historical} radius={SOLID_BAR_RADIUS} maxBarSize={22} isAnimationActive={false} />
               <Bar
                 dataKey="forecast_amount"
                 name="Forecast"
@@ -162,7 +186,7 @@ export default function ForecastComparison({ rows, amountUnit }) {
               <ChartTooltip>
                 <div className="chart-tooltip-month">{monthTitle(active.point.month)}</div>
                 <div className="chart-tooltip-value">
-                  {`Historical average ${active.point.historical_average == null ? "—" : formatAmount(active.point.historical_average, amountUnit)}`}
+                  {`Historical monthly average ${active.point.historical_average == null ? "—" : formatAmount(active.point.historical_average, amountUnit)}`}
                 </div>
                 <div className="chart-tooltip-value">
                   {`Forecast ${formatAmount(active.point.forecast_amount, amountUnit)}`}
@@ -179,13 +203,13 @@ export default function ForecastComparison({ rows, amountUnit }) {
       <div className="analytics-comparison-layout">
         <article className="card table-card">
           <h3>Monthly comparison</h3>
-          <p className="muted">Select a forecast month to inspect the historical periods used.</p>
+          <p className="muted">Select a forecast month to inspect the historical periods used in the monthly average.</p>
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Forecast month</th>
-                  <th>Historical average</th>
+                  <th>Historical monthly average</th>
                   <th>Forecast</th>
                   <th>Difference</th>
                   <th>Periods used</th>
@@ -209,7 +233,7 @@ export default function ForecastComparison({ rows, amountUnit }) {
                     <td>{monthTitle(row.month)}</td>
                     <td>{formatAmount(row.historical_average, amountUnit)}</td>
                     <td>{formatAmount(row.forecast_amount, amountUnit)}</td>
-                    <td className={differenceClass(row.difference)}>
+                    <td className="analytics-comparison-delta">
                       {`${formatAmount(row.difference, amountUnit)} (${formatPercentChange(row.difference_percent)})`}
                     </td>
                     <td>{row.observation_count}</td>
@@ -224,7 +248,7 @@ export default function ForecastComparison({ rows, amountUnit }) {
           <article className="card analytics-month-detail">
             <header className="analytics-month-detail-head">
               <h3>Selected month details</h3>
-              <p className="muted">Historical periods and comparison for the selected forecast month.</p>
+              <p className="muted">Historical periods and monthly-average comparison for the selected forecast month.</p>
               <p className="analytics-month-detail-date">{monthTitle(selected.month)}</p>
             </header>
 
@@ -255,10 +279,10 @@ export default function ForecastComparison({ rows, amountUnit }) {
               </section>
 
               <section className="analytics-month-detail-section analytics-month-detail-metrics" aria-labelledby="analytics-month-metrics-heading">
-                <h4 id="analytics-month-metrics-heading">Calculated comparison</h4>
+                <h4 id="analytics-month-metrics-heading">Calculated monthly-average comparison</h4>
                 <dl className="analytics-month-detail-metrics-list">
                   <div>
-                    <dt>Historical average</dt>
+                    <dt>Historical monthly average</dt>
                     <dd>{formatAmount(selected.historical_average, amountUnit)}</dd>
                   </div>
                   <div>
@@ -267,7 +291,7 @@ export default function ForecastComparison({ rows, amountUnit }) {
                   </div>
                   <div>
                     <dt>Difference</dt>
-                    <dd className={differenceClass(selected.difference)}>
+                    <dd className="analytics-comparison-delta">
                       <span>{formatAmount(selected.difference, amountUnit)}</span>
                       <em>{`(${formatPercentChange(selected.difference_percent)})`}</em>
                     </dd>

@@ -703,19 +703,22 @@ def _like_for_like_growth(current: dict[int, float], previous: dict[int, float] 
     return float((current_total - previous_total) / previous_total * 100)
 
 
-def _display_history_window(history_start: str, history_end: str) -> tuple[str, str]:
-    """Latest two completed calendar years + available months of the following partial year.
+def _shift_iso_month(iso: str, delta: int) -> str:
+    year = int(iso[:4])
+    month = int(iso[5:7])
+    index = year * 12 + (month - 1) + delta
+    return f"{index // 12:04d}-{(index % 12) + 1:02d}"
 
-    Anchored on the latest stored historical month, not the system clock.
-    December latest → January of the previous year; otherwise January two years earlier.
+
+def _display_history_window(history_start: str, history_end: str) -> tuple[str, str]:
+    """Last 24 months ending at the latest stored historical month (not the clock).
+
+    Example: latest Sep 2026 → Oct 2024–Sep 2026. Clamped to available history.
     """
     end = str(history_end or "")
     if len(end) < 7 or end[4] != "-":
         return str(history_start or end), end
-    year = int(end[:4])
-    month = int(end[5:7])
-    start_year = year - 1 if month == 12 else year - 2
-    start = f"{start_year:04d}-01"
+    start = _shift_iso_month(end, -23)
     available_start = str(history_start or start)
     if available_start and start < available_start:
         start = available_start

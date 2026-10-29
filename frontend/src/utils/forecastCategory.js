@@ -37,6 +37,43 @@ export function isInternationalSettlementCategory(category) {
   return [category.name, category.source_name, category.label].some(looksLikeInternationalSettlement);
 }
 
+/**
+ * True when an Overview/Analytics category record refers to the same category as a
+ * forecast payload label (id, display name, or source name such as Int'l Settlement).
+ */
+export function forecastMatchesOverviewCategory(forecastCategory, overviewCategory) {
+  if (forecastCategory == null || forecastCategory === "" || !overviewCategory) {
+    return false;
+  }
+  const forecastLabel = typeof forecastCategory === "object"
+    ? String(
+      forecastCategory.name
+      || forecastCategory.source_name
+      || forecastCategory.id
+      || ""
+    ).trim()
+    : String(forecastCategory).trim();
+  if (!forecastLabel) {
+    return false;
+  }
+  if (isInternationalSettlementCategory(forecastLabel) && isInternationalSettlementCategory(overviewCategory)) {
+    return true;
+  }
+  const candidates = [
+    overviewCategory.id,
+    overviewCategory.name,
+    overviewCategory.source_name,
+    overviewCategory.label,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (candidates.some((value) => value === forecastLabel)) {
+    return true;
+  }
+  const forecastNorm = normalizeCategoryText(forecastLabel);
+  return candidates.some((value) => normalizeCategoryText(value) === forecastNorm);
+}
+
 export function isForecastableCategory(category) {
   if (!category) {
     return false;

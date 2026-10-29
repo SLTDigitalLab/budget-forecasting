@@ -5,7 +5,6 @@ import {
   BarChart,
   CartesianGrid,
   ErrorBar,
-  Legend,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -40,6 +39,7 @@ import {
   validateHistoricalAnalysis,
 } from "../utils/analyticsPage";
 import { buildBudgetTrend } from "../utils/budgetTrend";
+import { forecastMatchesOverviewCategory } from "../utils/forecastCategory";
 import { buildForecastComparison, mergeHistoricalActuals } from "../utils/forecastComparison";
 import {
   cartesianChartMargin,
@@ -52,9 +52,12 @@ import {
   isYearTotalRow,
   summarizeDisplayedYears,
   summarizeLatestDisplayedYear,
-  summarizeMixedDisplayedYears,
 } from "../utils/chartYearTotals";
-import { buildHistoricalDisplayAnalysis } from "../utils/historicalDisplayWindow";
+import {
+  HISTORY_RANGE_ALL,
+  HISTORY_RANGE_LAST_24,
+  buildHistoricalDisplayAnalysis,
+} from "../utils/historicalDisplayWindow";
 import useChartPalette from "../hooks/useChartPalette";
 import {
   axisUnitLabel,
@@ -84,21 +87,6 @@ function budgetCodesFromForecast(forecast) {
     });
   });
   return Array.from(seen.values());
-}
-
-function yearlyActuals(historical) {
-  const totals = new Map();
-  (Array.isArray(historical) ? historical : []).forEach((row) => {
-    if (!row?.month || !Number.isFinite(Number(row.actual_amount))) {
-      return;
-    }
-    const year = Number(String(row.month).slice(0, 4));
-    const current = totals.get(year) || { total: 0, months: 0 };
-    current.total += Number(row.actual_amount);
-    current.months += 1;
-    totals.set(year, current);
-  });
-  return totals;
 }
 
 function codeRanking(forecast) {
@@ -259,84 +247,32 @@ function ForecastAnalysisPanel({ forecast }) {
   const amountUnit = forecast?.amount_unit;
   const unit = axisUnitLabel(amountUnit);
   const selectedCode = codes.find((item) => item.budget_code === budgetCode);
-  const historyStart = forecast?.historical_start || forecast?.historical_actuals?.[0]?.month;
-  const historyEnd = forecast?.history_end || forecast?.historical_end;
-  const mixedYears = useMemo(() => {
-    const actuals = yearlyActuals(forecast.historical_actuals);
-    const forecasts = Array.isArray(forecast.combined_yearly_forecasts)
-      ? forecast.combined_yearly_forecasts
-      : [];
-    const years = new Set([...actuals.keys(), ...forecasts.map((row) => Number(row.year))]);
-    return Array.from(years)
-      .filter((year) => Number.isFinite(year))
-      .sort((left, right) => left - right)
-      .map((year) => {
-        const forecastRow = forecasts.find((row) => Number(row.year) === year);
-        const actualRow = actuals.get(year);
-        return {
-          year,
-          actual: actualRow ? actualRow.total : null,
-          forecast: forecastRow ? Number(forecastRow.forecast_amount) : null,
-        };
-      })
-      .filter((row) => row.actual != null && row.forecast != null);
-  }, [forecast]);
 
   const combinedMonthly = useMemo(() => {
-    const historical = (Array.isArray(forecast.historical_actuals) ? forecast.historical_actuals : [])
-      .filter((row) => row?.month && Number.isFinite(Number(row.actual_amount)))
-      .sort((left, right) => String(left.month).localeCompare(String(right.month)))
-      .slice(-12);
-    const forecasts = chronologicalForecasts(forecast);
-    const byMonth = new Map();
-    historical.forEach((row) => {
-      byMonth.set(row.month, {
-        month: row.month,
-        label: isoToLabel(row.month),
-        actual: Number(row.actual_amount),
-        forecast: null,
-      });
-    });
-    forecasts.forEach((row) => {
-      const existing = byMonth.get(row.month) || {
-        month: row.month,
-        label: isoToLabel(row.month),
-        actual: null,
-        forecast: null,
-      };
-      existing.forecast = Number(row.forecast_amount);
-      existing.lower = Number.isFinite(Number(row.lower_bound)) ? Number(row.lower_bound) : null;
-      existing.upper = Number.isFinite(Number(row.upper_bound)) ? Number(row.upper_bound) : null;
-      existing.intervalStatus = row.interval_status || null;
-      byMonth.set(row.month, existing);
-    });
-    return Array.from(byMonth.values()).sort((left, right) => left.month.localeCompare(right.month));
+    return chronologicalForecasts(forecast).map((row) => ({
+      month: row.month,
+      label: isoToLabel(row.month),
+      forecast: Number(row.forecast_amount),
+      lower: Number.isFinite(Number(row.lower_bound)) ? Number(row.lower_bound) : null,
+      upper: Number.isFinite(Number(row.upper_bound)) ? Number(row.upper_bound) : null,
+      intervalStatus: row.interval_status || null,
+    }));
   }, [forecast]);
 
   const combinedYearly = useMemo(() => {
-    const actuals = yearlyActuals(forecast.historical_actuals);
     const forecasts = Array.isArray(forecast.combined_yearly_forecasts)
       ? forecast.combined_yearly_forecasts
       : [];
-    const years = new Set([...actuals.keys(), ...forecasts.map((row) => Number(row.year))]);
-    return Array.from(years)
-      .filter((year) => Number.isFinite(year))
-      .sort((left, right) => left - right)
-      .map((year) => {
-        const forecastRow = forecasts.find((row) => Number(row.year) === year);
-        const actualRow = actuals.get(year);
-        return {
-          year,
-          label: (actualRow && actualRow.months < 12) || forecastRow?.year_status === "PARTIAL_YEAR"
-            ? `${year}*`
-            : String(year),
-          actual: actualRow ? actualRow.total : null,
-          actual_months: actualRow ? actualRow.months : 0,
-          forecast: forecastRow ? Number(forecastRow.forecast_amount) : null,
-          year_status: forecastRow?.year_status || "",
-          months_included: forecastRow?.months_included || 0,
-        };
-      });
+    return forecasts
+      .map((row) => ({
+        year: Number(row.year),
+        label: row.year_status === "PARTIAL_YEAR" ? `${row.year}*` : String(row.year),
+        forecast: Number(row.forecast_amount),
+        year_status: row.year_status || "",
+        months_included: row.months_included || 0,
+      }))
+      .filter((row) => Number.isFinite(row.year) && Number.isFinite(row.forecast))
+      .sort((left, right) => left.year - right.year);
   }, [forecast]);
 
   const codeMonthly = useMemo(() => {
@@ -377,21 +313,21 @@ function ForecastAnalysisPanel({ forecast }) {
     if (grain !== "monthly") {
       return [];
     }
-    if (scope === "combined") {
-      return summarizeMixedDisplayedYears(monthlyChartRows, { isoKey: "month" });
-    }
     return summarizeDisplayedYears(monthlyChartRows, {
       isoKey: "month",
       valueKey: "forecast",
       seriesKind: "forecast",
     });
-  }, [grain, scope, monthlyChartRows]);
-  const showActuals = scope === "combined";
+  }, [grain, monthlyChartRows]);
   const showInterval = grain === "monthly" && monthlyChartRows.some(
     (row) => Number.isFinite(Number(row.lower)) && Number.isFinite(Number(row.upper))
   );
+  const partialForecastYears = useMemo(
+    () => combinedYearly.filter((row) => row.year_status === "PARTIAL_YEAR").map((row) => row.year),
+    [combinedYearly]
+  );
   const chartTitle = scope === "combined"
-    ? (grain === "monthly" ? "Combined monthly trend" : "Combined yearly comparison")
+    ? (grain === "monthly" ? "Combined monthly forecast" : "Combined yearly forecast")
     : (grain === "monthly" ? `${budgetCode} monthly forecast` : `${budgetCode} yearly forecast`);
 
   function selectCode(code) {
@@ -402,25 +338,23 @@ function ForecastAnalysisPanel({ forecast }) {
   return (
     <section className="analytics-major-section analytics-forecast-section" aria-labelledby="analytics-forecast-heading">
       <AnalyticsSectionHeading id="analytics-forecast-heading" title="Forecast Analysis" />
-      <section className="analytics-meta-grid" aria-label="History and forecast periods">
+      <section className="analytics-meta-grid" aria-label="Active forecast">
         <div className="analytics-meta-item">
-          <span>History period</span>
-          <strong>{`${monthTitle(historyStart)} – ${monthTitle(historyEnd)}`}</strong>
+          <span>Forecast category</span>
+          <strong>{forecast.category || "—"}</strong>
         </div>
         <div className="analytics-meta-item">
           <span>Forecast period</span>
           <strong>{periodLabel(forecast)}</strong>
         </div>
-        <div className="analytics-meta-item">
-          <span>Selected category</span>
-          <strong>{forecast.category || "—"}</strong>
-        </div>
       </section>
-      {mixedYears.length ? (
+      {partialForecastYears.length ? (
         <p className="analytics-partial-note">
-          {mixedYears.map((row) => row.year).join(", ")}
-          {mixedYears.length === 1 ? " contains" : " contain"}
-          {" partial actuals and a partial forecast. They are not full-year totals."}
+          {partialForecastYears.join(", ")}
+          {partialForecastYears.length === 1 ? " is a" : " are"}
+          {" partial forecast year"}
+          {partialForecastYears.length === 1 ? "" : "s"}
+          {". Totals cover only included forecast months."}
         </p>
       ) : null}
 
@@ -432,9 +366,10 @@ function ForecastAnalysisPanel({ forecast }) {
         <li>
           <span>Monthly average</span>
           <strong>{formatAmount(forecast.monthly_average, amountUnit)}</strong>
+          <em className="analytics-kpi-note">Average across forecast months</em>
         </li>
         <li>
-          <span>Months</span>
+          <span>Forecast months</span>
           <strong>{forecast.forecast_month_count || chronologicalForecasts(forecast).length}</strong>
         </li>
         <li>
@@ -449,13 +384,13 @@ function ForecastAnalysisPanel({ forecast }) {
             <div>
               <h3>{chartTitle}</h3>
               <p className="muted">
-                {showActuals
+                {scope === "combined"
                   ? grain === "monthly"
-                    ? "Last 12 actual months plus the generated forecast. Series do not overlap."
-                    : "Actual and forecast bars in the same year are different month ranges."
+                    ? "Forecast values only for the active generated forecast. Historical actuals are shown on Comparison."
+                    : "Yearly forecast totals for the active generated forecast only."
                   : selectedCode?.account_name
-                    ? `${selectedCode.account_name}. Combined historical actuals are not split by Budget Code.`
-                    : "Combined historical actuals are not split by Budget Code."}
+                    ? `${selectedCode.account_name}. Forecast values for the selected Budget Code.`
+                    : "Forecast values for the selected Budget Code."}
               </p>
               {showInterval ? <ExpectedRangeLabel /> : null}
             </div>
@@ -529,9 +464,6 @@ function ForecastAnalysisPanel({ forecast }) {
                         return (
                           <ChartTooltip>
                             <div className="chart-tooltip-month">{monthTitle(point.month)}</div>
-                            {point.actual != null ? (
-                              <div className="chart-tooltip-value">{`Actual ${formatAmount(point.actual, amountUnit)}`}</div>
-                            ) : null}
                             {point.forecast != null ? (
                               <div className="chart-tooltip-value">{`Forecast ${formatAmount(point.forecast, amountUnit)}`}</div>
                             ) : null}
@@ -546,10 +478,6 @@ function ForecastAnalysisPanel({ forecast }) {
                         );
                       }}
                     />
-                    {showActuals ? <Legend wrapperStyle={{ fontSize: 12, color: palette.legend }} /> : null}
-                    {showActuals ? (
-                      <Bar dataKey="actual" name="Historical actual" fill={palette.historical} radius={SOLID_BAR_RADIUS} maxBarSize={22} isAnimationActive={false} />
-                    ) : null}
                     <Bar
                       dataKey="forecast"
                       name="Forecast"
@@ -583,11 +511,6 @@ function ForecastAnalysisPanel({ forecast }) {
                       return (
                         <ChartTooltip>
                           <div className="chart-tooltip-month">{point.year}</div>
-                          {point.actual != null ? (
-                            <div className="chart-tooltip-value">
-                              {`Actual ${formatAmount(point.actual, amountUnit)}${point.actual_months && point.actual_months < 12 ? ` · ${point.actual_months} months` : ""}`}
-                            </div>
-                          ) : null}
                           {point.forecast != null ? (
                             <div className="chart-tooltip-value">
                               {`Forecast ${formatAmount(point.forecast, amountUnit)}${point.year_status === "PARTIAL_YEAR" ? ` · ${point.months_included} months` : ""}`}
@@ -597,10 +520,6 @@ function ForecastAnalysisPanel({ forecast }) {
                       );
                     }}
                   />
-                  {showActuals ? <Legend wrapperStyle={{ fontSize: 12, color: palette.legend }} /> : null}
-                  {showActuals ? (
-                    <Bar dataKey="actual" name="Historical actual" fill={palette.historical} radius={SOLID_BAR_RADIUS} maxBarSize={24} isAnimationActive={false} />
-                  ) : null}
                   <Bar
                     dataKey="forecast"
                     name="Forecast"
@@ -661,7 +580,9 @@ export default function Analytics() {
   const [restoreStatus, setRestoreStatus] = useState(forecast ? "ready" : "loading");
   const [restoreError, setRestoreError] = useState("");
   const [activeTab, setActiveTab] = useState("historical");
+  const [historyRange, setHistoryRange] = useState(HISTORY_RANGE_LAST_24);
   const [historyRequestId, setHistoryRequestId] = useState(0);
+  const [comparisonHistory, setComparisonHistory] = useState(null);
 
   const restoreLatest = useCallback(async () => {
     if (forecast) {
@@ -765,9 +686,43 @@ export default function Analytics() {
     restoreLatest();
   }, [restoreLatest]);
 
+  useEffect(() => {
+    if (!forecast?.category || !categories.length) {
+      setComparisonHistory(null);
+      return undefined;
+    }
+    const matched = categories.find((item) => forecastMatchesOverviewCategory(forecast.category, item));
+    if (!matched) {
+      setComparisonHistory(null);
+      return undefined;
+    }
+    if (history && forecastMatchesOverviewCategory(forecast.category, history.category || history)) {
+      setComparisonHistory(history);
+      return undefined;
+    }
+    let cancelled = false;
+    getOverviewAnalysis(matched.id)
+      .then((payload) => {
+        if (!cancelled) {
+          setComparisonHistory(payload);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setComparisonHistory(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [forecast?.category, categories, history]);
+
   const amountUnit = history?.amount_unit;
   const unit = axisUnitLabel(amountUnit);
-  const historicalDisplay = useMemo(() => buildHistoricalDisplayAnalysis(history), [history]);
+  const historicalDisplay = useMemo(
+    () => buildHistoricalDisplayAnalysis(history, { rangeMode: historyRange }),
+    [history, historyRange]
+  );
   const ranking = useMemo(
     () => codeHistoryRanking(historicalDisplay?.budget_codes || history?.budget_codes),
     [historicalDisplay, history]
@@ -808,25 +763,70 @@ export default function Analytics() {
       setActiveTab(defaultAnalyticsTab(mode));
     }
   }, [activeTab, mode]);
+  const comparisonActuals = useMemo(() => {
+    if (!forecast) {
+      return [];
+    }
+    // Prefer Overview monthly actuals for the forecast category. Forecast payload
+    // historical_actuals omit months where any selected code is incomplete, which
+    // must not blank Comparison All history bars when the master series has values.
+    const overviewMonths = comparisonHistory
+      && forecastMatchesOverviewCategory(forecast.category, comparisonHistory.category || comparisonHistory)
+      ? comparisonHistory.monthly_actuals
+      : null;
+    return mergeHistoricalActuals(overviewMonths, forecast.historical_actuals);
+  }, [forecast, comparisonHistory]);
   const comparisonRows = useMemo(() => {
     if (!forecast) {
       return [];
     }
     return buildForecastComparison({
-      historicalActuals: mergeHistoricalActuals(null, forecast.historical_actuals),
+      historicalActuals: comparisonActuals,
       forecast,
       historyEnd: forecast.history_end || forecast.historical_end,
     });
-  }, [forecast]);
+  }, [forecast, comparisonActuals]);
   const budgetTrend = useMemo(() => {
     if (!forecast) {
       return null;
     }
     return buildBudgetTrend({
-      monthlyActuals: forecast.historical_actuals,
+      monthlyActuals: comparisonActuals,
       forecast,
     });
-  }, [forecast]);
+  }, [forecast, comparisonActuals]);
+  const comparisonCoverageNote = useMemo(() => {
+    if (!forecast) {
+      return "";
+    }
+    const forecastCodes = Number(forecast.selected_account_count) || 0;
+    const sameCategory = comparisonHistory
+      ? forecastMatchesOverviewCategory(forecast.category, comparisonHistory.category || comparisonHistory)
+      : false;
+    const historyCodes = sameCategory ? Number(comparisonHistory?.budget_code_count) || 0 : 0;
+    const historyStart = budgetTrend?.history_start
+      || comparisonHistory?.history_start
+      || forecast.historical_start
+      || forecast.historical_actuals?.[0]?.month;
+    const historyEnd = budgetTrend?.history_end
+      || comparisonHistory?.history_end
+      || forecast.history_end
+      || forecast.historical_end;
+    const parts = [];
+    if (historyStart && historyEnd) {
+      parts.push(
+        `Actuals used for comparison cover ${monthTitle(historyStart)} – ${monthTitle(historyEnd)} for category ${forecast.category || "—"}.`
+      );
+    }
+    if (sameCategory && historyCodes > 0 && forecastCodes > 0 && historyCodes !== forecastCodes) {
+      parts.push(
+        `Budget-code coverage differs: historical analysis lists ${historyCodes} codes while this forecast includes ${forecastCodes}.`
+      );
+    } else if (forecastCodes > 0) {
+      parts.push(`This forecast includes ${forecastCodes} Budget Codes.`);
+    }
+    return parts.join(" ");
+  }, [forecast, comparisonHistory, budgetTrend]);
 
   return (
     <section className="analytics-page">
@@ -856,29 +856,62 @@ export default function Analytics() {
           </div>
         </div>
         {activeTab === "historical" ? (
-          <label className="analytics-category-control" htmlFor="analytics-category">
-            <span>Category</span>
-            <select
-              id="analytics-category"
-              value={categoryId}
-              onChange={(event) => setCategoryId(event.target.value)}
-              disabled={!categories.length || historyStatus === "loading"}
-            >
-              {categories.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="analytics-toolbar-controls">
+            <label className="analytics-category-control" htmlFor="analytics-category">
+              <span>Category</span>
+              <select
+                id="analytics-category"
+                value={categoryId}
+                onChange={(event) => setCategoryId(event.target.value)}
+                disabled={!categories.length || historyStatus === "loading"}
+              >
+                {categories.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="analytics-history-view" role="group" aria-label="Historical display range">
+              <button
+                type="button"
+                className={historyRange === HISTORY_RANGE_LAST_24 ? "active" : ""}
+                onClick={() => setHistoryRange(HISTORY_RANGE_LAST_24)}
+              >
+                Last 24 months
+              </button>
+              <button
+                type="button"
+                className={historyRange === HISTORY_RANGE_ALL ? "active" : ""}
+                onClick={() => setHistoryRange(HISTORY_RANGE_ALL)}
+              >
+                All history
+              </button>
+            </div>
+          </div>
         ) : null}
       </div>
 
-      {activeTab === "historical" && history ? (
+      <div
+        className="analytics-tab-panel"
+        role="tabpanel"
+        id="analytics-panel-historical"
+        aria-labelledby="analytics-tab-historical"
+        hidden={activeTab !== "historical"}
+      >
+      {history ? (
         <section className="analytics-meta-grid" aria-label="Actuals coverage">
           <div className="analytics-meta-item">
             <span>Actual-data coverage</span>
             <strong>{actualDataCoverageLabel(history)}</strong>
+          </div>
+          <div className="analytics-meta-item">
+            <span>Displayed range</span>
+            <strong>
+              {historicalDisplay?.window?.startIso && historicalDisplay?.window?.endIso
+                ? `${monthTitle(historicalDisplay.window.startIso)} – ${monthTitle(historicalDisplay.window.endIso)}`
+                : "—"}
+            </strong>
           </div>
           <div className="analytics-meta-item">
             <span>Latest complete year</span>
@@ -904,32 +937,23 @@ export default function Analytics() {
         </section>
       ) : null}
 
-      {activeTab === "historical" && yearNote ? <p className="analytics-partial-note">{yearNote}</p> : null}
+      {yearNote ? <p className="analytics-partial-note">{yearNote}</p> : null}
 
-      {activeTab === "historical" ? (
-        <details className="analytics-methods">
-          <summary>How coverage and YoY are calculated</summary>
-          <div>
-            Actual-data coverage is the stored monthly history for the selected category.
-            Latest complete year and latest submission come from master submission coverage
-            across all categories when labeled as such. Year-on-year growth compares only
-            overlapping months in partial years.
-          </div>
-        </details>
-      ) : null}
+      <details className="analytics-methods">
+        <summary>How coverage and YoY are calculated</summary>
+        <div>
+          Actual-data coverage is the full stored monthly history for the selected category.
+          Displayed range follows Last 24 months (ending at the latest stored actual month) or All history.
+          Switching this range does not change a generated forecast. Year-on-year growth compares only
+          overlapping months in partial years within the displayed range.
+        </div>
+      </details>
 
-      {activeTab === "historical" ? (
-      <div
-        className="analytics-tab-panel"
-        role="tabpanel"
-        id="analytics-panel-historical"
-        aria-labelledby="analytics-tab-historical"
-      >
       <section className="analytics-major-section" aria-labelledby="analytics-historical-heading">
         <AnalyticsSectionHeading
           id="analytics-historical-heading"
           title={selectedCategory?.name ? `Historical Budget Analysis · ${selectedCategory.name}` : "Historical Budget Analysis"}
-          subtitle={historicalDisplay?.periodLabel || null}
+          subtitle={historicalDisplay?.displayedRangeLabel || historicalDisplay?.periodLabel || null}
         />
 
       {mode.showHistoricalError ? (
@@ -968,6 +992,11 @@ export default function Analytics() {
             <li>
               <span>Monthly average</span>
               <strong>{formatAmount(historicalDisplay?.monthly_average ?? history.monthly_average, amountUnit)}</strong>
+              <em className="analytics-kpi-note">
+                {historyRange === HISTORY_RANGE_ALL
+                  ? "Average over All history months shown"
+                  : "Average over the Last 24 months shown"}
+              </em>
             </li>
             <li>
               <span>Latest YoY growth</span>
@@ -1104,14 +1133,13 @@ export default function Analytics() {
       ) : null}
       </section>
       </div>
-      ) : null}
 
-      {activeTab === "forecast" ? (
       <div
         className="analytics-tab-panel"
         role="tabpanel"
         id="analytics-panel-forecast"
         aria-labelledby="analytics-tab-forecast"
+        hidden={activeTab !== "forecast"}
       >
       {restoreStatus === "error" ? (
         <div className="card overview-inline-error" role="alert">
@@ -1130,13 +1158,6 @@ export default function Analytics() {
         </article>
       ) : null}
 
-      {mode.showBudgetTrend ? (
-        <BudgetTrendAnalysis
-          trend={budgetTrend}
-          amountUnit={forecast?.amount_unit}
-        />
-      ) : null}
-
       {mode.showForecastAnalysis ? (
         <ForecastAnalysisPanel forecast={forecast} />
       ) : restoreStatus !== "loading" ? (
@@ -1151,20 +1172,29 @@ export default function Analytics() {
         </section>
       ) : null}
       </div>
-      ) : null}
 
-      {activeTab === "comparison" ? (
       <div
         className="analytics-tab-panel"
         role="tabpanel"
         id="analytics-panel-comparison"
         aria-labelledby="analytics-tab-comparison"
+        hidden={activeTab !== "comparison"}
       >
       {mode.showComparison ? (
-        <ForecastComparison
-          rows={comparisonRows}
-          amountUnit={forecast?.amount_unit}
-        />
+        <>
+          <BudgetTrendAnalysis
+            trend={budgetTrend}
+            amountUnit={forecast?.amount_unit}
+          />
+          <ForecastComparison
+            rows={comparisonRows}
+            amountUnit={forecast?.amount_unit}
+            forecast={forecast}
+            historyStart={budgetTrend?.history_start || forecast?.historical_start}
+            historyEnd={budgetTrend?.history_end || forecast?.history_end || forecast?.historical_end}
+            coverageNote={comparisonCoverageNote}
+          />
+        </>
       ) : (
         <section className="analytics-major-section" aria-labelledby="analytics-comparison-heading">
           <AnalyticsSectionHeading id="analytics-comparison-heading" title="Historical vs Forecast Comparison" />
@@ -1177,7 +1207,6 @@ export default function Analytics() {
         </section>
       )}
       </div>
-      ) : null}
     </section>
   );
 }

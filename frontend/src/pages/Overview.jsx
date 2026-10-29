@@ -458,10 +458,6 @@ export default function Overview() {
           <h1>Overview</h1>
           <p>Key insights from your budget forecasting data</p>
         </div>
-        <div className="overview-period">
-          <span>Forecast Period</span>
-          <strong>{forecastRun ? recordPeriod(forecastRun) : "—"}</strong>
-        </div>
       </header>
 
       <div className="field overview-category-field">
