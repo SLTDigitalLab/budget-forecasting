@@ -27,7 +27,7 @@ import ActivityLogPanel from "../components/ActivityLogPanel";
 import { MasterSection, PreviewWorkspace, RevisionDetail, RollbackDialog } from "../components/HistoricalDataPanels";
 import SummaryCard from "../components/SummaryCard";
 import { formatHistoryPeriod } from "../utils/historyPeriod";
-import { latestAvailableDataValue } from "../utils/overviewDashboard";
+import { latestAvailableDataParts } from "../utils/overviewDashboard";
 import { CONFIRM_TEXT, RETRAIN_SAVE_NOTICE } from "../utils/retrainWorkflow";
 import {
   FILE_AUTH_DENIED,
@@ -40,6 +40,7 @@ import {
   subscribeFileSelectionReset,
 } from "../utils/fileSelectionAuth";
 import { confirmDatasetPayload, isAuthorizationCancellation } from "../utils/settingsActions";
+import { bumpOverviewHistoryEpoch } from "../utils/overviewHistoryEpoch";
 
 const BOOK_ENTRY_REMOVAL_WARNING = "Removing this account will make it eligible for forecasting again, subject to model and historical data availability.";
 
@@ -1007,6 +1008,7 @@ export default function Settings() {
     setNotice("Changes saved to the historical master successfully.");
     setMasterHighlight(commitResult.result.file_id || "");
     setMasterFilter("changes");
+    bumpOverviewHistoryEpoch(sessionStorage);
     try {
       await load();
       await refreshMaster(1, "changes", commitResult.result.file_id);
@@ -1041,6 +1043,7 @@ export default function Settings() {
       markPreviewCompleted(previewId, sessionStorage);
       setMasterHighlight(settled.result?.file_id || "");
       setMasterFilter("changes");
+      bumpOverviewHistoryEpoch(sessionStorage);
       try {
         await load();
         await refreshMaster(1, "changes", settled.result?.file_id);
@@ -1217,6 +1220,7 @@ export default function Settings() {
       masterPreviewRef.current = null;
       setNotice(result.message || "Historical dataset updated successfully.");
       setMasterHighlight(result.revision_id || "");
+      bumpOverviewHistoryEpoch(sessionStorage);
       await refreshMaster(1, "changes", result.revision_id);
       await load();
       return true;
@@ -1391,6 +1395,7 @@ export default function Settings() {
       setRollbackTarget(null);
       setRollbackReason("");
       setRollbackReview(null);
+      bumpOverviewHistoryEpoch(sessionStorage);
       await load();
       return true;
     } catch (cause) {
@@ -1471,6 +1476,7 @@ export default function Settings() {
 
   const pageCount = Math.max(1, Math.ceil(total / 10));
   const showSummaryValues = !loading && !loadFailed && summary && !summary.empty;
+  const latestAvailable = showSummaryValues ? latestAvailableDataParts(summary) : null;
   const showSummaryEmpty = !loading && !loadFailed && summary?.empty;
 
   return (
@@ -1528,14 +1534,25 @@ export default function Settings() {
         {showSummaryValues ? (
           <div className="summary-grid settings-summary-grid">
             <SummaryCard
+              className="settings-summary-card settings-summary-card-period"
               label="History Period"
               value={formatHistoryPeriod(summary.earliest_month, summary.latest_month)}
             />
-            <SummaryCard label="Categories" value={summary.category_count} />
-            <SummaryCard label="Budget Codes" value={summary.budget_code_count} />
-            <SummaryCard label="Latest complete year" value={summary.latest_complete_year ?? "Unavailable"} />
-            <SummaryCard label="Latest available data" value={latestAvailableDataValue(summary)} />
+            <SummaryCard className="settings-summary-card" label="Categories" value={summary.category_count} />
+            <SummaryCard className="settings-summary-card" label="Budget Codes" value={summary.budget_code_count} />
             <SummaryCard
+              className="settings-summary-card"
+              label="Latest complete year"
+              value={summary.latest_complete_year ?? "Unavailable"}
+            />
+            <SummaryCard
+              className="settings-summary-card settings-summary-card-latest"
+              label="Latest available data"
+              value={latestAvailable?.value}
+              detail={latestAvailable?.detail}
+            />
+            <SummaryCard
+              className="settings-summary-card"
               label={summary.data_source === "production_workbook" ? "Data Source" : "Last Upload"}
               value={
                 summary.data_source === "production_workbook"

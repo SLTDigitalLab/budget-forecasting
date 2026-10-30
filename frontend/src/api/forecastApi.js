@@ -46,9 +46,16 @@ export function getOverviewHistorical(category) {
   return request(`/api/overview/historical${query}`);
 }
 
-export function getOverviewAnalysis(category) {
-  const query = category ? `?category=${encodeURIComponent(category)}` : "";
-  return request(`/api/overview/analysis${query}`);
+export function getOverviewAnalysis(category, historyRange = "latest2") {
+  const params = new URLSearchParams();
+  if (category) {
+    params.set("category", category);
+  }
+  if (historyRange) {
+    params.set("history_range", historyRange === "all" ? "all" : "latest2");
+  }
+  const query = params.toString();
+  return request(`/api/overview/analysis${query ? `?${query}` : ""}`);
 }
 
 export function getOverviewForecastActivity() {

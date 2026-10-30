@@ -100,17 +100,28 @@ export function overviewCompleteYearUnavailableMessage(historical) {
   return "No complete year available.";
 }
 
-export function latestAvailableDataValue(source) {
+export function latestAvailableDataParts(source) {
   const month = source?.latest_available_month;
   if (!month) {
-    return "Unavailable";
+    return { value: "Unavailable", detail: null };
   }
   const status = source.latest_available_status === "complete" ? "Complete" : "Partial";
   const submitted = Number(source.latest_available_submitted) || 0;
   const applicable = Number(source.latest_available_applicable) || 0;
   const declared = Number(source.latest_available_declared_missing) || 0;
-  const declaredNote = declared > 0 ? `, ${declared} declared missing` : "";
-  return `${month} — ${status}, ${submitted}/${applicable} submitted${declaredNote}`;
+  const declaredNote = declared > 0 ? ` · ${declared} declared missing` : "";
+  return {
+    value: `${month} — ${status}`,
+    detail: `${submitted}/${applicable} submitted${declaredNote}`,
+  };
+}
+
+export function latestAvailableDataValue(source) {
+  const parts = latestAvailableDataParts(source);
+  if (!parts.detail) {
+    return parts.value;
+  }
+  return `${parts.value}, ${parts.detail.replace(" · ", ", ")}`;
 }
 
 const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -251,10 +262,29 @@ function monthPointsFromSavedSeries(rows) {
 /**
  * The whole saved run. Months are only those stored on the run.
  * Missing months are omitted and are not replaced with zero.
+ *
+ * Count definitions:
+ * - selectedAccountCount: codes selected at generate time (DB selected_account_count),
+ *   including unavailable / book-entry rows.
+ * - codeCount: available codes with at least one finite forecast month (zeros and
+ *   negatives included). This matches the distribution table amount rows.
+ * - Unavailable rows are listed in `codes` with a null amount so the table does not
+ *   silently drop them; they are excluded from codeCount and share math.
  */
 export function forecastViewFromRun(run) {
-  const entries = (Array.isArray(run?.budget_code_forecasts) ? run.budget_code_forecasts : [])
-    .filter((entry) => entry?.available !== false);
+  const allEntries = Array.isArray(run?.budget_code_forecasts) ? run.budget_code_forecasts : [];
+  const entries = allEntries.filter((entry) => entry?.available !== false);
+  const unavailable = allEntries
+    .filter((entry) => entry?.available === false)
+    .map((entry) => ({
+      budget_code: String(entry?.budget_code || "").trim(),
+      account_name: String(entry?.account_name || ""),
+      forecast_amount: null,
+      omission_reason: String(
+        entry?.reason_label || entry?.reason_code || entry?.reason || entry?.status || "Unavailable",
+      ).trim() || "Unavailable",
+    }))
+    .filter((row) => row.budget_code);
   const { monthTotals, codes } = monthsFromForecastEntries(entries);
   const savedMonths = monthPointsFromSavedSeries(run?.monthly_forecasts);
   const months = savedMonths.length ? savedMonths : monthPointsFromTotals(monthTotals);
@@ -263,15 +293,20 @@ export function forecastViewFromRun(run) {
   }
   const total = codes.reduce((sum, row) => sum + row.forecast_amount, 0);
   const overall = finiteAmount(run?.overall_total);
+  const amountRows = shareDistribution(codes, "forecast_amount");
+  const missingRows = shareDistribution(unavailable, "forecast_amount", { includeMissing: true })
+    .filter((row) => row.amount == null);
   return {
     runId: run?.id ?? null,
     category: String(run?.category || "").trim(),
     total,
     average: months.length ? total / months.length : null,
     share: overall == null || overall === 0 ? null : total / overall,
-    codeCount: codes.filter((row) => row.budget_code).length,
+    codeCount: amountRows.filter((row) => row.budget_code).length,
+    selectedAccountCount: Number(run?.selected_account_count) || allEntries.length,
+    unavailableCount: unavailable.length,
     months,
-    codes: shareDistribution(codes, "forecast_amount"),
+    codes: [...amountRows, ...missingRows],
     forecastYear: new Set(months.map((row) => row.year)).size === 1 ? months[0].year : null,
   };
 }
@@ -306,25 +341,76 @@ export function sliceTooltipDetails(entry) {
   };
 }
 
-export function shareDistribution(rows, amountKey) {
+/**
+ * Build Budget Code share rows.
+ * Zero and negative amounts are kept. Null/non-finite amounts are kept only when
+ * `includeMissing` is true so tables can list membership/unavailable codes explicitly.
+ */
+export function shareDistribution(rows, amountKey, options = {}) {
+  const includeMissing = Boolean(options?.includeMissing);
   const items = (Array.isArray(rows) ? rows : [])
     .map((row) => ({
       budget_code: String(row?.budget_code || "").trim(),
       account_name: String(row?.account_name || ""),
       amount: finiteAmount(row?.[amountKey] ?? row?.amount),
+      omission_reason: String(row?.omission_reason || "").trim(),
     }))
-    .filter((row) => row.budget_code && row.amount != null);
-  const total = items.reduce((sum, row) => sum + row.amount, 0);
-  const magnitude = items.reduce((sum, row) => sum + Math.abs(row.amount), 0);
+    .filter((row) => row.budget_code && (includeMissing || row.amount != null));
+  const amountItems = items.filter((row) => row.amount != null);
+  const total = amountItems.reduce((sum, row) => sum + row.amount, 0);
+  const magnitude = amountItems.reduce((sum, row) => sum + Math.abs(row.amount), 0);
   return items
-    .sort((left, right) => right.amount - left.amount || left.budget_code.localeCompare(right.budget_code))
+    .sort((left, right) => {
+      if (left.amount == null && right.amount == null) {
+        return left.budget_code.localeCompare(right.budget_code);
+      }
+      if (left.amount == null) {
+        return 1;
+      }
+      if (right.amount == null) {
+        return -1;
+      }
+      return right.amount - left.amount || left.budget_code.localeCompare(right.budget_code);
+    })
     .map((row) => ({
       ...row,
-      // Signed percent of absolute magnitude; keep signed amounts for bar charts.
-      percent: magnitude === 0 ? 0 : row.amount / magnitude,
+      // Signed percent of absolute magnitude; keep signed amounts for charts/tables.
+      percent: row.amount == null || magnitude === 0 ? (row.amount == null ? null : 0) : row.amount / magnitude,
       total,
       magnitude,
     }));
+}
+
+/** Positive amounts only — suitable for a pie/donut that cannot render zero/negative slices. */
+export function positiveDonutSlices(rows) {
+  return (Array.isArray(rows) ? rows : []).filter(
+    (row) => row?.budget_code && row.amount != null && Number(row.amount) > 0,
+  );
+}
+
+export function distributionAmountCount(rows) {
+  return (Array.isArray(rows) ? rows : []).filter(
+    (row) => row?.budget_code && row.amount != null,
+  ).length;
+}
+
+export function distributionOmissionNote(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const missing = list.filter((row) => row?.budget_code && row.amount == null).length;
+  const nonPositive = list.filter(
+    (row) => row?.budget_code && row.amount != null && Number(row.amount) <= 0,
+  ).length;
+  const parts = [];
+  if (nonPositive) {
+    parts.push(`${nonPositive} non-positive code${nonPositive === 1 ? "" : "s"} omitted from chart`);
+  }
+  if (missing) {
+    parts.push(`${missing} code${missing === 1 ? "" : "s"} with no amount listed in the table`);
+  }
+  if (!parts.length) {
+    return "";
+  }
+  return `${parts.join("; ")}.`;
 }
 
 /**

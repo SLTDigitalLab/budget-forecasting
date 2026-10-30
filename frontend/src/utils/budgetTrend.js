@@ -159,6 +159,7 @@ export function buildBudgetTrend({ monthlyActuals, forecast }) {
     forecast_month_count: forecastValues.length,
     history_start: historyStart,
     history_end: historyEnd,
+    actual_months: actuals.map((row) => row.month).filter(isIsoMonth),
     forecast_start: forecastStart || null,
     forecast_end: forecastEnd || null,
     category: forecast?.category || null,

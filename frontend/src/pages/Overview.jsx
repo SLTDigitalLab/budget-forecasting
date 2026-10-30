@@ -28,9 +28,12 @@ import { isoToLabel } from "../utils/months";
 import {
   actualYearSeries,
   DECLARED_MISSING_TOTAL_NOTE,
+  distributionAmountCount,
+  distributionOmissionNote,
   forecastViewFromRun,
   overviewCompleteYearUnavailableMessage,
   overviewLatestYearLabel,
+  positiveDonutSlices,
   selectNewestForecast,
   shareDistribution,
   sliceTooltipDetails,
@@ -147,8 +150,17 @@ function SliceTooltip({ slice, amountLabel, amountUnit, point }) {
   );
 }
 
-function DistributionCard({ title, rows, amountUnit, emptyMessage, amountLabel }) {
-  const slices = rows.map((row) => ({ ...row, color: codeColor(row.budget_code) }));
+function DistributionCard({ title, rows, amountUnit, emptyMessage, amountLabel, centerCaption = "With amounts" }) {
+  const tableRows = (Array.isArray(rows) ? rows : []).map((row) => ({
+    ...row,
+    color: codeColor(row.budget_code),
+  }));
+  const donutSlices = positiveDonutSlices(tableRows).map((row) => ({
+    ...row,
+    color: codeColor(row.budget_code),
+  }));
+  const amountCount = distributionAmountCount(tableRows);
+  const omissionNote = distributionOmissionNote(tableRows);
   const [active, setActive] = useState(null);
   const pinned = useRef(false);
   const chartRef = useRef(null);
@@ -203,36 +215,40 @@ function DistributionCard({ title, rows, amountUnit, emptyMessage, amountLabel }
     <article className="card section-card">
       <h2 className="section-card-header">{title}</h2>
       <div className="section-card-body">
-        {slices.length ? (
+        {tableRows.length ? (
           <div className="overview-distribution">
             <div className="overview-forecast-donut">
               <div className="overview-forecast-donut-chart" ref={chartRef}>
-                <ResponsiveContainer width="100%" height={180}>
-                  <PieChart>
-                    <Pie
-                      data={slices}
-                      dataKey="amount"
-                      nameKey="budget_code"
-                      innerRadius={52}
-                      outerRadius={72}
-                      paddingAngle={0}
-                      startAngle={90}
-                      endAngle={-270}
-                      stroke="#fff"
-                      isAnimationActive={false}
-                      rootTabIndex={0}
-                      onMouseEnter={(data, _index, event) => showSlice(data, event, false)}
-                      onMouseLeave={hideHover}
-                      onClick={(data, _index, event) => showSlice(data, event, true)}
-                      onFocus={(data, _index, event) => showSlice(data, event, false)}
-                      onBlur={hideHover}
-                    >
-                      {slices.map((row) => (
-                        <Cell key={row.budget_code} fill={row.color} />
-                      ))}
-                    </Pie>
-                  </PieChart>
-                </ResponsiveContainer>
+                {donutSlices.length ? (
+                  <ResponsiveContainer width="100%" height={180}>
+                    <PieChart>
+                      <Pie
+                        data={donutSlices}
+                        dataKey="amount"
+                        nameKey="budget_code"
+                        innerRadius={52}
+                        outerRadius={72}
+                        paddingAngle={0}
+                        startAngle={90}
+                        endAngle={-270}
+                        stroke="#fff"
+                        isAnimationActive={false}
+                        rootTabIndex={0}
+                        onMouseEnter={(data, _index, event) => showSlice(data, event, false)}
+                        onMouseLeave={hideHover}
+                        onClick={(data, _index, event) => showSlice(data, event, true)}
+                        onFocus={(data, _index, event) => showSlice(data, event, false)}
+                        onBlur={hideHover}
+                      >
+                        {donutSlices.map((row) => (
+                          <Cell key={row.budget_code} fill={row.color} />
+                        ))}
+                      </Pie>
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="overview-forecast-donut-empty" aria-hidden="true" />
+                )}
                 {active ? (
                   <SliceTooltip
                     slice={active.slice}
@@ -242,15 +258,16 @@ function DistributionCard({ title, rows, amountUnit, emptyMessage, amountLabel }
                   />
                 ) : null}
                 <div className="overview-forecast-donut-center">
-                  <strong>{slices.length}</strong>
-                  <span>Budget Codes</span>
+                  <strong>{amountCount}</strong>
+                  <span>{centerCaption}</span>
                 </div>
               </div>
+              {omissionNote ? <p className="overview-distribution-note">{omissionNote}</p> : null}
             </div>
             <div
               className="overview-forecast-code-list-scroll data-scroll data-scroll-sm"
               tabIndex={0}
-              aria-label={`Scrollable Budget Code distribution, ${slices.length} Budget Codes`}
+              aria-label={`Scrollable Budget Code distribution, ${tableRows.length} Budget Codes`}
             >
               <table className="overview-mini-table">
                 <thead>
@@ -261,11 +278,17 @@ function DistributionCard({ title, rows, amountUnit, emptyMessage, amountLabel }
                   </tr>
                 </thead>
                 <tbody>
-                  {slices.map((row) => (
+                  {tableRows.map((row) => (
                     <tr key={row.budget_code}>
                       <td>
-                        <span className="legend-swatch" style={{ background: row.color }} />
+                        <span
+                          className="legend-swatch"
+                          style={{ background: row.amount != null && Number(row.amount) > 0 ? row.color : "transparent" }}
+                        />
                         {row.budget_code}
+                        {row.omission_reason ? (
+                          <span className="overview-code-omission"> ({row.omission_reason})</span>
+                        ) : null}
                       </td>
                       <td>{formatAmount(row.amount, amountUnit)}</td>
                       <td>{formatSharePercent(row.percent)}</td>
@@ -438,7 +461,12 @@ export default function Overview() {
   const historicalCodes = shareDistribution(
     historical?.historical_display_budget_codes ?? historical?.latest_complete_year_budget_codes,
     "actual_amount",
-  );
+    { includeMissing: true },
+  ).map((row) => (
+    row.amount == null
+      ? { ...row, omission_reason: row.omission_reason || "No numeric actuals in display year" }
+      : row
+  ));
   const monthlyTitle = chartYear == null
     ? `Monthly Actuals – ${categoryName}`
     : `Monthly Actuals (${chartYear}) – ${categoryName}`;
@@ -449,6 +477,11 @@ export default function Overview() {
   const forecastPoints = forecastView?.months || [];
   const forecastYear = forecastView?.forecastYear;
   const historicalNote = overviewHistoricalNote(historical);
+  const categoryCodeCount = Number(historical?.category_budget_code_count);
+  const amountCodeCount = Number(historical?.historical_display_amount_code_count);
+  const historicalCountNote = Number.isFinite(categoryCodeCount) && categoryCodeCount > 0 && Number.isFinite(amountCodeCount)
+    ? `Category membership ${categoryCodeCount}; ${amountCodeCount} with ${chartYear ?? "display-year"} amounts.`
+    : "";
   const activities = historyRecords.slice(0, 5);
 
   return (
@@ -460,172 +493,178 @@ export default function Overview() {
         </div>
       </header>
 
-      <div className="field overview-category-field">
-        <label htmlFor="overview-category">Select Category</label>
-        <select
-          id="overview-category"
-          value={categoryId}
-          onChange={(event) => setCategoryId(event.target.value)}
-          disabled={loading || !categories.length}
-        >
-          {categories.map((item) => (
-            <option key={item.id} value={item.id}>{item.name}</option>
-          ))}
-        </select>
-      </div>
+      <section className="overview-historical" aria-label="Historical Actuals">
+        <h2>Historical Actuals</h2>
+        <div className="field overview-category-field">
+          <label htmlFor="overview-category">Select Category</label>
+          <select
+            id="overview-category"
+            value={categoryId}
+            onChange={(event) => setCategoryId(event.target.value)}
+            disabled={loading || !categories.length}
+          >
+            {categories.map((item) => (
+              <option key={item.id} value={item.id}>{item.name}</option>
+            ))}
+          </select>
+        </div>
 
-      {historicalNote ? <p className="overview-historical-note">{historicalNote}</p> : null}
-      {historical ? (
-        <p className="overview-historical-note">
-          {overviewLatestYearLabel(completeYear)}. {DECLARED_MISSING_TOTAL_NOTE}
-          {historical.actuals_display_label ? ` ${historical.actuals_display_label}` : ""}
-        </p>
-      ) : null}
+        {historicalNote ? <p className="overview-historical-note">{historicalNote}</p> : null}
+        {historical ? (
+          <p className="overview-historical-note">
+            {overviewLatestYearLabel(completeYear)}. {DECLARED_MISSING_TOTAL_NOTE}
+            {historical.actuals_display_label ? ` ${historical.actuals_display_label}` : ""}
+            {historicalCountNote ? ` ${historicalCountNote}` : ""}
+          </p>
+        ) : null}
 
-      <div className="summary-grid summary-grid-four overview-kpi-row">
-        <SummaryCard label="Category Forecast" value={forecastView ? formatAmount(forecastView.total, forecastAmountUnit) : "—"} />
-        <SummaryCard label="Monthly Average" value={forecastView ? formatAmount(forecastView.average, forecastAmountUnit) : "—"} />
-        <SummaryCard label="Budget Codes" value={forecastView ? String(forecastView.codeCount) : "—"} />
-        <SummaryCard label="Category Share" value={formatSharePercent(forecastView?.share)} />
-      </div>
-
-      <div className="overview-split">
-        <article className="card section-card">
-          <h2 className="section-card-header">
-            {monthlyTitle}
-          </h2>
-          <div className="section-card-body overview-chart-body">
-            {historicalLoading && !historical ? (
-              <EmptyCopy>Loading historical actuals…</EmptyCopy>
-            ) : historicalError ? (
-              <EmptyCopy>{historicalError}</EmptyCopy>
-            ) : !chartHasActual ? (
-              <EmptyCopy>
-                {completeYearUnavailable
-                  || `No numeric actuals for ${chartYear} in this category. ${DECLARED_MISSING_TOTAL_NOTE}`}
-              </EmptyCopy>
-            ) : (
-              <ResponsiveContainer width="100%" height={280}>
-                <BarChart data={actualPoints} margin={cartesianChartMargin({ bottom: 12 })} barCategoryGap="22%">
-                  <CartesianGrid stroke={palette.grid} vertical={false} />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={12} interval="preserveStartEnd" />
-                  <YAxis {...valueYAxisProps(historicalUnit)} tickLine={false} axisLine={false} tickFormatter={formatAxisTick} />
-                  <Tooltip
-                    cursor={{ fill: "rgba(2, 62, 138, 0.08)" }}
-                    content={({ active, payload }) => {
-                      if (!active || !payload?.length) {
-                        return null;
-                      }
-                      const point = payload[0].payload;
-                      return (
-                        <ChartTooltip>
-                          <div className="chart-tooltip-month">{monthTitle(point.month)}</div>
-                          <div>{`Category: ${categoryName}`}</div>
-                          <div>{`Actual amount: ${point.actual_amount == null ? "—" : formatAmount(point.actual_amount, historicalAmountUnit)}`}</div>
-                          <div>{`Year: ${point.year}`}</div>
-                          <div>{DECLARED_MISSING_TOTAL_NOTE}</div>
-                        </ChartTooltip>
-                      );
-                    }}
-                  />
-                  <Bar
-                    dataKey="actual_amount"
-                    name="Actual"
-                    fill={palette.historical}
-                    maxBarSize={28}
-                    radius={[3, 3, 0, 0]}
-                    isAnimationActive={false}
-                  />
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-        </article>
-        <DistributionCard
-          title={distributionTitle}
-          rows={historicalCodes}
-          amountUnit={historicalAmountUnit}
-          amountLabel="Actual"
-          emptyMessage={
-            historicalLoading
-              ? "Loading historical actuals…"
-              : historicalError
-                ? historicalError
-                : !chartHasActual
-                  ? (completeYearUnavailable
-                    || `No numeric actuals for ${chartYear} in this category. ${DECLARED_MISSING_TOTAL_NOTE}`)
-                  : "Budget Code breakdown is not available for this record."
-          }
-        />
-      </div>
+        <div className="overview-split">
+          <article className="card section-card">
+            <h2 className="section-card-header">
+              {monthlyTitle}
+            </h2>
+            <div className="section-card-body overview-chart-body">
+              {historicalLoading && !historical ? (
+                <EmptyCopy>Loading historical actuals…</EmptyCopy>
+              ) : historicalError ? (
+                <EmptyCopy>{historicalError}</EmptyCopy>
+              ) : !chartHasActual ? (
+                <EmptyCopy>
+                  {completeYearUnavailable
+                    || `No numeric actuals for ${chartYear} in this category. ${DECLARED_MISSING_TOTAL_NOTE}`}
+                </EmptyCopy>
+              ) : (
+                <ResponsiveContainer width="100%" height={280}>
+                  <BarChart data={actualPoints} margin={cartesianChartMargin({ bottom: 12 })} barCategoryGap="22%">
+                    <CartesianGrid stroke={palette.grid} vertical={false} />
+                    <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={12} interval="preserveStartEnd" />
+                    <YAxis {...valueYAxisProps(historicalUnit)} tickLine={false} axisLine={false} tickFormatter={formatAxisTick} />
+                    <Tooltip
+                      cursor={{ fill: "rgba(2, 62, 138, 0.08)" }}
+                      content={({ active, payload }) => {
+                        if (!active || !payload?.length) {
+                          return null;
+                        }
+                        const point = payload[0].payload;
+                        return (
+                          <ChartTooltip>
+                            <div className="chart-tooltip-month">{monthTitle(point.month)}</div>
+                            <div>{`Category: ${categoryName}`}</div>
+                            <div>{`Actual amount: ${point.actual_amount == null ? "—" : formatAmount(point.actual_amount, historicalAmountUnit)}`}</div>
+                            <div>{`Year: ${point.year}`}</div>
+                            <div>{DECLARED_MISSING_TOTAL_NOTE}</div>
+                          </ChartTooltip>
+                        );
+                      }}
+                    />
+                    <Bar
+                      dataKey="actual_amount"
+                      name="Actual"
+                      fill={palette.historical}
+                      maxBarSize={28}
+                      radius={[3, 3, 0, 0]}
+                      isAnimationActive={false}
+                    />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </article>
+          <DistributionCard
+            title={distributionTitle}
+            rows={historicalCodes}
+            amountUnit={historicalAmountUnit}
+            amountLabel="Actual"
+            centerCaption="With amounts"
+            emptyMessage={
+              historicalLoading
+                ? "Loading historical actuals…"
+                : historicalError
+                  ? historicalError
+                  : !chartHasActual
+                    ? (completeYearUnavailable
+                      || `No numeric actuals for ${chartYear} in this category. ${DECLARED_MISSING_TOTAL_NOTE}`)
+                    : "Budget Code breakdown is not available for this record."
+            }
+          />
+        </div>
+      </section>
 
       <section className="overview-latest-forecast" aria-label="Latest Forecast">
         <h2>Latest Forecast</h2>
         <p>{forecastCategoryName !== "Category" ? forecastCategoryName : "—"}</p>
         <p>{forecastRun ? recordPeriod(forecastRun) : "—"}</p>
         <p>{forecastRun?.generated_at ? `Generated ${formatGeneratedAt(forecastRun.generated_at)}` : ""}</p>
-      </section>
 
-      <div className="overview-split">
-        <article className="card section-card">
-          <h2 className="section-card-header">
-            {forecastYear ? `Monthly Forecast (${forecastYear}) – ${forecastCategoryName}` : `Monthly Forecast – ${forecastCategoryName}`}
-          </h2>
-          <div className="section-card-body overview-chart-body">
-            {forecastLoading && !forecastView ? (
-              <EmptyCopy>Loading latest forecast…</EmptyCopy>
-            ) : forecastError || !forecastView ? (
-              <EmptyCopy>{forecastError || "No forecast is available yet."}</EmptyCopy>
-            ) : (
-              <ResponsiveContainer width="100%" height={280}>
-                <BarChart data={forecastPoints} margin={cartesianChartMargin({ bottom: 12 })} barCategoryGap="22%">
-                  <CartesianGrid stroke={palette.grid} vertical={false} />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={12} interval="preserveStartEnd" />
-                  <YAxis {...valueYAxisProps(forecastUnit)} tickLine={false} axisLine={false} tickFormatter={formatAxisTick} />
-                  <Tooltip
-                    cursor={{ fill: "rgba(2, 62, 138, 0.08)" }}
-                    content={({ active, payload }) => {
-                      if (!active || !payload?.length) {
-                        return null;
-                      }
-                      const point = payload[0].payload;
-                      return (
-                        <ChartTooltip>
-                          <div className="chart-tooltip-month">{monthTitle(point.month)}</div>
-                          <div>{`Category: ${forecastCategoryName}`}</div>
-                          <div>{`Forecast amount: ${formatAmount(point.forecast_amount, forecastAmountUnit)}`}</div>
-                          <div>{`Forecast period: ${recordPeriod(forecastRun)}`}</div>
-                        </ChartTooltip>
-                      );
-                    }}
-                  />
-                  <Bar
-                    dataKey="forecast_amount"
-                    name="Forecast"
-                    fill={palette.forecast}
-                    maxBarSize={28}
-                    radius={[3, 3, 0, 0]}
-                    isAnimationActive={false}
-                  />
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-        </article>
-        <DistributionCard
-          title={`Budget Code Distribution (Latest Forecast) – ${forecastCategoryName}`}
-          rows={forecastView?.codes || []}
-          amountUnit={forecastAmountUnit}
-          amountLabel="Forecast"
-          emptyMessage={
-            forecastLoading && !forecastView
-              ? "Loading latest forecast…"
-              : forecastView
-                ? "Budget Code breakdown is not available for this record."
-                : (forecastError || "No forecast is available yet.")
-          }
-        />
-      </div>
+        <div className="summary-grid summary-grid-four overview-kpi-row">
+          <SummaryCard label="Category Forecast" value={forecastView ? formatAmount(forecastView.total, forecastAmountUnit) : "—"} />
+          <SummaryCard label="Monthly Average" value={forecastView ? formatAmount(forecastView.average, forecastAmountUnit) : "—"} />
+          <SummaryCard label="Budget Codes" value={forecastView ? String(forecastView.codeCount) : "—"} />
+          <SummaryCard label="Category Share" value={formatSharePercent(forecastView?.share)} />
+        </div>
+
+        <div className="overview-split">
+          <article className="card section-card">
+            <h2 className="section-card-header">
+              {forecastYear ? `Monthly Forecast (${forecastYear}) – ${forecastCategoryName}` : `Monthly Forecast – ${forecastCategoryName}`}
+            </h2>
+            <div className="section-card-body overview-chart-body">
+              {forecastLoading && !forecastView ? (
+                <EmptyCopy>Loading latest forecast…</EmptyCopy>
+              ) : forecastError || !forecastView ? (
+                <EmptyCopy>{forecastError || "No forecast is available yet."}</EmptyCopy>
+              ) : (
+                <ResponsiveContainer width="100%" height={280}>
+                  <BarChart data={forecastPoints} margin={cartesianChartMargin({ bottom: 12 })} barCategoryGap="22%">
+                    <CartesianGrid stroke={palette.grid} vertical={false} />
+                    <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={12} interval="preserveStartEnd" />
+                    <YAxis {...valueYAxisProps(forecastUnit)} tickLine={false} axisLine={false} tickFormatter={formatAxisTick} />
+                    <Tooltip
+                      cursor={{ fill: "rgba(2, 62, 138, 0.08)" }}
+                      content={({ active, payload }) => {
+                        if (!active || !payload?.length) {
+                          return null;
+                        }
+                        const point = payload[0].payload;
+                        return (
+                          <ChartTooltip>
+                            <div className="chart-tooltip-month">{monthTitle(point.month)}</div>
+                            <div>{`Category: ${forecastCategoryName}`}</div>
+                            <div>{`Forecast amount: ${formatAmount(point.forecast_amount, forecastAmountUnit)}`}</div>
+                            <div>{`Forecast period: ${recordPeriod(forecastRun)}`}</div>
+                          </ChartTooltip>
+                        );
+                      }}
+                    />
+                    <Bar
+                      dataKey="forecast_amount"
+                      name="Forecast"
+                      fill={palette.forecast}
+                      maxBarSize={28}
+                      radius={[3, 3, 0, 0]}
+                      isAnimationActive={false}
+                    />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </article>
+          <DistributionCard
+            title={`Budget Code Distribution (Latest Forecast) – ${forecastCategoryName}`}
+            rows={forecastView?.codes || []}
+            amountUnit={forecastAmountUnit}
+            amountLabel="Forecast"
+            centerCaption="With amounts"
+            emptyMessage={
+              forecastLoading && !forecastView
+                ? "Loading latest forecast…"
+                : forecastView
+                  ? "Budget Code breakdown is not available for this record."
+                  : (forecastError || "No forecast is available yet.")
+            }
+          />
+        </div>
+      </section>
 
       <article className="card section-card overview-activity-card">
         <div className="section-card-header overview-card-head">
@@ -643,7 +682,7 @@ export default function Overview() {
                     <th>Date & Time</th>
                     <th>Forecast Period</th>
                     <th>Category</th>
-                    <th>No. of Codes</th>
+                    <th title="Codes selected at generate time, including unavailable accounts">Selected Codes</th>
                     <th>Status</th>
                     <th>Actions</th>
                   </tr>

@@ -85,7 +85,8 @@ class MonthlyActualItem(BaseModel):
 class BudgetCodeActualItem(BaseModel):
     budget_code: str
     account_name: str
-    actual_amount: float
+    # Null when the code is in the category but has no finite numeric month in scope.
+    actual_amount: Optional[float] = None
 
 
 class OverviewHistoricalResponse(BaseModel):
@@ -104,6 +105,9 @@ class OverviewHistoricalResponse(BaseModel):
     historical_display_year: Optional[int] = None
     historical_display_year_partial: bool = False
     historical_display_budget_codes: list[BudgetCodeActualItem] = []
+    # Membership vs display-year amount coverage (not rewritten into stored forecasts).
+    category_budget_code_count: int = 0
+    historical_display_amount_code_count: int = 0
     coverage_scope: str = "master"
     historical_data_partial: bool = False
     historical_missing_budget_codes: list[str] = []
@@ -153,6 +157,7 @@ class OverviewAnalysisResponse(BaseModel):
     history_end: str
     display_history_start: Optional[str] = None
     display_history_end: Optional[str] = None
+    history_range: str = "latest2"
     latest_complete_year: Optional[int] = None
     latest_year: int
     latest_year_is_partial: bool
@@ -710,20 +715,48 @@ def _shift_iso_month(iso: str, delta: int) -> str:
     return f"{index // 12:04d}-{(index % 12) + 1:02d}"
 
 
-def _display_history_window(history_start: str, history_end: str) -> tuple[str, str]:
-    """Last 24 months ending at the latest stored historical month (not the clock).
+def _complete_calendar_years_from_dates(month_dates) -> list[int]:
+    """Years with confirmed Jan–Dec month records present (amounts may be null)."""
+    by_year: dict[int, set[int]] = {}
+    for item in month_dates or []:
+        timestamp = pd.Timestamp(item).replace(day=1)
+        by_year.setdefault(int(timestamp.year), set()).add(int(timestamp.month))
+    return sorted(
+        year
+        for year, months in by_year.items()
+        if months == set(range(1, 13))
+    )
 
-    Example: latest Sep 2026 → Oct 2024–Sep 2026. Clamped to available history.
+
+def _display_history_window(
+    history_start: str,
+    history_end: str,
+    month_dates=None,
+    *,
+    history_range: str = "latest2",
+) -> tuple[str, str]:
+    """Historical display window from confirmed month records.
+
+    latest2: latest two complete calendar years (example: data through Sep 2026
+    → Jan 2024–Dec 2025). all: full available history including partial years.
     """
-    end = str(history_end or "")
-    if len(end) < 7 or end[4] != "-":
-        return str(history_start or end), end
-    start = _shift_iso_month(end, -23)
+    mode = str(history_range or "latest2").strip().lower()
+    if mode in {"all", "all_history", "full"}:
+        return str(history_start or history_end), str(history_end or history_start)
+    complete_years = _complete_calendar_years_from_dates(month_dates)
+    if not complete_years:
+        return "", ""
+    selected = complete_years[-2:]
+    start = f"{selected[0]:04d}-01"
+    end = f"{selected[-1]:04d}-12"
     available_start = str(history_start or start)
+    available_end = str(history_end or end)
     if available_start and start < available_start:
         start = available_start
+    if available_end and end > available_end:
+        end = available_end
     if start > end:
-        start = end
+        return "", ""
     return start, end
 
 
@@ -784,7 +817,7 @@ def _combined_month_total(selected_all: pd.DataFrame, column: str) -> float | No
     return total
 
 
-def _analysis_from_prepared(prepared: dict) -> dict:
+def _analysis_from_prepared(prepared: dict, *, history_range: str = "latest2") -> dict:
     category = prepared["category"]
     scope = prepared["scope"]
     date_to_column = prepared["date_to_column"]
@@ -792,6 +825,9 @@ def _analysis_from_prepared(prepared: dict) -> dict:
     selected_codes = prepared["selected_codes"]
     names = prepared["names"]
     selected_all = prepared["selected_all"]
+    mode = str(history_range or "latest2").strip().lower()
+    if mode in {"last24", "recent", "rolling24"}:
+        mode = "latest2"
 
     monthly_actuals = []
     complete_totals: list[tuple[str, float]] = []
@@ -803,30 +839,53 @@ def _analysis_from_prepared(prepared: dict) -> dict:
         if total is not None:
             complete_totals.append((iso, total))
 
-    display_start, display_end = _display_history_window(scope["history_start"], scope["history_end"])
+    display_start, display_end = _display_history_window(
+        scope["history_start"],
+        scope["history_end"],
+        month_dates,
+        history_range=mode,
+    )
+    complete_years = _complete_calendar_years_from_dates(month_dates)
+    range_is_all = mode in {"all", "all_history", "full"}
+    selected_years = None if range_is_all else set(complete_years[-2:])
+    empty_latest2 = selected_years is not None and not selected_years
+
+    def _in_aggregate_scope(iso: str) -> bool:
+        if empty_latest2 or not display_start or not display_end:
+            return False
+        if not _iso_in_window(iso, display_start, display_end):
+            return False
+        if selected_years is None:
+            return True
+        return int(iso[:4]) in selected_years
+
     display_dates = [
         date for date in month_dates
-        if _iso_in_window(_iso_month(date), display_start, display_end)
+        if _in_aggregate_scope(_iso_month(date))
     ]
     display_complete = [
         (iso, amount) for iso, amount in complete_totals
-        if _iso_in_window(iso, display_start, display_end)
+        if _in_aggregate_scope(iso)
     ]
     display_years = {int(iso[:4]) for iso, _ in display_complete}
-    # Prior calendar year may be needed solely for matching-month YoY growth.
-    baseline_year = int(display_start[:4]) - 1
-    yearly_source = list(display_complete)
-    yearly_source.extend(
-        (iso, amount) for iso, amount in complete_totals
-        if int(iso[:4]) == baseline_year
+    baseline_year = (
+        int(display_start[:4]) - 1
+        if display_start and len(display_start) >= 7 and not empty_latest2
+        else None
     )
+    yearly_source = list(display_complete)
+    if baseline_year is not None:
+        yearly_source.extend(
+            (iso, amount) for iso, amount in complete_totals
+            if int(iso[:4]) == baseline_year
+        )
 
     complete_month_count = len(display_complete)
     overall_total = float(sum(amount for _, amount in display_complete))
     if not np.isfinite(overall_total):
         raise OverviewDataError("Historical actuals contain a non-finite total.")
     monthly_average = float(overall_total / complete_month_count) if complete_month_count else None
-    yearly_actuals = _yearly_actuals(yearly_source, display_years=display_years)
+    yearly_actuals = _yearly_actuals(yearly_source, display_years=display_years) if display_years else []
     latest_year_growth_percent = yearly_actuals[-1]["growth_percent"] if yearly_actuals else None
 
     history_month_count = len(display_dates)
@@ -860,8 +919,9 @@ def _analysis_from_prepared(prepared: dict) -> dict:
         "category": {"id": category["id"], "name": category["name"]},
         "history_start": scope["history_start"],
         "history_end": scope["history_end"],
-        "display_history_start": display_start,
-        "display_history_end": display_end,
+        "display_history_start": None if empty_latest2 else (display_start or None),
+        "display_history_end": None if empty_latest2 else (display_end or None),
+        "history_range": "all" if range_is_all else "latest2",
         "latest_complete_year": scope["latest_complete_year"],
         "latest_year": int(scope["latest_year"]),
         "latest_year_is_partial": bool(scope["latest_year_is_partial"]),
@@ -875,7 +935,7 @@ def _analysis_from_prepared(prepared: dict) -> dict:
         "complete_month_count": complete_month_count,
         "budget_code_count": len(budget_codes),
         "recurring_count": sum(1 for item in budget_codes if item["recurring"]),
-        # Full stored monthly series retained for Forecast/Comparison tabs.
+        # Full stored monthly series retained for Forecast/Comparison tabs and client windows.
         "monthly_actuals": monthly_actuals,
         "yearly_actuals": yearly_actuals,
         "seasonal_profile": _seasonal_profile(display_complete),
@@ -884,8 +944,8 @@ def _analysis_from_prepared(prepared: dict) -> dict:
     }
 
 
-def _build_analysis(category: dict) -> dict:
-    return _analysis_from_prepared(_prepare_category_actuals(category))
+def _build_analysis(category: dict, *, history_range: str = "latest2") -> dict:
+    return _analysis_from_prepared(_prepare_category_actuals(category), history_range=history_range)
 
 
 def _category_year_actuals(prepared: dict, year: int) -> tuple[list[dict], list[dict]]:
@@ -920,16 +980,29 @@ def _category_year_actuals(prepared: dict, year: int) -> tuple[list[dict], list[
                 continue
             code_totals[code] = code_totals.get(code, 0.0) + float(value) * AMOUNT_CONVERSION_FACTOR
             code_found.add(code)
-    rows = [
-        {
-            "budget_code": str(code),
-            "account_name": names.get(str(code)) or names.get(code) or "",
-            "actual_amount": float(code_totals[code]),
-        }
-        for code in selected_codes
-        if code in code_found and np.isfinite(code_totals.get(code, float("nan")))
-    ]
-    rows.sort(key=lambda item: (-item["actual_amount"], item["budget_code"]))
+    rows = []
+    for code in selected_codes:
+        name = names.get(str(code)) or names.get(code) or ""
+        if code in code_found and np.isfinite(code_totals.get(code, float("nan"))):
+            rows.append({
+                "budget_code": str(code),
+                "account_name": name,
+                "actual_amount": float(code_totals[code]),
+            })
+        else:
+            # Keep category membership visible: no finite month in this year is not a silent drop.
+            rows.append({
+                "budget_code": str(code),
+                "account_name": name,
+                "actual_amount": None,
+            })
+    rows.sort(
+        key=lambda item: (
+            item["actual_amount"] is None,
+            -(item["actual_amount"] if item["actual_amount"] is not None else 0.0),
+            item["budget_code"],
+        )
+    )
     return monthly_actuals, rows
 
 
@@ -978,16 +1051,22 @@ def _overlay_submission_coverage(payload: dict, category: dict | None = None) ->
     payload["historical_display_year"] = display_year
     payload["historical_display_year_partial"] = partial
     payload["latest_year_is_partial"] = complete_year is None
+    selected_count = len(prepared.get("selected_codes") or [])
+    payload["category_budget_code_count"] = int(selected_count)
     if display_year is None:
         payload["latest_year_monthly_actuals"] = []
         payload["latest_complete_year_budget_codes"] = []
         payload["historical_display_budget_codes"] = []
+        payload["historical_display_amount_code_count"] = 0
         return payload
     monthly_actuals, budget_codes = _category_year_actuals(prepared, int(display_year))
     payload["latest_year"] = int(display_year)
     payload["latest_year_monthly_actuals"] = monthly_actuals
     payload["historical_display_budget_codes"] = budget_codes
     payload["latest_complete_year_budget_codes"] = [] if partial else budget_codes
+    payload["historical_display_amount_code_count"] = sum(
+        1 for row in budget_codes if row.get("actual_amount") is not None
+    )
     return payload
 
 
@@ -1001,13 +1080,22 @@ def _get_historical(category: str | None) -> dict:
     return payload
 
 
-def _get_analysis(category: str | None) -> dict:
+def _normalize_history_range(history_range: str | None) -> str:
+    mode = str(history_range or "latest2").strip().lower()
+    if mode in {"all", "all_history", "full"}:
+        return "all"
+    return "latest2"
+
+
+def _get_analysis(category: str | None, history_range: str | None = "latest2") -> dict:
     resolved = _resolve_category(category)
-    cached = _analysis_cache.get(resolved["id"])
+    mode = _normalize_history_range(history_range)
+    cache_key = f"{resolved['id']}:{mode}"
+    cached = _analysis_cache.get(cache_key)
     if cached is not None:
         return cached
-    payload = _overlay_submission_coverage(_build_analysis(resolved), None)
-    _analysis_cache[resolved["id"]] = payload
+    payload = _overlay_submission_coverage(_build_analysis(resolved, history_range=mode), None)
+    _analysis_cache[cache_key] = payload
     return payload
 
 
@@ -1034,9 +1122,13 @@ def overview_historical(
 @router.get("/analysis", response_model=OverviewAnalysisResponse)
 def overview_analysis(
     category: str | None = Query(default=None, description="Category id or name"),
+    history_range: str | None = Query(
+        default="latest2",
+        description="Historical display range: latest2 (two complete calendar years) or all",
+    ),
 ) -> OverviewAnalysisResponse:
     try:
-        return OverviewAnalysisResponse(**_get_analysis(category))
+        return OverviewAnalysisResponse(**_get_analysis(category, history_range=history_range))
     except OverviewNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except OverviewDataError as error:
