@@ -16,7 +16,33 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def last_active_upload_at() -> Any | None:
+    """Uploaded_at of the newest active non-legacy dataset revision, if any."""
+    try:
+        with get_connection() as connection:
+            last_upload = connection.execute(
+                """
+                SELECT uploaded_at
+                FROM dataset_files
+                WHERE status = 'active' AND is_legacy = FALSE
+                ORDER BY uploaded_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return None if not last_upload else last_upload["uploaded_at"]
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to load the historical data summary.") from error
+
+
 def historical_summary() -> dict[str, Any]:
+    """Lightweight DB counts for the confirmed historical tables.
+
+    Month bounds are the union of dataset_master_meta and historical_actuals so a
+    stale meta.latest_month cannot hide later confirmed months. Budget Codes use
+    the full meta catalog when present (including codes with no numeric rows),
+    not a training-eligible subset. Prefer dataset_service.summary() for Settings,
+    which merges catalog + actuals via load_master_state.
+    """
     try:
         with get_connection() as connection:
             bounds = connection.execute(
@@ -36,23 +62,36 @@ def historical_summary() -> dict[str, Any]:
                 WHERE id = 1
                 """
             ).fetchone()
-            last_upload = connection.execute(
-                """
-                SELECT uploaded_at
-                FROM dataset_files
-                WHERE status = 'active' AND is_legacy = FALSE
-                ORDER BY uploaded_at DESC
-                LIMIT 1
-                """
-            ).fetchone()
+            actual_code_rows = connection.execute(
+                "SELECT DISTINCT budget_code FROM historical_actuals"
+            ).fetchall()
+        last_upload_at = last_active_upload_at()
         codes = []
         if identity and isinstance(identity["budget_codes"], list):
             codes = [item for item in identity["budget_codes"] if isinstance(item, dict) and item.get("budget_code")]
-        earliest = (identity or {}).get("earliest_month") or (None if not bounds else bounds["earliest_month"])
-        latest = (identity or {}).get("latest_month") or (None if not bounds else bounds["latest_month"])
-        if codes:
-            budget_code_count = len({str(item["budget_code"]) for item in codes})
-            category_count = len({str(item.get("category") or "").strip() for item in codes if str(item.get("category") or "").strip()})
+        meta_earliest = (identity or {}).get("earliest_month")
+        meta_latest = (identity or {}).get("latest_month")
+        actual_earliest = None if not bounds else bounds["earliest_month"]
+        actual_latest = None if not bounds else bounds["latest_month"]
+        earliest_candidates = [item for item in (meta_earliest, actual_earliest) if item]
+        latest_candidates = [item for item in (meta_latest, actual_latest) if item]
+        earliest = min(earliest_candidates) if earliest_candidates else None
+        latest = max(latest_candidates) if latest_candidates else None
+        catalog_codes = {str(item["budget_code"]) for item in codes}
+        catalog_codes.update(
+            str(row["budget_code"]) for row in actual_code_rows if row.get("budget_code")
+        )
+        if catalog_codes:
+            budget_code_count = len(catalog_codes)
+            category_count = len(
+                {
+                    str(item.get("category") or "").strip()
+                    for item in codes
+                    if str(item.get("category") or "").strip()
+                }
+            )
+            if category_count == 0 and bounds:
+                category_count = int(bounds["category_count"] or 0)
         else:
             budget_code_count = 0 if not bounds else int(bounds["budget_code_count"] or 0)
             category_count = 0 if not bounds else int(bounds["category_count"] or 0)
@@ -62,7 +101,7 @@ def historical_summary() -> dict[str, Any]:
             "latest_month": None if empty else latest,
             "category_count": 0 if empty else category_count,
             "budget_code_count": 0 if empty else budget_code_count,
-            "last_upload_at": None if not last_upload else last_upload["uploaded_at"],
+            "last_upload_at": last_upload_at,
             "empty": empty,
         }
     except psycopg.Error as error:

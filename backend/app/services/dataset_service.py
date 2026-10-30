@@ -38,6 +38,7 @@ from app.services.dataset_repository import (
     get_audit_event,
     historical_summary,
     insert_preview,
+    last_active_upload_at,
     list_change_records_for_audit,
     list_change_records_for_file,
     list_dataset_files,
@@ -989,29 +990,96 @@ def _summary_from_loaded_workbook(workbook: dict[str, Any]) -> dict[str, Any] | 
     return payload
 
 
-def _coverage_summary(payload: dict[str, Any]) -> dict[str, Any]:
+def _coverage_summary(payload: dict[str, Any], state: dict[str, Any] | None = None) -> dict[str, Any]:
     from app.services.dataset_master import load_master_state
     from app.services.submission_state import coverage_fields, coverage_report
 
-    report = coverage_report(load_master_state())
+    report = coverage_report(state if state is not None else load_master_state())
     return {**payload, **coverage_fields(report)}
 
 
+def _summary_from_master_state(state: dict[str, Any], last_upload_at: Any) -> dict[str, Any] | None:
+    """Settings Current Data Summary from the active confirmed master only."""
+    codes = [item for item in (state.get("budget_codes") or []) if item.get("budget_code")]
+    records = list(state.get("records") or [])
+    if not codes and not records:
+        return None
+    categories = {
+        str(item.get("category") or "").strip()
+        for item in codes
+        if str(item.get("category") or "").strip()
+    }
+    if not categories:
+        categories = {
+            str(item.get("category") or "").strip()
+            for item in records
+            if str(item.get("category") or "").strip()
+        }
+    source = state.get("source") or "database"
+    payload = {
+        "earliest_month": state.get("earliest_month"),
+        "latest_month": state.get("latest_month"),
+        "category_count": len(categories),
+        # Full confirmed catalog (includes codes with no numeric actuals).
+        "budget_code_count": len(codes) if codes else len({str(item.get("budget_code")) for item in records if item.get("budget_code")}),
+        "last_upload_at": last_upload_at if source == "database" else None,
+        "empty": False,
+        "data_source": source,
+    }
+    if source == "production_workbook":
+        payload["data_source_label"] = "Production Historical Dataset"
+        payload["last_upload_at"] = None
+    return _coverage_summary(payload, state)
+
+
 def summary() -> dict[str, Any]:
+    """Current Data Summary for Settings: active confirmed historical dataset.
+
+    Uses load_master_state (DB catalog + actuals + declarations), not model
+    metadata, unconfirmed previews, or a stale workbook when the DB has data.
+    Workbook fallback applies only when no confirmed master exists.
+    """
+    last_upload_at = None
+    try:
+        last_upload_at = last_active_upload_at()
+    except DatabaseError:
+        last_upload_at = None
+
+    try:
+        state = load_master_state()
+    except Exception:
+        state = None
+    if state is not None and state.get("source") == "database":
+        derived = _summary_from_master_state(state, last_upload_at)
+        if derived is not None:
+            return derived
+
     stored = historical_summary()
     if not stored.get("empty"):
-        return _coverage_summary({**stored, "data_source": "database"})
+        return _coverage_summary(
+            {
+                **stored,
+                "data_source": "database",
+                "last_upload_at": last_upload_at or stored.get("last_upload_at"),
+            }
+        )
+
+    if state is not None and state.get("source") == "production_workbook":
+        derived = _summary_from_master_state(state, None)
+        if derived is not None:
+            return derived
+
     try:
         from app.routers.overview import OverviewDataError, _load_workbook
 
         workbook = _load_workbook()
     except OverviewDataError:
-        return {**stored, "data_source": None}
+        return {**stored, "data_source": None, "last_upload_at": last_upload_at}
     derived = _summary_from_loaded_workbook(workbook)
     if derived is None:
-        return {**stored, "data_source": None}
+        return {**stored, "data_source": None, "last_upload_at": last_upload_at}
     if derived["data_source"] == "database":
-        derived["last_upload_at"] = stored.get("last_upload_at")
+        derived["last_upload_at"] = last_upload_at or stored.get("last_upload_at")
     return _coverage_summary(derived)
 
 
@@ -1883,8 +1951,10 @@ def add_book_entry(body: dict[str, Any], actor=None) -> dict[str, Any]:
     record = _run_book_entry_change(mutate)
     _import_preprocessing()
     from preprocessing import clear_book_entry_cache
+    from app.routers import overview as overview_router
 
     clear_book_entry_cache()
+    overview_router.invalidate_overview_cache()
     return {"account": record, "previous": None, "new": record}
 
 
@@ -1927,8 +1997,10 @@ def update_book_entry(budget_code: str, body: dict[str, Any], actor=None) -> dic
     previous, record = _run_book_entry_change(mutate)
     _import_preprocessing()
     from preprocessing import clear_book_entry_cache
+    from app.routers import overview as overview_router
 
     clear_book_entry_cache()
+    overview_router.invalidate_overview_cache()
     return {"account": record, "previous": previous, "new": record}
 
 
@@ -1957,8 +2029,10 @@ def delete_book_entry(budget_code: str) -> dict[str, Any]:
     previous = _run_book_entry_change(mutate)
     _import_preprocessing()
     from preprocessing import clear_book_entry_cache
+    from app.routers import overview as overview_router
 
     clear_book_entry_cache()
+    overview_router.invalidate_overview_cache()
     return {"account": previous, "previous": previous, "new": None}
 
 

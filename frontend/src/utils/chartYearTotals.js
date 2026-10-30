@@ -301,16 +301,17 @@ export function appendMixedYearTotalBars(rows, {
 }
 
 /**
- * Recent-history view for mixed actual/forecast timelines.
- * Uses the Historical Budget Analysis window on the latest stored actual month,
+ * Latest-2-years view for mixed actual/forecast timelines.
+ * Uses the two latest complete calendar years from confirmed actual month rows,
  * then keeps every forecast month (and any existing gap rows between them).
- * Display-window only — does not truncate stored history.
+ * Display-window only — does not truncate stored history or change forecast values.
  */
 export function filterRecentHistoryWithForecast(points, {
   actualKey = "actual",
   forecastKey = "forecast",
   isoKey,
   historyStartIso,
+  confirmedMonthIsos = null,
 } = {}) {
   const source = Array.isArray(points) ? points.filter((row) => !isYearTotalRow(row)) : [];
   if (!source.length) {
@@ -320,32 +321,41 @@ export function filterRecentHistoryWithForecast(points, {
   let latestActual = null;
   let earliestActual = null;
   let firstForecast = null;
+  const actualMonthIsos = [];
   source.forEach((row) => {
     const iso = resolveRowIso(row, isoKey);
     if (!isIsoMonth(iso)) {
       return;
     }
-    if (finiteOrNull(row?.[actualKey]) != null) {
-      if (!latestActual || iso > latestActual) {
-        latestActual = iso;
-      }
-      if (!earliestActual || iso < earliestActual) {
-        earliestActual = iso;
-      }
-    }
     if (finiteOrNull(row?.[forecastKey]) != null) {
       if (!firstForecast || iso < firstForecast) {
         firstForecast = iso;
       }
+      return;
+    }
+    // Historical side only — ignore forecast rows and do not invent completeness from them.
+    actualMonthIsos.push(iso);
+    if (!latestActual || iso > latestActual) {
+      latestActual = iso;
+    }
+    if (!earliestActual || iso < earliestActual) {
+      earliestActual = iso;
     }
   });
 
+  const rangeStart = historyStartIso || earliestActual || null;
+  const confirmedMonths = (Array.isArray(confirmedMonthIsos) ? confirmedMonthIsos : [])
+    .map((value) => String(value || ""))
+    .filter(isIsoMonth);
   const window = resolveHistoricalDisplayWindow(
     latestActual,
-    historyStartIso || earliestActual || null
+    rangeStart,
+    undefined,
+    confirmedMonths.length ? confirmedMonths : actualMonthIsos
   );
   if (!window) {
-    return source.slice();
+    // No complete calendar year — keep forecast months only.
+    return source.filter((row) => finiteOrNull(row?.[forecastKey]) != null);
   }
 
   return source.filter((row) => {
@@ -359,8 +369,14 @@ export function filterRecentHistoryWithForecast(points, {
     if (iso >= window.startIso && iso <= window.endIso) {
       return true;
     }
-    // Preserve chronological gap rows already present between history and forecast.
-    if (firstForecast && iso > window.endIso && iso < firstForecast) {
+    // Preserve blank gap placeholders between the historical window and forecast start.
+    // Do not pull later partial-year actuals into Latest 2 years.
+    if (
+      firstForecast
+      && iso > window.endIso
+      && iso < firstForecast
+      && finiteOrNull(row?.[actualKey]) == null
+    ) {
       return true;
     }
     return false;

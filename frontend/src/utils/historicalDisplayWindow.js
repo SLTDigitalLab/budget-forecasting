@@ -15,7 +15,10 @@ const MONTH_LABELS = [
   "Dec",
 ];
 
-export const HISTORY_RANGE_LAST_24 = "last24";
+/** Latest two complete calendar years in confirmed historical month records. */
+export const HISTORY_RANGE_LATEST_2_YEARS = "latest2";
+/** @deprecated Use HISTORY_RANGE_LATEST_2_YEARS */
+export const HISTORY_RANGE_LAST_24 = HISTORY_RANGE_LATEST_2_YEARS;
 export const HISTORY_RANGE_ALL = "all";
 
 function isIsoMonth(value) {
@@ -50,9 +53,116 @@ function monthIndex(year, month) {
   return year * 12 + (month - 1);
 }
 
+function normalizeRangeMode(rangeMode) {
+  if (rangeMode === HISTORY_RANGE_ALL || rangeMode === "all") {
+    return HISTORY_RANGE_ALL;
+  }
+  // Accept legacy last24 / recent aliases as latest-2-years.
+  return HISTORY_RANGE_LATEST_2_YEARS;
+}
+
 /**
- * Last 24 months ending at the latest stored actual month (not today's date).
- * Example: latest Sep 2026 → Oct 2024 – Sep 2026.
+ * Complete calendar years from confirmed month records.
+ * A year is complete when Jan–Dec month keys exist. Amounts may be null
+ * (explicit missing); absent month keys make the year incomplete.
+ */
+export function listCompleteCalendarYears(monthIsos) {
+  const byYear = new Map();
+  (Array.isArray(monthIsos) ? monthIsos : []).forEach((value) => {
+    const parsed = parseIsoMonth(value);
+    if (!parsed) {
+      return;
+    }
+    if (!byYear.has(parsed.year)) {
+      byYear.set(parsed.year, new Set());
+    }
+    byYear.get(parsed.year).add(parsed.month);
+  });
+  return [...byYear.entries()]
+    .filter(([, months]) => {
+      if (months.size !== 12) {
+        return false;
+      }
+      for (let month = 1; month <= 12; month += 1) {
+        if (!months.has(month)) {
+          return false;
+        }
+      }
+      return true;
+    })
+    .map(([year]) => year)
+    .sort((left, right) => left - right);
+}
+
+function monthIsosFromHistory(history) {
+  const fromRows = (Array.isArray(history?.monthly_actuals) ? history.monthly_actuals : [])
+    .map((row) => String(row?.month || ""))
+    .filter(isIsoMonth);
+  if (fromRows.length) {
+    return fromRows;
+  }
+  const start = parseIsoMonth(history?.history_start);
+  const end = parseIsoMonth(history?.latest_actual_month || history?.history_end);
+  if (!start || !end || start.iso > end.iso) {
+    return [];
+  }
+  const months = [];
+  let cursor = start.iso;
+  while (cursor <= end.iso) {
+    months.push(cursor);
+    cursor = addMonths(cursor, 1);
+  }
+  return months;
+}
+
+/**
+ * Latest two complete calendar years.
+ * Example: data through Sep 2026 → Jan 2024–Dec 2025.
+ * When 2026 is complete → Jan 2025–Dec 2026.
+ * Returns null when no complete year exists (empty state).
+ */
+export function resolveLatestTwoCompleteYearsWindow(monthIsos) {
+  const completeYears = listCompleteCalendarYears(monthIsos);
+  if (!completeYears.length) {
+    return null;
+  }
+  const selectedYears = completeYears.slice(-2);
+  const startYear = selectedYears[0];
+  const endYear = selectedYears[selectedYears.length - 1];
+  return {
+    startIso: `${startYear}-01`,
+    endIso: `${endYear}-12`,
+    startYear,
+    endYear,
+    endMonth: 12,
+    selectedYears,
+    mode: HISTORY_RANGE_LATEST_2_YEARS,
+  };
+}
+
+/**
+ * Full available confirmed history, including partial years.
+ */
+export function resolveAllHistoryWindow(latestIsoMonth, historyStartIso) {
+  const latest = parseIsoMonth(latestIsoMonth);
+  if (!latest) {
+    return null;
+  }
+  const availableStart = parseIsoMonth(historyStartIso);
+  const startIso = availableStart && availableStart.iso <= latest.iso ? availableStart.iso : latest.iso;
+  return {
+    startIso,
+    endIso: latest.iso,
+    startYear: parseIsoMonth(startIso).year,
+    endYear: latest.year,
+    endMonth: latest.month,
+    selectedYears: null,
+    mode: HISTORY_RANGE_ALL,
+  };
+}
+
+/**
+ * @deprecated Rolling 24-month helper retained for older imports; prefer resolveLatestTwoCompleteYearsWindow.
  */
 export function resolveLast24MonthsWindow(latestIsoMonth, historyStartIso) {
   const latest = parseIsoMonth(latestIsoMonth);
@@ -73,43 +183,41 @@ export function resolveLast24MonthsWindow(latestIsoMonth, historyStartIso) {
     startYear: parseIsoMonth(startIso).year,
     endYear: latest.year,
     endMonth: latest.month,
-    mode: HISTORY_RANGE_LAST_24,
+    selectedYears: null,
+    mode: HISTORY_RANGE_LATEST_2_YEARS,
   };
 }
 
 /**
- * Full available history for the selected category/code.
- */
-export function resolveAllHistoryWindow(latestIsoMonth, historyStartIso) {
-  const latest = parseIsoMonth(latestIsoMonth);
-  if (!latest) {
-    return null;
-  }
-  const availableStart = parseIsoMonth(historyStartIso);
-  const startIso = availableStart && availableStart.iso <= latest.iso ? availableStart.iso : latest.iso;
-  return {
-    startIso,
-    endIso: latest.iso,
-    startYear: parseIsoMonth(startIso).year,
-    endYear: latest.year,
-    endMonth: latest.month,
-    mode: HISTORY_RANGE_ALL,
-  };
-}
-
-/**
- * Resolve a historical display window.
- * Default mode is Last 24 months anchored on the latest stored actual month.
+ * Resolve a historical display window from confirmed month records.
  */
 export function resolveHistoricalDisplayWindow(
   latestIsoMonth,
   historyStartIso,
-  rangeMode = HISTORY_RANGE_LAST_24
+  rangeMode = HISTORY_RANGE_LATEST_2_YEARS,
+  monthIsos = null
 ) {
-  if (rangeMode === HISTORY_RANGE_ALL) {
+  const mode = normalizeRangeMode(rangeMode);
+  if (mode === HISTORY_RANGE_ALL) {
     return resolveAllHistoryWindow(latestIsoMonth, historyStartIso);
   }
-  return resolveLast24MonthsWindow(latestIsoMonth, historyStartIso);
+  const months = Array.isArray(monthIsos) && monthIsos.length
+    ? monthIsos
+    : (() => {
+      const start = parseIsoMonth(historyStartIso);
+      const end = parseIsoMonth(latestIsoMonth);
+      if (!start || !end || start.iso > end.iso) {
+        return [];
+      }
+      const list = [];
+      let cursor = start.iso;
+      while (cursor <= end.iso) {
+        list.push(cursor);
+        cursor = addMonths(cursor, 1);
+      }
+      return list;
+    })();
+  return resolveLatestTwoCompleteYearsWindow(months);
 }
 
 export function countCalendarMonthsInWindow(window) {
@@ -236,28 +344,63 @@ function completeTotalsFromMonthly(rows) {
     .filter(Boolean);
 }
 
+function amountRowsForAggregates(displayMonths, window) {
+  const selected = Array.isArray(window?.selectedYears) ? new Set(window.selectedYears) : null;
+  if (!selected) {
+    return displayMonths;
+  }
+  // Latest 2 years: exclude incomplete intervening years from aggregates.
+  return displayMonths.filter((row) => {
+    const parsed = parseIsoMonth(row?.month);
+    return parsed && selected.has(parsed.year);
+  });
+}
+
 /**
  * Build Historical Budget Analysis metrics for the selected display range.
  * Baseline months before the window are used only for YoY matching-month growth.
  */
-export function buildHistoricalDisplayAnalysis(history, { rangeMode = HISTORY_RANGE_LAST_24 } = {}) {
+export function buildHistoricalDisplayAnalysis(history, { rangeMode = HISTORY_RANGE_LATEST_2_YEARS } = {}) {
   if (!history) {
     return null;
   }
+  const mode = normalizeRangeMode(rangeMode);
+  const allMonths = Array.isArray(history.monthly_actuals) ? history.monthly_actuals : [];
+  const monthIsos = monthIsosFromHistory(history);
   const latestIso =
     history.latest_actual_month
     || history.history_end
-    || (Array.isArray(history.monthly_actuals) && history.monthly_actuals.length
-      ? history.monthly_actuals[history.monthly_actuals.length - 1].month
-      : null);
-  const window = resolveHistoricalDisplayWindow(latestIso, history.history_start, rangeMode);
+    || (monthIsos.length ? monthIsos[monthIsos.length - 1] : null);
+  const window = resolveHistoricalDisplayWindow(
+    latestIso,
+    history.history_start,
+    mode,
+    monthIsos
+  );
   if (!window) {
-    return null;
+    return {
+      window: null,
+      rangeMode: mode,
+      periodLabel: "Historical period: unavailable",
+      displayedRangeLabel: "Displayed range: unavailable",
+      calendarMonthCount: 0,
+      monthly_actuals: [],
+      overall_total: 0,
+      monthly_average: null,
+      complete_month_count: 0,
+      yearly_actuals: [],
+      seasonal_profile: buildWindowedSeasonalProfile([]),
+      latest_year_growth_percent: null,
+      budget_codes: Array.isArray(history.budget_codes) ? history.budget_codes : [],
+      recurring_count: history.recurring_count,
+      budget_code_count: history.budget_code_count,
+      emptyReason: "No complete calendar year is available in confirmed historical data.",
+    };
   }
 
-  const allMonths = Array.isArray(history.monthly_actuals) ? history.monthly_actuals : [];
   const displayMonths = filterMonthlyActualsToWindow(allMonths, window);
-  const displayComplete = completeTotalsFromMonthly(displayMonths);
+  const aggregateMonths = amountRowsForAggregates(displayMonths, window);
+  const displayComplete = completeTotalsFromMonthly(aggregateMonths);
   const baselineYear = window.startYear - 1;
   const baselineComplete = completeTotalsFromMonthly(
     allMonths.filter((row) => {
@@ -277,7 +420,7 @@ export function buildHistoricalDisplayAnalysis(history, { rangeMode = HISTORY_RA
 
   return {
     window,
-    rangeMode: window.mode || rangeMode,
+    rangeMode: window.mode || mode,
     periodLabel: formatHistoricalPeriodLabel(window),
     displayedRangeLabel: formatDisplayedRangeLabel(window),
     calendarMonthCount: countCalendarMonthsInWindow(window),
@@ -288,10 +431,10 @@ export function buildHistoricalDisplayAnalysis(history, { rangeMode = HISTORY_RA
     yearly_actuals: yearlyActuals,
     seasonal_profile: seasonalProfile,
     latest_year_growth_percent: latestYearGrowthPercent,
-    // Budget-code recurring totals require per-code months; the analysis API
-    // already windows these with the same display rule for the default range.
+    // Rankings are refreshed from the analysis API for the active range.
     budget_codes: Array.isArray(history.budget_codes) ? history.budget_codes : [],
     recurring_count: history.recurring_count,
     budget_code_count: history.budget_code_count,
+    emptyReason: null,
   };
 }

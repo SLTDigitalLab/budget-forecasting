@@ -51,13 +51,13 @@ import {
 import {
   isYearTotalRow,
   summarizeDisplayedYears,
-  summarizeLatestDisplayedYear,
 } from "../utils/chartYearTotals";
 import {
   HISTORY_RANGE_ALL,
-  HISTORY_RANGE_LAST_24,
+  HISTORY_RANGE_LATEST_2_YEARS,
   buildHistoricalDisplayAnalysis,
 } from "../utils/historicalDisplayWindow";
+import { readOverviewHistoryEpoch } from "../utils/overviewHistoryEpoch";
 import useChartPalette from "../hooks/useChartPalette";
 import {
   axisUnitLabel,
@@ -141,67 +141,50 @@ function HistoricalMonthlyTrendChart({ monthlyTrend, amountUnit, unit }) {
     () => (Array.isArray(monthlyTrend) ? monthlyTrend : []).filter((row) => !isYearTotalRow(row)),
     [monthlyTrend]
   );
-  const yearSummary = useMemo(
-    () => summarizeLatestDisplayedYear(chartRows, { isoKey: "month", valueKey: "actual" }),
-    [chartRows]
-  );
 
   return (
-    <div className="analytics-expenditure-panel">
-      {yearSummary ? (
-        <div className="analytics-ytd-summary" aria-label={yearSummary.title}>
-          <div className="analytics-ytd-summary-title">{yearSummary.title}</div>
-          <div className="analytics-ytd-summary-amount">
-            {yearSummary.total == null ? "Unavailable" : formatAmount(yearSummary.total, amountUnit)}
-          </div>
-          {yearSummary.coverageLabel ? (
-            <div className="analytics-ytd-summary-coverage muted">{yearSummary.coverageLabel}</div>
-          ) : null}
-        </div>
-      ) : null}
-      <div className="analytics-chart analytics-chart-wide analytics-chart-fit" role="img" aria-label="Expenditure trend" ref={hostRef}>
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart
-            data={chartRows}
-            margin={cartesianChartMargin({ bottom: 20, top: 8, right: 12 })}
-            barCategoryGap="18%"
-            onMouseMove={(state) => {
-              if (!state?.isTooltipActive || !state.activePayload?.length || !state.activeCoordinate) {
-                setActive(null);
-                return;
-              }
-              setActive({
-                point: state.activePayload[0].payload,
-                x: state.activeCoordinate.x,
-                y: state.activeCoordinate.y,
-              });
-            }}
-            onMouseLeave={() => setActive(null)}
-          >
-            <CartesianGrid stroke={palette.grid} vertical={false} />
-            <XAxis
-              dataKey="label"
-              tick={{ fontSize: 10, fill: palette.tick }}
-              minTickGap={22}
-              tickMargin={8}
-              interval="preserveStartEnd"
-            />
-            <YAxis {...valueYAxisProps(unit, { axisFill: palette.axis })} tickFormatter={formatAxisTick} />
-            <Tooltip cursor={{ fill: palette.cursor }} content={() => null} wrapperStyle={{ display: "none" }} />
-            <Bar dataKey="actual" name="Historical actual" fill={palette.historical} maxBarSize={22} radius={SOLID_BAR_RADIUS} isAnimationActive={false} />
-          </BarChart>
-        </ResponsiveContainer>
-        <BoundedChartTooltip active={Boolean(active)} anchor={active} hostRef={hostRef}>
-          {active ? (
-            <ChartTooltip>
-              <div className="chart-tooltip-month">{monthTitle(active.point.month)}</div>
-              <div className="chart-tooltip-value">
-                {active.point.actual == null ? "No actual available" : formatAmount(active.point.actual, amountUnit)}
-              </div>
-            </ChartTooltip>
-          ) : null}
-        </BoundedChartTooltip>
-      </div>
+    <div className="analytics-chart analytics-chart-wide analytics-chart-fit" role="img" aria-label="Expenditure trend" ref={hostRef}>
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart
+          data={chartRows}
+          margin={cartesianChartMargin({ bottom: 20, top: 8, right: 12 })}
+          barCategoryGap="18%"
+          onMouseMove={(state) => {
+            if (!state?.isTooltipActive || !state.activePayload?.length || !state.activeCoordinate) {
+              setActive(null);
+              return;
+            }
+            setActive({
+              point: state.activePayload[0].payload,
+              x: state.activeCoordinate.x,
+              y: state.activeCoordinate.y,
+            });
+          }}
+          onMouseLeave={() => setActive(null)}
+        >
+          <CartesianGrid stroke={palette.grid} vertical={false} />
+          <XAxis
+            dataKey="label"
+            tick={{ fontSize: 10, fill: palette.tick }}
+            minTickGap={22}
+            tickMargin={8}
+            interval="preserveStartEnd"
+          />
+          <YAxis {...valueYAxisProps(unit, { axisFill: palette.axis })} tickFormatter={formatAxisTick} />
+          <Tooltip cursor={{ fill: palette.cursor }} content={() => null} wrapperStyle={{ display: "none" }} />
+          <Bar dataKey="actual" name="Historical actual" fill={palette.historical} maxBarSize={22} radius={SOLID_BAR_RADIUS} isAnimationActive={false} />
+        </BarChart>
+      </ResponsiveContainer>
+      <BoundedChartTooltip active={Boolean(active)} anchor={active} hostRef={hostRef}>
+        {active ? (
+          <ChartTooltip>
+            <div className="chart-tooltip-month">{monthTitle(active.point.month)}</div>
+            <div className="chart-tooltip-value">
+              {active.point.actual == null ? "No actual available" : formatAmount(active.point.actual, amountUnit)}
+            </div>
+          </ChartTooltip>
+        ) : null}
+      </BoundedChartTooltip>
     </div>
   );
 }
@@ -580,9 +563,10 @@ export default function Analytics() {
   const [restoreStatus, setRestoreStatus] = useState(forecast ? "ready" : "loading");
   const [restoreError, setRestoreError] = useState("");
   const [activeTab, setActiveTab] = useState("historical");
-  const [historyRange, setHistoryRange] = useState(HISTORY_RANGE_LAST_24);
+  const [historyRange, setHistoryRange] = useState(HISTORY_RANGE_LATEST_2_YEARS);
   const [historyRequestId, setHistoryRequestId] = useState(0);
   const [comparisonHistory, setComparisonHistory] = useState(null);
+  const historyEpochRef = useRef(readOverviewHistoryEpoch());
 
   const restoreLatest = useCallback(async () => {
     if (forecast) {
@@ -651,7 +635,7 @@ export default function Analytics() {
       setHistoryError("");
       setHistory(null);
       try {
-        const payload = await getOverviewAnalysis(categoryId);
+        const payload = await getOverviewAnalysis(categoryId, historyRange);
         if (cancelled) {
           return;
         }
@@ -680,7 +664,28 @@ export default function Analytics() {
     return () => {
       cancelled = true;
     };
-  }, [categoryId, historyRequestId]);
+  }, [categoryId, historyRequestId, historyRange]);
+
+  useEffect(() => {
+    function refreshIfHistoryChanged() {
+      const epoch = readOverviewHistoryEpoch();
+      if (epoch && epoch !== historyEpochRef.current) {
+        historyEpochRef.current = epoch;
+        setHistoryRequestId((value) => value + 1);
+      }
+    }
+    function onVisible() {
+      if (document.visibilityState === "visible") {
+        refreshIfHistoryChanged();
+      }
+    }
+    window.addEventListener("focus", refreshIfHistoryChanged);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener("focus", refreshIfHistoryChanged);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
 
   useEffect(() => {
     restoreLatest();
@@ -875,10 +880,10 @@ export default function Analytics() {
             <div className="analytics-history-view" role="group" aria-label="Historical display range">
               <button
                 type="button"
-                className={historyRange === HISTORY_RANGE_LAST_24 ? "active" : ""}
-                onClick={() => setHistoryRange(HISTORY_RANGE_LAST_24)}
+                className={historyRange === HISTORY_RANGE_LATEST_2_YEARS ? "active" : ""}
+                onClick={() => setHistoryRange(HISTORY_RANGE_LATEST_2_YEARS)}
               >
-                Last 24 months
+                Latest 2 years
               </button>
               <button
                 type="button"
@@ -943,7 +948,7 @@ export default function Analytics() {
         <summary>How coverage and YoY are calculated</summary>
         <div>
           Actual-data coverage is the full stored monthly history for the selected category.
-          Displayed range follows Last 24 months (ending at the latest stored actual month) or All history.
+          Displayed range follows Latest 2 years (two complete calendar years in confirmed data) or All history.
           Switching this range does not change a generated forecast. Year-on-year growth compares only
           overlapping months in partial years within the displayed range.
         </div>
@@ -981,7 +986,13 @@ export default function Analytics() {
         </article>
       ) : null}
 
-      {mode.showHistorical ? (
+      {mode.showHistorical && historicalDisplay?.emptyReason ? (
+        <article className="card empty-panel">
+          <EmptyState message={historicalDisplay.emptyReason} />
+        </article>
+      ) : null}
+
+      {mode.showHistorical && !historicalDisplay?.emptyReason ? (
         <>
 
           <ul className="analytics-kpis" aria-label="Historical snapshot">
@@ -995,7 +1006,7 @@ export default function Analytics() {
               <em className="analytics-kpi-note">
                 {historyRange === HISTORY_RANGE_ALL
                   ? "Average over All history months shown"
-                  : "Average over the Last 24 months shown"}
+                  : "Average over the Latest 2 years shown"}
               </em>
             </li>
             <li>

@@ -14,7 +14,7 @@ from app.config import BACKEND_DIR, DATASET_STORAGE_DIR, HISTORICAL_MASTER_DATAS
 from app.services.dataset_parser import actuals_header_for_month, iso_month
 from app.services.dataset_repository import list_declarations, list_historical_actuals, load_master_identity, master_version
 from app.services.dataset_storage import ensure_storage_dir
-from app.services.dataset_workflow import merge_budget_codes
+from app.services.dataset_workflow import extend_month_span, merge_budget_codes
 
 ENGINE_DIR = BACKEND_DIR / "model_training_engine"
 
@@ -92,13 +92,14 @@ def load_master_state() -> dict:
     stored = list_historical_actuals()
     identity = load_master_identity()
     if stored or identity["budget_codes"]:
-        earliest = identity["earliest_month"]
-        latest = identity["latest_month"]
-        numeric_months = sorted({str(item["month"]) for item in stored if item.get("month")})
-        if not earliest and numeric_months:
-            earliest = numeric_months[0]
-        if not latest and numeric_months:
-            latest = numeric_months[-1]
+        declarations = list_declarations()
+        # Reconcile meta bounds with confirmed actuals/declarations so a stale
+        # dataset_master_meta.latest_month cannot hide later confirmed months.
+        earliest, latest = extend_month_span(
+            identity["earliest_month"],
+            identity["latest_month"],
+            [*stored, *[{"month": item.get("month")} for item in declarations]],
+        )
         codes = merge_budget_codes(identity["budget_codes"], [], stored)
         order = list(identity.get("category_order") or [])
         if not order:
@@ -110,7 +111,7 @@ def load_master_state() -> dict:
             )
         return {
             "records": stored,
-            "declarations": list_declarations(),
+            "declarations": declarations,
             "budget_codes": codes,
             "category_order": order,
             "earliest_month": earliest,

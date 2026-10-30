@@ -38,7 +38,7 @@ import {
 } from "../utils/forecastDisplay";
 import {
   HISTORY_RANGE_ALL,
-  HISTORY_RANGE_LAST_24,
+  HISTORY_RANGE_LATEST_2_YEARS,
   formatDisplayedRangeLabel,
   resolveHistoricalDisplayWindow,
 } from "../utils/historicalDisplayWindow";
@@ -79,7 +79,7 @@ function TrendTooltipBody({ point, amountUnit }) {
 export default function BudgetTrendAnalysis({ trend, amountUnit }) {
   const palette = useChartPalette();
   const unit = axisUnitLabel(amountUnit);
-  const [historyView, setHistoryView] = useState(HISTORY_RANGE_LAST_24);
+  const [historyView, setHistoryView] = useState(HISTORY_RANGE_LATEST_2_YEARS);
   const containerRef = useRef(null);
   const [active, setActive] = useState(null);
 
@@ -90,9 +90,10 @@ export default function BudgetTrendAnalysis({ trend, amountUnit }) {
     return resolveHistoricalDisplayWindow(
       trend.history_end,
       trend.history_start,
-      historyView === HISTORY_RANGE_ALL ? HISTORY_RANGE_ALL : HISTORY_RANGE_LAST_24
+      historyView === HISTORY_RANGE_ALL ? HISTORY_RANGE_ALL : HISTORY_RANGE_LATEST_2_YEARS,
+      trend.actual_months || null
     );
-  }, [trend?.history_end, trend?.history_start, historyView]);
+  }, [trend?.history_end, trend?.history_start, trend?.actual_months, historyView]);
 
   const windowedPoints = useMemo(() => {
     const points = (trend?.points || []).filter((row) => !isYearTotalRow(row));
@@ -102,8 +103,9 @@ export default function BudgetTrendAnalysis({ trend, amountUnit }) {
     return filterRecentHistoryWithForecast(points, {
       isoKey: "month",
       historyStartIso: trend?.history_start || null,
+      confirmedMonthIsos: trend?.actual_months || null,
     });
-  }, [trend?.points, trend?.history_start, historyView]);
+  }, [trend?.points, trend?.history_start, trend?.actual_months, historyView]);
 
   const displayedActualRange = useMemo(() => {
     const actualMonths = windowedPoints
@@ -199,7 +201,7 @@ export default function BudgetTrendAnalysis({ trend, amountUnit }) {
           <em className="analytics-kpi-note">
             {historyView === HISTORY_RANGE_ALL
               ? "Monthly average over All history months shown"
-              : "Monthly average over the Last 24 months shown"}
+              : "Monthly average over the Latest 2 years shown"}
           </em>
         </li>
         <li>
@@ -233,7 +235,7 @@ export default function BudgetTrendAnalysis({ trend, amountUnit }) {
           <div>
             <h3>Historical versus forecast timeline</h3>
             <p className="muted">
-              {historyView === HISTORY_RANGE_LAST_24
+              {historyView === HISTORY_RANGE_LATEST_2_YEARS
                 ? `${formatDisplayedRangeLabel(historyWindow)}. Forecast period is unchanged when this range switches.`
                 : `${formatDisplayedRangeLabel(historyWindow || displayedActualRange)}. Full available actuals plus the selected forecast period.`}
             </p>
@@ -242,10 +244,10 @@ export default function BudgetTrendAnalysis({ trend, amountUnit }) {
           <div className="analytics-history-view" role="group" aria-label="History window">
             <button
               type="button"
-              className={historyView === HISTORY_RANGE_LAST_24 ? "active" : ""}
-              onClick={() => setHistoryView(HISTORY_RANGE_LAST_24)}
+              className={historyView === HISTORY_RANGE_LATEST_2_YEARS ? "active" : ""}
+              onClick={() => setHistoryView(HISTORY_RANGE_LATEST_2_YEARS)}
             >
-              Last 24 months
+              Latest 2 years
             </button>
             <button
               type="button"
