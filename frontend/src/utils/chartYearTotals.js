@@ -90,6 +90,62 @@ export function yearTotalLabel({ year, startMonth, endMonth }) {
   return "Period Total";
 }
 
+/** True when the selected forecast months for a year are exactly Jan–Dec (12 months). */
+export function isFullForecastCalendarYear({ startMonth, endMonth, monthCount }) {
+  return Number(startMonth) === 1 && Number(endMonth) === 12 && Number(monthCount) === 12;
+}
+
+/**
+ * Combined Monthly Forecast side-chart titles:
+ * - Full Jan–Dec year → "YTD YYYY"
+ * - Any other selection → "Forecast Period Total YYYY"
+ */
+export function forecastYearChartTitle({ year, startMonth, endMonth, monthCount }) {
+  const y = Number(year);
+  if (!Number.isFinite(y)) {
+    return "Forecast Period Total";
+  }
+  if (isFullForecastCalendarYear({ startMonth, endMonth, monthCount })) {
+    return `YTD ${y}`;
+  }
+  return `Forecast Period Total ${y}`;
+}
+
+/** Human-readable range for the selected forecast months within one calendar year. */
+export function forecastYearRangeLabel({ year, startMonth, endMonth }) {
+  const y = Number(year);
+  const start = Number(startMonth);
+  const end = Number(endMonth);
+  if (!Number.isFinite(y) || !start || !end) {
+    return "";
+  }
+  if (start === end) {
+    return `${monthName(start)} ${y}`;
+  }
+  return `${monthName(start)} ${y} – ${monthName(end)} ${y}`;
+}
+
+/**
+ * Shared Y domain for Combined Monthly year-total charts.
+ * Independent of the monthly chart. Nonnegative totals start at 0;
+ * negative headroom is added only when a yearly total is negative.
+ */
+export function sharedYearTotalDomain(totals, { paddingRatio = 0.12 } = {}) {
+  const finite = (totals || [])
+    .map((value) => (value == null || value === "" ? null : Number(value)))
+    .filter((value) => Number.isFinite(value));
+  if (!finite.length) {
+    return [0, 1];
+  }
+  const min = Math.min(...finite);
+  const max = Math.max(...finite);
+  const high = Math.max(max, 0);
+  const low = min < 0 ? min : 0;
+  const span = high - low;
+  const padding = span < 1e-9 ? Math.max(Math.abs(high || min) * paddingRatio, 1) : span * paddingRatio;
+  return [low < 0 ? low - padding : 0, high + padding];
+}
+
 export function yearTotalTooltipTitle({ year, startMonth, endMonth, seriesKind = "forecast" }) {
   const start = Number(startMonth);
   const end = Number(endMonth);

@@ -341,6 +341,27 @@ def list_historical_actuals() -> list[dict[str, Any]]:
         raise DatabaseError("Unable to load historical actuals.") from error
 
 
+def list_historical_actuals_for_codes(budget_codes: list[str]) -> list[dict[str, Any]]:
+    """Confirmed code/month actuals for the requested Budget Codes only."""
+    codes = [str(code).strip() for code in budget_codes if str(code or "").strip()]
+    if not codes:
+        return []
+    try:
+        with get_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT budget_code, month, amount, description, category, source_file_id
+                FROM historical_actuals
+                WHERE budget_code = ANY(%s)
+                ORDER BY budget_code, month
+                """,
+                (codes,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except psycopg.Error as error:
+        raise DatabaseError("Unable to load historical actuals for Budget Codes.") from error
+
+
 def list_dataset_files(limit: int, offset: int) -> tuple[list[dict[str, Any]], int]:
     bounded = max(1, min(int(limit), 50))
     start = max(0, int(offset))

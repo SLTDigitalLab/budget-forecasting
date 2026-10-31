@@ -415,12 +415,22 @@ def build_excel_forecast_model(payload: dict[str, Any]) -> dict[str, Any]:
         for index in range(len(months)):
             amounts = [float(row["months"][index]) for row in rows if is_finite_amount(row["months"][index])]
             totals.append(float(sum(amounts)) if amounts else None)
+        finite_totals = [float(value) for value in totals if is_finite_amount(value)]
         sections.append({
             "category": category,
             "rows": rows,
             "totals": totals,
-            "total_ytd": None,
+            "total_ytd": float(sum(finite_totals)) if finite_totals else None,
         })
+    grand_totals: list[float | None] = []
+    for index in range(len(months)):
+        amounts = [
+            float(section["totals"][index])
+            for section in sections
+            if index < len(section.get("totals") or []) and is_finite_amount(section["totals"][index])
+        ]
+        grand_totals.append(float(sum(amounts)) if amounts else None)
+    finite_grand = [float(value) for value in grand_totals if is_finite_amount(value)]
     start = str(payload.get("requested_start_month") or (months[0] if months else ""))
     end = str(payload.get("requested_end_month") or (months[-1] if months else ""))
     coverage = coverage_export(payload)
@@ -430,6 +440,8 @@ def build_excel_forecast_model(payload: dict[str, Any]) -> dict[str, Any]:
         "months": months,
         "month_headers": month_column_headers(months),
         "sections": sections,
+        "grand_totals": grand_totals,
+        "grand_total_ytd": float(sum(finite_grand)) if finite_grand else None,
         "coverage_rows": coverage["rows"],
         "unavailable_accounts": coverage["unavailable_accounts"],
         "forecast_available": bool(sections),
@@ -512,6 +524,7 @@ def historical_periods_for_forecast_month(
     forecast_month: str,
     actuals_by_month: dict[str, float],
     history_end: str | None,
+    history_start: str | None = None,
 ) -> list[dict[str, Any]]:
     if not is_iso_month(forecast_month):
         return []
@@ -521,6 +534,8 @@ def historical_periods_for_forecast_month(
         if not is_iso_month(month) or month[5:7] != target:
             continue
         if month >= forecast_month:
+            continue
+        if history_start and month < history_start:
             continue
         if history_end and month > history_end:
             continue
@@ -538,6 +553,53 @@ def average_from_periods(periods: list[dict[str, Any]]) -> float | None:
     if not is_finite_amount(total):
         return None
     return total / len(periods)
+
+
+def contributing_forecast_codes(payload: dict[str, Any]) -> list[str]:
+    """Codes with at least one finite forecast amount (zeros/negatives kept)."""
+    codes: set[str] = set()
+    for row in payload.get("account_monthly_forecasts") or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("budget_code") or "").strip()
+        if code and is_finite_amount(row.get("forecast_amount")):
+            codes.add(code)
+    return sorted(codes)
+
+
+def account_forecasts_by_month(payload: dict[str, Any]) -> dict[str, dict[str, float]]:
+    by_month: dict[str, dict[str, float]] = {}
+    for row in payload.get("account_monthly_forecasts") or []:
+        if not isinstance(row, dict):
+            continue
+        month = str(row.get("month") or "")
+        code = str(row.get("budget_code") or "").strip()
+        if not is_iso_month(month) or not code or not is_finite_amount(row.get("forecast_amount")):
+            continue
+        by_month.setdefault(month, {})[code] = float(row["forecast_amount"])
+    return by_month
+
+
+def load_confirmed_code_actuals(budget_codes: list[str]) -> dict[str, dict[str, float]]:
+    """Confirmed DB actuals keyed code → month → finite amount. Missing stays absent."""
+    try:
+        from app.config import AMOUNT_CONVERSION_FACTOR
+        from app.services.dataset_repository import list_historical_actuals_for_codes
+    except Exception:
+        return {}
+    try:
+        rows = list_historical_actuals_for_codes(budget_codes)
+    except Exception:
+        return {}
+    factor = float(AMOUNT_CONVERSION_FACTOR)
+    by_code: dict[str, dict[str, float]] = {}
+    for row in rows:
+        code = str(row.get("budget_code") or "").strip()
+        month = str(row.get("month") or "").strip()
+        if not code or not is_iso_month(month) or not is_finite_amount(row.get("amount")):
+            continue
+        by_code.setdefault(code, {})[month] = float(row["amount"]) * factor
+    return by_code
 
 
 def forecast_distribution_by_code(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -681,7 +743,79 @@ def build_forecast_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_forecast_comparison(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    history_end = str(payload.get("history_end") or payload.get("historical_end") or "")
+    """Same-calendar-month comparison on matched contributing Budget Codes.
+
+    Prefer confirmed code-level actuals for codes that contribute finite forecast
+    amounts. Fall back to sparse forecast-attached aggregates only when confirmed
+    code actuals are unavailable.
+    """
+    history_end = str(payload.get("history_end") or payload.get("historical_end") or "") or None
+    history_start = str(payload.get("comparison_history_start") or "") or None
+    codes = contributing_forecast_codes(payload)
+    by_code = load_confirmed_code_actuals(codes) if codes else {}
+    forecasts_by_month = account_forecasts_by_month(payload)
+
+    if by_code:
+        rows: list[dict[str, Any]] = []
+        for row in chronological_forecasts(payload):
+            month = str(row.get("month") or "")
+            if not is_iso_month(month) or not is_finite_amount(row.get("forecast_amount")):
+                continue
+            forecast_amount = float(row["forecast_amount"])
+            code_forecasts = forecasts_by_month.get(month) or {}
+            matched_forecast = 0.0
+            matched_historical = 0.0
+            matched_code_count = 0
+            period_sums: dict[str, dict[str, float | int]] = {}
+            for code, code_forecast in code_forecasts.items():
+                periods = historical_periods_for_forecast_month(
+                    month,
+                    by_code.get(code) or {},
+                    history_end,
+                    history_start,
+                )
+                baseline = average_from_periods(periods)
+                if baseline is None:
+                    continue
+                matched_forecast += float(code_forecast)
+                matched_historical += float(baseline)
+                matched_code_count += 1
+                for period in periods:
+                    bucket = period_sums.setdefault(period["month"], {"actual": 0.0, "code_count": 0})
+                    bucket["actual"] = float(bucket["actual"]) + float(period["actual"])
+                    bucket["code_count"] = int(bucket["code_count"]) + 1
+            has_match = matched_code_count > 0
+            matched_forecast_amount = matched_forecast if has_match else None
+            historical_average = matched_historical if has_match else None
+            difference = None if not has_match else matched_forecast - matched_historical
+            difference_percent = (
+                None
+                if not has_match or matched_historical == 0 or difference is None
+                else (difference / matched_historical) * 100
+            )
+            periods_used = [
+                {
+                    "month": period_month,
+                    "actual": float(info["actual"]),
+                    "code_count": int(info["code_count"]),
+                }
+                for period_month, info in sorted(period_sums.items())
+            ]
+            rows.append({
+                "month": month,
+                "forecast_amount": forecast_amount,
+                "matched_forecast_amount": matched_forecast_amount,
+                "historical_average": historical_average,
+                "difference": difference,
+                "difference_percent": difference_percent,
+                "observation_count": len(periods_used),
+                "matched_code_count": matched_code_count,
+                "historical_periods_used": periods_used,
+                "comparison_scope": "code_matched",
+            })
+        return rows
+
+    # Fallback: sparse forecast-attached category aggregates (legacy).
     actuals = merge_historical_actuals(payload.get("historical_actuals"))
     actuals_by_month = {row["month"]: float(row["actual_amount"]) for row in actuals}
     rows = []
@@ -689,9 +823,10 @@ def build_forecast_comparison(payload: dict[str, Any]) -> list[dict[str, Any]]:
         month = str(row.get("month") or "")
         if not is_iso_month(month) or not is_finite_amount(row.get("forecast_amount")):
             continue
-        periods = historical_periods_for_forecast_month(month, actuals_by_month, history_end or None)
+        periods = historical_periods_for_forecast_month(month, actuals_by_month, history_end, history_start)
         historical_average = average_from_periods(periods)
         forecast_amount = float(row["forecast_amount"])
+        matched_forecast_amount = None if historical_average is None else forecast_amount
         difference = None if historical_average is None else forecast_amount - historical_average
         difference_percent = (
             None
@@ -701,11 +836,14 @@ def build_forecast_comparison(payload: dict[str, Any]) -> list[dict[str, Any]]:
         rows.append({
             "month": month,
             "forecast_amount": forecast_amount,
+            "matched_forecast_amount": matched_forecast_amount,
             "historical_average": historical_average,
             "difference": difference,
             "difference_percent": difference_percent,
             "observation_count": len(periods),
+            "matched_code_count": 0,
             "historical_periods_used": periods,
+            "comparison_scope": "aggregate",
         })
     return rows
 

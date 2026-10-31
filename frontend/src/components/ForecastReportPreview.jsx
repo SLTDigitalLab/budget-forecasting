@@ -238,11 +238,14 @@ export default function ForecastReportPreview({ report }) {
               </tr>
             </thead>
             <tbody>
-              {report.comparison.map((row) => (
+              {report.comparison.map((row) => {
+                const matched =
+                  row.matched_forecast_amount == null ? row.forecast_amount : row.matched_forecast_amount;
+                return (
                 <tr key={row.month}>
                   <td>{isoToLabel(row.month)}</td>
                   <td>{formatAmount(row.historical_average, unit)}</td>
-                  <td>{formatAmount(row.forecast_amount, unit)}</td>
+                  <td>{formatAmount(matched, unit)}</td>
                   <td className={growthClass(row.difference)}>{formatAmount(row.difference, unit)}</td>
                   <td className={growthClass(row.difference_percent)}>
                     {formatPercentChange(row.difference_percent)}
@@ -255,7 +258,8 @@ export default function ForecastReportPreview({ report }) {
                       : UNAVAILABLE}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

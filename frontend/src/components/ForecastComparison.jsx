@@ -12,7 +12,7 @@ import {
 import AnalyticsSectionHeading from "./AnalyticsSectionHeading";
 import BoundedChartTooltip from "./BoundedChartTooltip";
 import EmptyState from "./EmptyState";
-import { comparisonTotals } from "../utils/forecastComparison";
+import { comparisonTotals, isFiniteAmount } from "../utils/forecastComparison";
 import useChartPalette from "../hooks/useChartPalette";
 import { cartesianChartMargin, SOLID_BAR_RADIUS, valueYAxisProps } from "../utils/chartLayout";
 import {
@@ -47,9 +47,14 @@ export default function ForecastComparison({
   const totals = useMemo(() => comparisonTotals(rows), [rows]);
   const selected = rows.find((row) => row.month === selectedMonth) || rows[0] || null;
   const unit = axisUnitLabel(amountUnit);
+  const usesCodeMatch = rows.some((row) => row.comparison_scope === "code_matched");
   const chartRows = rows.map((row) => ({
     ...row,
     label: isoToLabel(row.month),
+    // Chart bars share the matched scope with difference / % KPIs.
+    chart_forecast: isFiniteAmount(row.matched_forecast_amount)
+      ? Number(row.matched_forecast_amount)
+      : null,
   }));
 
   useEffect(() => {
@@ -80,7 +85,8 @@ export default function ForecastComparison({
           title="Same-month historical average vs forecast"
         />
         <p className="muted">
-          Each forecast month is compared with the monthly average of the same calendar month in prior actual years.
+          Each forecast month is compared with the sum of same-calendar-month historical averages
+          for Budget Codes that have both a finite forecast amount and a valid prior baseline.
           This is a monthly-average comparison, not annual year-over-year growth.
         </p>
       </div>
@@ -109,25 +115,38 @@ export default function ForecastComparison({
         <li>
           <span>Forecast total</span>
           <strong>{formatAmount(totals.forecast_total, amountUnit)}</strong>
-          <em className="analytics-kpi-note">Sum of forecast months only</em>
+          <em className="analytics-kpi-note">Sum of all forecast months (full forecast)</em>
         </li>
         <li>
           <span>Same-month historical monthly averages (sum)</span>
           <strong>{formatAmount(totals.historical_total, amountUnit)}</strong>
-          <em className="analytics-kpi-note">Not a full-year actual total</em>
+          <em className="analytics-kpi-note">
+            {totals.compared_month_count
+              ? `Sum of code-level baselines for ${totals.compared_month_count} matched month${totals.compared_month_count === 1 ? "" : "s"}`
+              : "No matched historical baselines"}
+          </em>
         </li>
         <li>
           <span>Monthly-average difference</span>
           <strong className="analytics-comparison-delta">
             {formatAmount(totals.difference, amountUnit)}
           </strong>
-          <em className="analytics-kpi-note">Informational; higher spend is not scored as better</em>
+          <em className="analytics-kpi-note">
+            {totals.compared_month_count
+              ? "Matched forecast sum minus matched baselines only"
+              : "Unavailable until at least one code/month pair has a historical baseline"}
+          </em>
         </li>
         <li>
           <span>Relative change</span>
           <strong className="analytics-comparison-delta">
             {formatPercentChange(totals.difference_percent)}
           </strong>
+          <em className="analytics-kpi-note">
+            {totals.compared_month_count
+              ? "Based on matched sums only; zero baseline sum stays Unavailable"
+              : "Unavailable — no matched historical baselines"}
+          </em>
         </li>
       </ul>
 
@@ -136,14 +155,16 @@ export default function ForecastComparison({
           <div>
             <h3>Monthly-average comparison by forecast month</h3>
             <p className="muted">
-              Historical bars are the average of matching calendar months in prior actual years for the active forecast category.
+              {usesCodeMatch
+                ? "Chart bars use the matched Budget Code population only. The Forecast total KPI above remains the full forecast."
+                : "Historical bars are the average of matching calendar months in prior actual years for the active forecast category."}
             </p>
           </div>
         </div>
         <div
           className="analytics-chart analytics-chart-wide"
           role="img"
-          aria-label="Historical monthly average versus forecast"
+          aria-label="Historical monthly average versus matched forecast"
           ref={hostRef}
         >
           <ResponsiveContainer width="100%" height="100%">
@@ -172,8 +193,8 @@ export default function ForecastComparison({
               <Legend wrapperStyle={{ fontSize: 12, color: palette.legend }} />
               <Bar dataKey="historical_average" name="Historical monthly average" fill={palette.historical} radius={SOLID_BAR_RADIUS} maxBarSize={22} isAnimationActive={false} />
               <Bar
-                dataKey="forecast_amount"
-                name="Forecast"
+                dataKey="chart_forecast"
+                name={usesCodeMatch ? "Matched forecast" : "Forecast"}
                 fill={palette.forecast}
                 radius={SOLID_BAR_RADIUS}
                 maxBarSize={22}
@@ -189,10 +210,22 @@ export default function ForecastComparison({
                   {`Historical monthly average ${active.point.historical_average == null ? "—" : formatAmount(active.point.historical_average, amountUnit)}`}
                 </div>
                 <div className="chart-tooltip-value">
-                  {`Forecast ${formatAmount(active.point.forecast_amount, amountUnit)}`}
+                  {`${usesCodeMatch ? "Matched forecast" : "Forecast"} ${
+                    active.point.chart_forecast == null
+                      ? "—"
+                      : formatAmount(active.point.chart_forecast, amountUnit)
+                  }`}
                 </div>
+                {usesCodeMatch ? (
+                  <div className="chart-tooltip-value">
+                    {`Full month forecast ${formatAmount(active.point.forecast_amount, amountUnit)}`}
+                  </div>
+                ) : null}
                 <div className="chart-tooltip-series">
                   {`${active.point.observation_count} historical month${active.point.observation_count === 1 ? "" : "s"} used`}
+                  {active.point.matched_code_count
+                    ? ` · ${active.point.matched_code_count} matched code${active.point.matched_code_count === 1 ? "" : "s"}`
+                    : ""}
                 </div>
               </ChartTooltip>
             ) : null}
@@ -203,14 +236,18 @@ export default function ForecastComparison({
       <div className="analytics-comparison-layout">
         <article className="card table-card">
           <h3>Monthly comparison</h3>
-          <p className="muted">Select a forecast month to inspect the historical periods used in the monthly average.</p>
+          <p className="muted">
+            Select a forecast month to inspect the historical periods used in the monthly average.
+            Difference uses matched forecast amounts only.
+          </p>
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Forecast month</th>
                   <th>Historical monthly average</th>
-                  <th>Forecast</th>
+                  <th>{usesCodeMatch ? "Matched forecast" : "Forecast"}</th>
+                  {usesCodeMatch ? <th>Full forecast</th> : null}
                   <th>Difference</th>
                   <th>Periods used</th>
                 </tr>
@@ -232,7 +269,8 @@ export default function ForecastComparison({
                   >
                     <td>{monthTitle(row.month)}</td>
                     <td>{formatAmount(row.historical_average, amountUnit)}</td>
-                    <td>{formatAmount(row.forecast_amount, amountUnit)}</td>
+                    <td>{formatAmount(row.matched_forecast_amount, amountUnit)}</td>
+                    {usesCodeMatch ? <td>{formatAmount(row.forecast_amount, amountUnit)}</td> : null}
                     <td className="analytics-comparison-delta">
                       {`${formatAmount(row.difference, amountUnit)} (${formatPercentChange(row.difference_percent)})`}
                     </td>
@@ -276,6 +314,16 @@ export default function ForecastComparison({
                     No prior same-calendar-month actuals are available for this forecast month.
                   </p>
                 )}
+                {usesCodeMatch ? (
+                  <p className="muted" style={{ marginTop: "0.75rem" }}>
+                    Period amounts are the sum of confirmed values that month for matched codes.
+                    The baseline above is the sum of per-code same-calendar-month averages
+                    {selected.matched_code_count
+                      ? ` across ${selected.matched_code_count} matched code${selected.matched_code_count === 1 ? "" : "s"}`
+                      : ""}
+                    .
+                  </p>
+                ) : null}
               </section>
 
               <section className="analytics-month-detail-section analytics-month-detail-metrics" aria-labelledby="analytics-month-metrics-heading">
@@ -286,9 +334,15 @@ export default function ForecastComparison({
                     <dd>{formatAmount(selected.historical_average, amountUnit)}</dd>
                   </div>
                   <div>
-                    <dt>Forecast</dt>
-                    <dd>{formatAmount(selected.forecast_amount, amountUnit)}</dd>
+                    <dt>{usesCodeMatch ? "Matched forecast" : "Forecast"}</dt>
+                    <dd>{formatAmount(selected.matched_forecast_amount ?? selected.forecast_amount, amountUnit)}</dd>
                   </div>
+                  {usesCodeMatch ? (
+                    <div>
+                      <dt>Full month forecast</dt>
+                      <dd>{formatAmount(selected.forecast_amount, amountUnit)}</dd>
+                    </div>
+                  ) : null}
                   <div>
                     <dt>Difference</dt>
                     <dd className="analytics-comparison-delta">
