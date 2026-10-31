@@ -22,7 +22,12 @@ import ExpectedRangeLabel, {
 } from "../components/ExpectedRangeLabel";
 import ForecastComparison from "../components/ForecastComparison";
 import LoadingState from "../components/LoadingState";
-import { getLatestForecastRecord, getOverviewAnalysis, getOverviewCategories } from "../api/forecastApi";
+import {
+  getLatestForecastRecord,
+  getOverviewAnalysis,
+  getOverviewCategories,
+  getOverviewCodeActuals,
+} from "../api/forecastApi";
 import { useForecast } from "../context/ForecastContext";
 import { resolveAnalyticsForecast } from "../utils/analyticsForecast";
 import {
@@ -39,8 +44,12 @@ import {
   validateHistoricalAnalysis,
 } from "../utils/analyticsPage";
 import { buildBudgetTrend } from "../utils/budgetTrend";
-import { forecastMatchesOverviewCategory } from "../utils/forecastCategory";
-import { buildForecastComparison, mergeHistoricalActuals } from "../utils/forecastComparison";
+import { forecastMatchesOverviewCategory, isAllCategories } from "../utils/forecastCategory";
+import {
+  buildForecastComparison,
+  contributingForecastCodes,
+  mergeHistoricalActuals,
+} from "../utils/forecastComparison";
 import {
   cartesianChartMargin,
   INTERVAL_BAR_STROKE,
@@ -56,6 +65,9 @@ import {
   HISTORY_RANGE_ALL,
   HISTORY_RANGE_LATEST_2_YEARS,
   buildHistoricalDisplayAnalysis,
+  listCompleteCalendarYears,
+  resolveAllHistoryWindow,
+  resolveLatestTwoCompleteYearsWindow,
 } from "../utils/historicalDisplayWindow";
 import { readOverviewHistoryEpoch } from "../utils/overviewHistoryEpoch";
 import useChartPalette from "../hooks/useChartPalette";
@@ -566,6 +578,7 @@ export default function Analytics() {
   const [historyRange, setHistoryRange] = useState(HISTORY_RANGE_LATEST_2_YEARS);
   const [historyRequestId, setHistoryRequestId] = useState(0);
   const [comparisonHistory, setComparisonHistory] = useState(null);
+  const [comparisonCodeActuals, setComparisonCodeActuals] = useState(null);
   const historyEpochRef = useRef(readOverviewHistoryEpoch());
 
   const restoreLatest = useCallback(async () => {
@@ -692,21 +705,28 @@ export default function Analytics() {
   }, [restoreLatest]);
 
   useEffect(() => {
-    if (!forecast?.category || !categories.length) {
+    if (!forecast?.category) {
       setComparisonHistory(null);
       return undefined;
     }
-    const matched = categories.find((item) => forecastMatchesOverviewCategory(forecast.category, item));
+    // Category analysis still powers Budget Trend; Comparison uses code-level actuals below.
+    const matched = isAllCategories(forecast.category)
+      ? { id: "all", name: "All Categories" }
+      : categories.find((item) => forecastMatchesOverviewCategory(forecast.category, item));
     if (!matched) {
       setComparisonHistory(null);
       return undefined;
     }
-    if (history && forecastMatchesOverviewCategory(forecast.category, history.category || history)) {
+    if (
+      history
+      && forecastMatchesOverviewCategory(forecast.category, history.category || history)
+      && !isAllCategories(forecast.category)
+    ) {
       setComparisonHistory(history);
       return undefined;
     }
     let cancelled = false;
-    getOverviewAnalysis(matched.id)
+    getOverviewAnalysis(matched.id, "all")
       .then((payload) => {
         if (!cancelled) {
           setComparisonHistory(payload);
@@ -721,6 +741,33 @@ export default function Analytics() {
       cancelled = true;
     };
   }, [forecast?.category, categories, history]);
+
+  useEffect(() => {
+    if (!forecast) {
+      setComparisonCodeActuals(null);
+      return undefined;
+    }
+    const codes = contributingForecastCodes(forecast);
+    if (!codes.length) {
+      setComparisonCodeActuals({ actuals: [], budget_code_count: 0, history_start: null, history_end: null });
+      return undefined;
+    }
+    let cancelled = false;
+    getOverviewCodeActuals(codes)
+      .then((payload) => {
+        if (!cancelled) {
+          setComparisonCodeActuals(payload);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setComparisonCodeActuals(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [forecast]);
 
   const amountUnit = history?.amount_unit;
   const unit = axisUnitLabel(amountUnit);
@@ -772,25 +819,80 @@ export default function Analytics() {
     if (!forecast) {
       return [];
     }
-    // Prefer Overview monthly actuals for the forecast category. Forecast payload
-    // historical_actuals omit months where any selected code is incomplete, which
-    // must not blank Comparison All history bars when the master series has values.
+    // Budget Trend still uses category monthly totals (confirmed Overview preferred).
     const overviewMonths = comparisonHistory
       && forecastMatchesOverviewCategory(forecast.category, comparisonHistory.category || comparisonHistory)
       ? comparisonHistory.monthly_actuals
       : null;
     return mergeHistoricalActuals(overviewMonths, forecast.historical_actuals);
   }, [forecast, comparisonHistory]);
+
+  const comparisonHistoryBounds = useMemo(() => {
+    const codeRows = Array.isArray(comparisonCodeActuals?.actuals) ? comparisonCodeActuals.actuals : [];
+    const monthIsos = [...new Set(
+      codeRows.map((row) => String(row?.month || "")).filter((month) => /^\d{4}-\d{2}$/.test(month))
+    )].sort((left, right) => left.localeCompare(right));
+    const confirmedStart = comparisonCodeActuals?.history_start || monthIsos[0] || null;
+    const confirmedEnd = comparisonCodeActuals?.history_end || monthIsos[monthIsos.length - 1] || null;
+    if (historyRange === HISTORY_RANGE_ALL) {
+      const window = resolveAllHistoryWindow(confirmedEnd, confirmedStart);
+      return {
+        historyStart: window?.startIso || confirmedStart,
+        historyEnd: window?.endIso || confirmedEnd,
+        confirmedStart,
+        confirmedEnd,
+        mode: HISTORY_RANGE_ALL,
+      };
+    }
+    const window = resolveLatestTwoCompleteYearsWindow(monthIsos);
+    if (!window) {
+      return {
+        historyStart: null,
+        historyEnd: null,
+        confirmedStart,
+        confirmedEnd,
+        mode: HISTORY_RANGE_LATEST_2_YEARS,
+        emptyLatest2: true,
+      };
+    }
+    return {
+      historyStart: window.startIso,
+      historyEnd: window.endIso,
+      confirmedStart,
+      confirmedEnd,
+      mode: HISTORY_RANGE_LATEST_2_YEARS,
+      completeYears: listCompleteCalendarYears(monthIsos),
+    };
+  }, [comparisonCodeActuals, historyRange]);
+
   const comparisonRows = useMemo(() => {
     if (!forecast) {
       return [];
     }
+    if (Array.isArray(comparisonCodeActuals?.actuals)) {
+      if (comparisonHistoryBounds.emptyLatest2) {
+        return buildForecastComparison({
+          codeActuals: [],
+          forecast,
+          historyEnd: null,
+          historyStart: null,
+        });
+      }
+      return buildForecastComparison({
+        codeActuals: comparisonCodeActuals.actuals,
+        forecast,
+        historyEnd: comparisonHistoryBounds.historyEnd,
+        historyStart: comparisonHistoryBounds.historyStart,
+      });
+    }
+    // Fallback while code actuals load / if the endpoint fails: sparse forecast history only.
     return buildForecastComparison({
       historicalActuals: comparisonActuals,
       forecast,
       historyEnd: forecast.history_end || forecast.historical_end,
     });
-  }, [forecast, comparisonActuals]);
+  }, [forecast, comparisonCodeActuals, comparisonHistoryBounds, comparisonActuals]);
+
   const budgetTrend = useMemo(() => {
     if (!forecast) {
       return null;
@@ -800,38 +902,49 @@ export default function Analytics() {
       forecast,
     });
   }, [forecast, comparisonActuals]);
+
   const comparisonCoverageNote = useMemo(() => {
     if (!forecast) {
       return "";
     }
-    const forecastCodes = Number(forecast.selected_account_count) || 0;
-    const sameCategory = comparisonHistory
-      ? forecastMatchesOverviewCategory(forecast.category, comparisonHistory.category || comparisonHistory)
-      : false;
-    const historyCodes = sameCategory ? Number(comparisonHistory?.budget_code_count) || 0 : 0;
-    const historyStart = budgetTrend?.history_start
-      || comparisonHistory?.history_start
-      || forecast.historical_start
-      || forecast.historical_actuals?.[0]?.month;
-    const historyEnd = budgetTrend?.history_end
-      || comparisonHistory?.history_end
-      || forecast.history_end
-      || forecast.historical_end;
+    const contributing = contributingForecastCodes(forecast);
+    const historyStart = comparisonHistoryBounds.historyStart;
+    const historyEnd = comparisonHistoryBounds.historyEnd;
+    const confirmedStart = comparisonHistoryBounds.confirmedStart;
+    const confirmedEnd = comparisonHistoryBounds.confirmedEnd;
     const parts = [];
     if (historyStart && historyEnd) {
       parts.push(
-        `Actuals used for comparison cover ${monthTitle(historyStart)} – ${monthTitle(historyEnd)} for category ${forecast.category || "—"}.`
+        `Baselines use confirmed actuals ${monthTitle(historyStart)} – ${monthTitle(historyEnd)}`
+        + ` for the ${contributing.length} Budget Codes that contribute finite forecast amounts.`
+      );
+    } else if (comparisonHistoryBounds.emptyLatest2) {
+      parts.push(
+        "Latest 2 years requires complete calendar years; none are available in confirmed history for this forecast’s codes."
       );
     }
-    if (sameCategory && historyCodes > 0 && forecastCodes > 0 && historyCodes !== forecastCodes) {
+    if (
+      historyRange === HISTORY_RANGE_LATEST_2_YEARS
+      && confirmedStart
+      && confirmedEnd
+      && historyStart
+      && historyEnd
+      && (confirmedStart !== historyStart || confirmedEnd !== historyEnd)
+    ) {
       parts.push(
-        `Budget-code coverage differs: historical analysis lists ${historyCodes} codes while this forecast includes ${forecastCodes}.`
+        `Confirmed master coverage is ${monthTitle(confirmedStart)} – ${monthTitle(confirmedEnd)}; `
+        + "Latest 2 years uses complete calendar years only."
       );
-    } else if (forecastCodes > 0) {
-      parts.push(`This forecast includes ${forecastCodes} Budget Codes.`);
+    }
+    parts.push(
+      "Difference and relative change compare only code/month pairs with both a finite forecast and a same-calendar-month historical baseline. "
+      + "This is a monthly-average comparison, not annual year-over-year growth."
+    );
+    if (!Array.isArray(comparisonCodeActuals?.actuals)) {
+      parts.push("Confirmed code-level actuals were unavailable; comparison fell back to forecast-attached history.");
     }
     return parts.join(" ");
-  }, [forecast, comparisonHistory, budgetTrend]);
+  }, [forecast, comparisonHistoryBounds, historyRange, comparisonCodeActuals]);
 
   return (
     <section className="analytics-page">
@@ -1201,8 +1314,8 @@ export default function Analytics() {
             rows={comparisonRows}
             amountUnit={forecast?.amount_unit}
             forecast={forecast}
-            historyStart={budgetTrend?.history_start || forecast?.historical_start}
-            historyEnd={budgetTrend?.history_end || forecast?.history_end || forecast?.historical_end}
+            historyStart={comparisonHistoryBounds.historyStart || comparisonHistoryBounds.confirmedStart}
+            historyEnd={comparisonHistoryBounds.historyEnd || comparisonHistoryBounds.confirmedEnd}
             coverageNote={comparisonCoverageNote}
           />
         </>

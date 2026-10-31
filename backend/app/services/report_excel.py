@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from io import BytesIO
-from typing import Any
+from typing import Any, Iterator
 
 from openpyxl import Workbook
+from openpyxl.cell import _writer as cell_writer
+from openpyxl.compat import safe_string
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.protection import WorkbookProtection
+from openpyxl.worksheet import _writer as worksheet_writer
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.xml.functions import Element, XML_NS
 
-from app.services.report_builder import UNAVAILABLE, build_excel_forecast_model
+from app.services.report_builder import UNAVAILABLE, build_excel_forecast_model, is_finite_amount
+
+FORMULA_CACHE_MAP = "_forecast_formula_caches"
 
 HEADER_FILL = PatternFill("solid", fgColor="071A33")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
@@ -67,6 +75,90 @@ def _sum_formula(start_col: int, start_row: int, end_col: int, end_row: int) -> 
     return f"=SUM({start}:{end})"
 
 
+def _set_sum_formula(cell, formula: str, cached_value: Any) -> None:
+    """Write an editable SUM formula and keep a numeric cache for non-Excel viewers."""
+    cell.value = formula
+    cell.number_format = AMOUNT_FORMAT
+    cell.alignment = Alignment(horizontal="right", vertical="center")
+    parent = cell.parent
+    caches = getattr(parent, FORMULA_CACHE_MAP, None)
+    if caches is None:
+        caches = {}
+        setattr(parent, FORMULA_CACHE_MAP, caches)
+    if is_finite_amount(cached_value):
+        caches[cell.coordinate] = float(cached_value)
+    else:
+        caches.pop(cell.coordinate, None)
+
+
+def _write_formula_cell_with_cache(xf, worksheet, cell, styled=False) -> None:
+    """openpyxl normally emits empty <v/> for formulas; include our precomputed cache."""
+    from openpyxl.cell._writer import _set_attributes
+    from openpyxl.cell.rich_text import CellRichText
+
+    value, attributes = _set_attributes(cell, styled)
+    caches = getattr(worksheet, FORMULA_CACHE_MAP, {}) or {}
+    cache = caches.get(cell.coordinate)
+
+    if value == "" or value is None:
+        with xf.element("c", attributes):
+            return
+
+    with xf.element("c", attributes):
+        if cell.data_type == "f":
+            attrib = {}
+            if isinstance(value, ArrayFormula):
+                attrib = dict(value)
+                value = value.text
+            elif isinstance(value, DataTableFormula):
+                attrib = dict(value)
+                value = None
+            with xf.element("f", attrib):
+                if value is not None and attrib.get("t") != "dataTable":
+                    xf.write(value[1:])
+                    value = None
+            with xf.element("v"):
+                if is_finite_amount(cache):
+                    xf.write(safe_string(float(cache)))
+            return
+
+        if cell.data_type == "s":
+            if isinstance(value, CellRichText):
+                xf.write(value.to_tree())
+            else:
+                with xf.element("is"):
+                    if isinstance(value, str):
+                        attrs = {}
+                        if value != value.strip():
+                            attrs["{%s}space" % XML_NS] = "preserve"
+                        el = Element("t", attrs)
+                        el.text = value
+                        xf.write(el)
+            return
+
+        with xf.element("v"):
+            if value is not None:
+                xf.write(safe_string(value))
+
+
+@contextmanager
+def _formula_cache_writer() -> Iterator[None]:
+    """Patch openpyxl writers so SUM formulas keep cached numeric results.
+
+    WorksheetWriter imports write_cell by name, so both module bindings must be
+    replaced for the cache to appear in the downloaded XLSX.
+    """
+    original_cell = cell_writer.write_cell
+    original_sheet = worksheet_writer.write_cell
+    cell_writer.write_cell = _write_formula_cell_with_cache
+    worksheet_writer.write_cell = _write_formula_cell_with_cache
+    try:
+        yield
+    finally:
+        cell_writer.write_cell = original_cell
+        worksheet_writer.write_cell = original_sheet
+
+
 def _ensure_editable(workbook: Workbook, sheet: Worksheet) -> None:
     """Export real editable cells — no sheet/workbook locks or read-only recommendation."""
     # Do not assign protection.password = None; openpyxl hashes the value and raises.
@@ -93,7 +185,8 @@ def render_forecast_excel(report: dict[str, Any]) -> bytes:
     if workbook.sheetnames != [SHEET_NAME]:
         raise AssertionError("Excel workbook must contain exactly one worksheet: Budget Forecast.")
     buffer = BytesIO()
-    workbook.save(buffer)
+    with _formula_cache_writer():
+        workbook.save(buffer)
     return buffer.getvalue()
 
 
@@ -139,6 +232,7 @@ def _write_budget_forecast(sheet: Worksheet, report: dict[str, Any]) -> None:
         sheet.row_dimensions[2].height = 36
 
     row = 3
+    category_total_rows: list[int] = []
     for section in sections:
         category = str(section.get("category") or "")
         sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=last_col)
@@ -163,6 +257,7 @@ def _write_budget_forecast(sheet: Worksheet, report: dict[str, Any]) -> None:
 
         section_partial = any(item.get("unavailable") for item in (section.get("rows") or []))
         data_rows = list(section.get("rows") or [])
+        section_totals = list(section.get("totals") or [])
         data_start = row
         for item in data_rows:
             code_cell = sheet.cell(row, 1, str(item.get("budget_code") or ""))
@@ -178,10 +273,11 @@ def _write_budget_forecast(sheet: Worksheet, report: dict[str, Any]) -> None:
                 amount = values[index] if index < len(values) else None
                 _write_numeric_or_blank(sheet.cell(row, 3 + index), amount)
             if month_count:
-                ytd_cell = sheet.cell(row, ytd_col)
-                ytd_cell.value = _sum_formula(3, row, month_end, row)
-                ytd_cell.number_format = AMOUNT_FORMAT
-                ytd_cell.alignment = Alignment(horizontal="right", vertical="center")
+                ytd_cache = item.get("ytd")
+                if not is_finite_amount(ytd_cache):
+                    finite = [float(value) for value in values if is_finite_amount(value)]
+                    ytd_cache = float(sum(finite)) if finite else None
+                _set_sum_formula(sheet.cell(row, ytd_col), _sum_formula(3, row, month_end, row), ytd_cache)
             else:
                 sheet.cell(row, ytd_col).value = None
             for column in range(1, last_col + 1):
@@ -195,14 +291,22 @@ def _write_budget_forecast(sheet: Worksheet, report: dict[str, Any]) -> None:
         sheet.cell(row, 2, "")
         if data_rows and month_count:
             for index in range(month_count):
-                total_cell = sheet.cell(row, 3 + index)
-                total_cell.value = _sum_formula(3 + index, data_start, 3 + index, data_end)
-                total_cell.number_format = AMOUNT_FORMAT
-                total_cell.alignment = Alignment(horizontal="right", vertical="center")
-            ytd_total = sheet.cell(row, ytd_col)
-            ytd_total.value = _sum_formula(ytd_col, data_start, ytd_col, data_end)
-            ytd_total.number_format = AMOUNT_FORMAT
-            ytd_total.alignment = Alignment(horizontal="right", vertical="center")
+                cached = section_totals[index] if index < len(section_totals) else None
+                _set_sum_formula(
+                    sheet.cell(row, 3 + index),
+                    _sum_formula(3 + index, data_start, 3 + index, data_end),
+                    cached,
+                )
+            ytd_cache = section.get("total_ytd")
+            if not is_finite_amount(ytd_cache):
+                finite = [float(value) for value in section_totals if is_finite_amount(value)]
+                ytd_cache = float(sum(finite)) if finite else None
+            _set_sum_formula(
+                sheet.cell(row, ytd_col),
+                _sum_formula(ytd_col, data_start, ytd_col, data_end),
+                ytd_cache,
+            )
+            category_total_rows.append(row)
         else:
             for index in range(month_count):
                 _write_numeric_or_blank(sheet.cell(row, 3 + index), None)
@@ -213,6 +317,19 @@ def _write_budget_forecast(sheet: Worksheet, report: dict[str, Any]) -> None:
             sheet.cell(row, column).font = TOTAL_FONT
         sheet.row_dimensions[row].height = 20
         row += 2
+
+    if sections and month_count and category_total_rows:
+        row = _write_grand_total(
+            sheet,
+            row,
+            last_col,
+            month_count,
+            ytd_col,
+            category_total_rows,
+            list(model.get("grand_totals") or []),
+            model.get("grand_total_ytd"),
+        )
+        row += 1
 
     if not sections:
         message = sheet.cell(row, 1, model.get("no_forecast_message") or "No forecast available for the selected category.")
@@ -232,6 +349,46 @@ def _write_budget_forecast(sheet: Worksheet, report: dict[str, Any]) -> None:
     sheet.page_setup.fitToWidth = 1
     sheet.page_setup.fitToHeight = 0
     sheet.sheet_properties.pageSetUpPr.fitToPage = True
+
+
+def _write_grand_total(
+    sheet: Worksheet,
+    row: int,
+    last_col: int,
+    month_count: int,
+    ytd_col: int,
+    category_total_rows: list[int],
+    grand_totals: list[Any],
+    grand_total_ytd: Any,
+) -> int:
+    """Overall monthly/YTD total from category TOTAL rows only (no double-counting)."""
+    label = sheet.cell(row, 1, "GRAND TOTAL")
+    label.font = TOTAL_FONT
+    sheet.cell(row, 2, "")
+    for index in range(month_count):
+        column = 3 + index
+        refs = [f"{get_column_letter(column)}{total_row}" for total_row in category_total_rows]
+        formula = f"=SUM({','.join(refs)})" if refs else None
+        cached = grand_totals[index] if index < len(grand_totals) else None
+        if formula:
+            _set_sum_formula(sheet.cell(row, column), formula, cached)
+        else:
+            _write_numeric_or_blank(sheet.cell(row, column), cached)
+    if category_total_rows:
+        ytd_refs = [f"{get_column_letter(ytd_col)}{total_row}" for total_row in category_total_rows]
+        _set_sum_formula(
+            sheet.cell(row, ytd_col),
+            f"=SUM({','.join(ytd_refs)})",
+            grand_total_ytd,
+        )
+    else:
+        sheet.cell(row, ytd_col).value = None
+    for column in range(1, last_col + 1):
+        sheet.cell(row, column).fill = TOTAL_FILL
+        sheet.cell(row, column).border = THIN
+        sheet.cell(row, column).font = TOTAL_FONT
+    sheet.row_dimensions[row].height = 22
+    return row + 1
 
 
 def _section_banner(sheet: Worksheet, row: int, last_col: int, title: str) -> None:

@@ -41,6 +41,15 @@ from preprocessing import (  # noqa: E402
 
 DEFAULT_CATEGORY_ID = "international_settlement"
 DEFAULT_CATEGORY_NAME = "International Settlement"
+ALL_CATEGORIES_ID = "all"
+ALL_CATEGORIES_NAME = "All Categories"
+ALL_CATEGORIES_TOKENS = {
+    "all",
+    "all categories",
+    "all_categories",
+    "*",
+    "__all__",
+}
 RECURRING_COVERAGE = 0.75
 
 router = APIRouter(prefix="/api/overview", tags=["overview"])
@@ -193,13 +202,29 @@ def _is_international_settlement(name: str) -> bool:
 
 def _category_slug(name: str) -> str:
     text = str(name or "").strip()
+    if _is_all_categories_label(text):
+        return ALL_CATEGORIES_ID
     if _is_international_settlement(text):
         return DEFAULT_CATEGORY_ID
     return re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_") or "category"
 
 
+def _is_all_categories_label(value: object) -> bool:
+    return str(value or "").strip().casefold() in ALL_CATEGORIES_TOKENS
+
+
+def _all_categories_record() -> dict:
+    return {
+        "id": ALL_CATEGORIES_ID,
+        "name": ALL_CATEGORIES_NAME,
+        "source_name": ALL_CATEGORIES_NAME,
+    }
+
+
 def _display_category_name(name: str) -> str:
     text = str(name or "").strip()
+    if _is_all_categories_label(text):
+        return ALL_CATEGORIES_NAME
     return DEFAULT_CATEGORY_NAME if _is_international_settlement(text) else text
 
 
@@ -502,11 +527,15 @@ def _list_categories() -> dict:
 
 
 def _resolve_category(requested: str | None) -> dict:
+    if _is_all_categories_label(requested):
+        return _all_categories_record()
     catalog = _list_categories()
     if not requested:
         ident = catalog["default_category"]
     else:
         ident = _category_slug(requested)
+        if ident == ALL_CATEGORIES_ID:
+            return _all_categories_record()
         known = {item["id"] for item in catalog["categories"]}
         if ident not in known:
             match = next(
@@ -543,13 +572,23 @@ def _prepare_category_actuals(category: dict) -> dict:
         raise OverviewDataError("Latest actual month is missing from the historical data.")
 
     assigned = workbook["assigned"]
-    accounts = assigned[
+    account_mask = (
         (~assigned["is_category_row"])
         & assigned["numeric_account_code"].notna()
         & assigned[account_code_col].notna()
         & assigned["category"].notna()
-        & (assigned["category"].astype(str).str.strip().str.casefold() == category["source_name"].strip().casefold())
-    ].copy()
+    )
+    if category.get("id") == ALL_CATEGORIES_ID or _is_all_categories_label(category.get("source_name")):
+        # Confirmed master: every numeric account row across all source categories.
+        accounts = assigned[account_mask].copy()
+    else:
+        accounts = assigned[
+            account_mask
+            & (
+                assigned["category"].astype(str).str.strip().str.casefold()
+                == category["source_name"].strip().casefold()
+            )
+        ].copy()
     if accounts.empty:
         raise OverviewDataError(f"No account rows were found for category {category['source_name']!r}.")
 
@@ -1099,10 +1138,89 @@ def _get_analysis(category: str | None, history_range: str | None = "latest2") -
     return payload
 
 
+class CodeActualsRequest(BaseModel):
+    budget_codes: list[str] = []
+
+
+class CodeMonthActualItem(BaseModel):
+    budget_code: str
+    month: str
+    # Null preserves explicit missing declarations; absent records are omitted entirely.
+    actual_amount: Optional[float] = None
+
+
+class CodeActualsResponse(BaseModel):
+    amount_unit: str
+    conversion_factor: float
+    history_start: Optional[str] = None
+    history_end: Optional[str] = None
+    budget_code_count: int = 0
+    actuals: list[CodeMonthActualItem]
+
+
+def _code_actuals_payload(budget_codes: list[str]) -> dict:
+    from app.services.dataset_repository import list_historical_actuals_for_codes
+
+    requested = sorted({str(code).strip() for code in budget_codes if str(code or "").strip()})
+    try:
+        rows = list_historical_actuals_for_codes(requested)
+    except DatabaseError as error:
+        raise OverviewDataError(str(error)) from error
+
+    factor = float(AMOUNT_CONVERSION_FACTOR)
+    actuals: list[dict] = []
+    months: list[str] = []
+    codes_seen: set[str] = set()
+    for row in rows:
+        code = str(row.get("budget_code") or "").strip()
+        month = str(row.get("month") or "").strip()
+        if not code or not re.fullmatch(r"\d{4}-\d{2}", month):
+            continue
+        raw = row.get("amount")
+        amount: float | None
+        if raw is None or raw == "":
+            # Explicit missing declaration — keep null; never invent a zero.
+            amount = None
+        else:
+            try:
+                number = float(raw) * factor
+            except (TypeError, ValueError):
+                # Non-numeric stored value: skip; do not coerce to zero.
+                continue
+            if number != number or number in (float("inf"), float("-inf")):
+                continue
+            amount = float(number)
+        codes_seen.add(code)
+        months.append(month)
+        actuals.append({
+            "budget_code": code,
+            "month": month,
+            "actual_amount": amount,
+        })
+    months_sorted = sorted(set(months))
+    return {
+        "amount_unit": RESPONSE_AMOUNT_UNIT,
+        "conversion_factor": factor,
+        "history_start": months_sorted[0] if months_sorted else None,
+        "history_end": months_sorted[-1] if months_sorted else None,
+        "budget_code_count": len(codes_seen),
+        "actuals": actuals,
+    }
+
+
 @router.get("/categories", response_model=OverviewCategoriesResponse)
 def overview_categories() -> OverviewCategoriesResponse:
     try:
         return OverviewCategoriesResponse(**_list_categories())
+    except OverviewDataError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@router.post("/code-actuals", response_model=CodeActualsResponse)
+def overview_code_actuals(body: CodeActualsRequest) -> CodeActualsResponse:
+    """Confirmed historical actuals for a specific Budget Code population."""
+    try:
+        return CodeActualsResponse(**_code_actuals_payload(body.budget_codes or []))
     except OverviewDataError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 

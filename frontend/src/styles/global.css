@@ -2395,6 +2395,14 @@ td {
   position: relative;
 }
 
+.generate-page .combined-forecast-charts {
+  overflow: visible;
+}
+
+.generate-page .combined-forecast-year-total-chart.chart-area-tooltip-host {
+  overflow: visible !important;
+}
+
 .generate-page .chart-area .recharts-responsive-container,
 .generate-page .chart-area .recharts-wrapper,
 .generate-page .chart-area .recharts-surface {
@@ -3151,6 +3159,106 @@ td {
   width: 100%;
 }
 
+.combined-forecast-charts {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  gap: 0;
+  min-width: 0;
+  width: 100%;
+  overflow: visible;
+}
+
+.combined-forecast-charts-monthly {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-right: 1rem;
+}
+
+.combined-forecast-charts-totals {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  gap: 0.75rem;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding-left: 1rem;
+  border-left: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  overflow: visible;
+}
+
+.combined-forecast-charts[data-year-count="1"] .combined-forecast-charts-totals {
+  flex-basis: clamp(160px, 22vw, 220px);
+}
+
+.combined-forecast-charts[data-year-count="2"] .combined-forecast-charts-totals {
+  flex-basis: clamp(300px, 38vw, 420px);
+}
+
+.combined-forecast-charts[data-year-count="3"] .combined-forecast-charts-totals,
+.combined-forecast-charts[data-year-count="4"] .combined-forecast-charts-totals {
+  flex-basis: clamp(420px, 48vw, 600px);
+}
+
+.combined-forecast-year-total {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  min-width: 0;
+  flex: 1 1 0;
+  align-self: stretch;
+}
+
+.combined-forecast-year-total-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+  min-height: 2.4rem;
+}
+
+.combined-forecast-year-total-title {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--text);
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.combined-forecast-year-total-range {
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.3;
+}
+
+.combined-forecast-year-total-chart {
+  position: relative;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 180px;
+  height: 180px;
+  min-width: 0;
+  overflow: visible;
+}
+
+.combined-forecast-year-total-value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  min-height: 1.35em;
+}
+
+.combined-forecast-year-total-coverage {
+  font-size: 0.7rem;
+  line-height: 1.3;
+}
+
 .analytics-ytd-summary-row {
   display: flex;
   flex-wrap: wrap;
@@ -3486,6 +3594,37 @@ td {
   .analytics-comparison-layout,
   .analytics-meta-grid {
     grid-template-columns: 1fr;
+  }
+
+  .combined-forecast-charts {
+    flex-direction: column;
+    flex-wrap: nowrap;
+  }
+
+  .combined-forecast-charts-monthly {
+    flex: 1 1 100%;
+    padding-right: 0;
+    padding-bottom: 0.85rem;
+  }
+
+  .combined-forecast-charts-totals,
+  .combined-forecast-charts[data-year-count="1"] .combined-forecast-charts-totals,
+  .combined-forecast-charts[data-year-count="2"] .combined-forecast-charts-totals,
+  .combined-forecast-charts[data-year-count="3"] .combined-forecast-charts-totals,
+  .combined-forecast-charts[data-year-count="4"] .combined-forecast-charts-totals {
+    flex: 1 1 100%;
+    flex-basis: auto;
+    flex-wrap: wrap;
+    border-left: none;
+    border-top: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+    padding-left: 0;
+    padding-top: 0.85rem;
+  }
+
+  .combined-forecast-year-total {
+    flex: 1 1 160px;
+    max-width: 100%;
+    min-width: min(160px, 100%);
   }
 
   .analytics-toolbar {

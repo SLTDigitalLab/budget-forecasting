@@ -6,12 +6,14 @@ import {
   forecastPdfPreviewUrl,
   getForecastHistory,
   getForecastRecord,
+  getOverviewCodeActuals,
 } from "../api/forecastApi";
 import ErrorState from "../components/ErrorState";
 import EmptyState from "../components/EmptyState";
 import ForecastReportPreview from "../components/ForecastReportPreview";
 import LoadingState from "../components/LoadingState";
 import { formatAmount } from "../utils/forecastDisplay";
+import { contributingForecastCodes } from "../utils/forecastComparison";
 import {
   buildReportPreviewModel,
   exportPageState,
@@ -106,7 +108,21 @@ export default function ExportForecasts() {
     setPreview(null);
     try {
       const forecast = await getForecastRecord(selectedId);
-      const model = buildReportPreviewModel(forecast);
+      let enriched = forecast;
+      try {
+        const codes = contributingForecastCodes(forecast);
+        if (codes.length) {
+          const codeActuals = await getOverviewCodeActuals(codes);
+          enriched = {
+            ...forecast,
+            code_level_actuals: Array.isArray(codeActuals?.actuals) ? codeActuals.actuals : [],
+            history_end: codeActuals?.history_end || forecast.history_end || forecast.historical_end,
+          };
+        }
+      } catch {
+        // Preview still works from forecast-attached history if code actuals fail.
+      }
+      const model = buildReportPreviewModel(enriched);
       if (!model) {
         throw new Error("Only a completed forecast can be previewed.");
       }

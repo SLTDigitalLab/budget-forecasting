@@ -89,9 +89,13 @@ export function buildReportPreviewModel(forecast) {
     };
   });
   const comparison = buildForecastComparison({
+    // Prefer confirmed code-level actuals when the caller supplies them (Analytics / export prep).
+    // Otherwise fall back to forecast-attached history for lightweight previews.
+    codeActuals: Array.isArray(forecast.code_level_actuals) ? forecast.code_level_actuals : undefined,
     historicalActuals: forecast.historical_actuals,
     forecast,
     historyEnd: forecast.history_end || forecast.historical_end,
+    historyStart: forecast.comparison_history_start || null,
   });
   return {
     title: "AI Budget Forecast Report",

@@ -45,6 +45,9 @@ export function forecastMatchesOverviewCategory(forecastCategory, overviewCatego
   if (forecastCategory == null || forecastCategory === "" || !overviewCategory) {
     return false;
   }
+  if (isAllCategories(forecastCategory) && isAllCategories(overviewCategory)) {
+    return true;
+  }
   const forecastLabel = typeof forecastCategory === "object"
     ? String(
       forecastCategory.name

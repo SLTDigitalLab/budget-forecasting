@@ -58,6 +58,17 @@ export function getOverviewAnalysis(category, historyRange = "latest2") {
   return request(`/api/overview/analysis${query ? `?${query}` : ""}`);
 }
 
+/** Confirmed code/month actuals for a specific Budget Code population. */
+export function getOverviewCodeActuals(budgetCodes) {
+  const codes = (Array.isArray(budgetCodes) ? budgetCodes : [])
+    .map((code) => String(code || "").trim())
+    .filter(Boolean);
+  return request("/api/overview/code-actuals", {
+    method: "POST",
+    body: JSON.stringify({ budget_codes: codes }),
+  });
+}
+
 export function getOverviewForecastActivity() {
   return request("/api/overview/forecast-activity");
 }
