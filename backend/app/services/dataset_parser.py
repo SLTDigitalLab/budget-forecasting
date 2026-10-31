@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import uuid
 from collections import defaultdict
@@ -129,6 +130,133 @@ def _is_blank(value: Any) -> bool:
 
 def _is_formula(value: Any) -> bool:
     return isinstance(value, str) and value.startswith("=")
+
+
+# Blank-code workbook rows that are totals/notes — not category headings and not accounts.
+# Do not treat every blank ACT CODE as skippable; genuine accounts still fail validation.
+_SUMMARY_OR_NOTE_LABEL = re.compile(
+    r"(?ix)"
+    r"(?:^|\b)(?:"
+    r"grand\s*totals?"
+    r"|sub[\s-]*totals?"
+    r"|totals?"
+    r"|exclusions?"
+    r")(?:\b|$)"
+)
+_CELL_REF = re.compile(r"\$?[A-Za-z]{1,3}\$?\d+")
+_ACCOUNT_LOOKUP_FORMULA = re.compile(r"(?i)\b(?:VLOOKUP|XLOOKUP|INDEX|MATCH|HLOOKUP)\b")
+
+
+def is_summary_or_note_label(description: Any) -> bool:
+    """True for total/subtotal/exclusion labels that are not budget accounts."""
+    text = "" if description is None else str(description).strip()
+    if not text:
+        return False
+    return bool(_SUMMARY_OR_NOTE_LABEL.search(text))
+
+
+def _formula_is_cross_row_aggregation(formula: str) -> bool:
+    """Detect SUM/additive rollups; account VLOOKUPs are not aggregations."""
+    text = str(formula or "").strip()
+    if not text.startswith("="):
+        return False
+    body = text[1:]
+    if _ACCOUNT_LOOKUP_FORMULA.search(body):
+        return False
+    if re.search(r"(?i)\b(?:SUM|AVERAGE|SUBTOTAL|AGGREGATE)\s*\(", body):
+        return True
+    refs = _CELL_REF.findall(body)
+    return len(refs) >= 2 and ("+" in body or "-" in body)
+
+
+def _month_values_look_like_non_account_rollups(month_values: list[Any]) -> bool:
+    """True when blank-code month cells are dominated by cross-row rollup formulas.
+
+    Some workbook subtotals paste a few months as literals while leaving the rest
+    as SUM/additive formulas. Require aggregations to outnumber literals and reject
+    account-style lookup formulas so genuine missing Budget Codes still fail.
+    """
+    nonempty = [value for value in month_values if not _is_blank(value)]
+    if not nonempty:
+        return False
+    aggregations = 0
+    lookups = 0
+    other = 0
+    for value in nonempty:
+        if _is_formula(value):
+            text = str(value)
+            if _ACCOUNT_LOOKUP_FORMULA.search(text):
+                lookups += 1
+            elif _formula_is_cross_row_aggregation(text):
+                aggregations += 1
+            else:
+                other += 1
+        else:
+            other += 1
+    if lookups or aggregations == 0:
+        return False
+    return aggregations >= max(2, (aggregations + other + 1) // 2)
+
+
+def discover_non_account_blank_code_rows(
+    path: Path,
+    sheet_name: str,
+    header_row_idx: int,
+    code_column: str,
+    name_column: str,
+    month_columns: list[str],
+    *,
+    end_excel_row: int | None = None,
+) -> set[int]:
+    """Excel rows with a blank Budget Code that are summary/note lines, not accounts.
+
+    Category headings are handled separately (bold name + empty actuals) and must
+    not be reclassified here — notes/summaries must not interrupt category ffill.
+    Genuine account rows that simply omit their Budget Code are not returned.
+    """
+    workbook = load_workbook(path, read_only=False, data_only=False)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            return set()
+        worksheet = workbook[sheet_name]
+        header_row = int(header_row_idx) + 1
+        max_column = int(worksheet.max_column or 0)
+        headers = [
+            normalize_label(worksheet.cell(header_row, column).value)
+            for column in range(1, max_column + 1)
+        ]
+        try:
+            code_idx = headers.index(normalize_label(code_column))
+            name_idx = headers.index(normalize_label(name_column))
+        except ValueError:
+            return set()
+        month_indices = [
+            headers.index(normalize_label(column))
+            for column in month_columns
+            if normalize_label(column) in headers
+        ]
+        first_data_row = header_row + 1
+        last_data_row = int(end_excel_row or worksheet.max_row or 0)
+        if last_data_row < first_data_row:
+            return set()
+        skipped: set[int] = set()
+        for excel_row in range(first_data_row, last_data_row + 1):
+            code_value = worksheet.cell(excel_row, code_idx + 1).value
+            name_value = worksheet.cell(excel_row, name_idx + 1).value
+            if not _is_blank(code_value) or _is_formula(code_value):
+                continue
+            description = "" if name_value is None else str(name_value).strip()
+            if not description or _is_formula(name_value):
+                continue
+            if is_summary_or_note_label(description):
+                skipped.add(int(excel_row))
+                continue
+            month_values = [worksheet.cell(excel_row, index + 1).value for index in month_indices]
+            if _month_values_look_like_non_account_rollups(month_values):
+                skipped.add(int(excel_row))
+        return skipped
+    finally:
+        workbook.close()
 
 
 def _cached_financial_value(value: Any) -> Any:
@@ -433,13 +561,15 @@ def parse_historical_dataset(
     )
     category_headings: list[dict] = []
     category_order: list[str] = []
+    non_account_rows: set[int] = set()
+    end_excel_row = int(header_row_idx) + 1 + len(working)
     if loaded["kind"] == "xlsx":
         category_headings = detect_category_headings_from_workbook(
             path,
             sheet,
             header_row_idx,
             header_values=raw.iloc[header_row_idx].tolist(),
-            end_excel_row=int(header_row_idx) + 1 + len(working),
+            end_excel_row=end_excel_row,
         )
         category_order = category_order_from_headings(category_headings)
         assigned = assign_categories(
@@ -450,6 +580,19 @@ def parse_historical_dataset(
         )
         working = assigned
         working["category"] = working["category"].fillna("").astype(str).str.strip()
+        # Summaries/notes (blank code + total/exclusion label or aggregation formulas).
+        # Never treat these as category headings — Bad debt ffill must continue past them.
+        non_account_rows = discover_non_account_blank_code_rows(
+            path,
+            sheet,
+            header_row_idx,
+            code_col,
+            name_col,
+            month_columns,
+            end_excel_row=end_excel_row,
+        )
+        heading_rows = {int(item["excel_row"]) for item in category_headings}
+        non_account_rows -= heading_rows
     elif category_col:
         # CSV/text uploads cannot expose bold headings; use an explicit Category column only.
         working["category"] = working[category_col].map(
@@ -469,9 +612,15 @@ def parse_historical_dataset(
         excel_row = _excel_row_number(header_row_idx, int(index))
         if record.get("is_category_row"):
             continue
+        if excel_row in non_account_rows:
+            # Skip totals/notes: do not import amounts and do not raise missing-code errors.
+            continue
         code = record.get(code_col)
         description = str(record.get(name_col) or "").strip()
         if _is_blank(code) and not description:
+            continue
+        # CSV/text path: label-only non-account rows (no openpyxl formula inspection).
+        if loaded["kind"] != "xlsx" and _is_blank(code) and is_summary_or_note_label(description):
             continue
         category = str(record.get("category") or "").strip()
         amounts: dict[str, Any] = {}
