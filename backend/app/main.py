@@ -11,6 +11,7 @@ from app.routers.forecasting import router as forecasting_router
 from app.routers.overview import router as overview_router
 from app.routers.datasets import router as datasets_router
 from app.routers.retraining import router as retraining_router
+from app.routers.internal_metrics import router as internal_metrics_router
 from app.services.retrain_state import CoordinationError
 from app.schemas.forecast import HealthResponse
 from app.services.forecasting_service import (
@@ -24,6 +25,7 @@ from app.services.model_loader import (
     is_model_loaded,
     load_production_model,
 )
+from app.telemetry.middleware import HttpMetricsMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +86,14 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
+# Outer middleware: records status through streaming completion without buffering bodies.
+app.add_middleware(HttpMetricsMiddleware)
 
 app.include_router(forecasting_router)
 app.include_router(overview_router)
 app.include_router(datasets_router)
 app.include_router(retraining_router)
+app.include_router(internal_metrics_router)
 
 
 @app.exception_handler(CoordinationError)

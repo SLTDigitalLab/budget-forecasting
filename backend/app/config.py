@@ -59,3 +59,7 @@ DATASET_STORAGE_DIR = Path(
 DATASET_MAX_UPLOAD_BYTES = int(os.getenv("DATASET_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 DATASET_PREVIEW_TTL_SECONDS = int(os.getenv("DATASET_PREVIEW_TTL_SECONDS", "7200"))
 
+# Dedicated scrape token for GET /internal/metrics. Never log or commit the value.
+# When unset, the metrics endpoint rejects all scrapes.
+METRICS_API_TOKEN = str(os.getenv("METRICS_API_TOKEN") or "").strip()
+
