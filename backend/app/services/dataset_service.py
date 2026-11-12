@@ -461,60 +461,7 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
             "Historical records were saved, but the managed master workbook could not be replaced.",
         ) from error
 
-    category_assignments: dict[str, str] = {}
-    previous_by_code: dict[str, str] = {}
-    for item in analysis.get("changes") or []:
-        code = str(item.get("budget_code") or "").strip()
-        previous = str(item.get("previous_category") or "").strip()
-        new_category = str(item.get("new_category") or "").strip()
-        if not code or not new_category or previous == new_category:
-            continue
-        category_assignments[code] = new_category
-        if previous:
-            previous_by_code.setdefault(code, previous)
-    for conflict in analysis.get("metadata_conflicts") or []:
-        if not conflict.get("category_differs"):
-            continue
-        code = str(conflict.get("budget_code") or "").strip()
-        new_category = str(conflict.get("uploaded_category") or "").strip()
-        previous = str(conflict.get("current_category") or "").strip()
-        if code and new_category:
-            category_assignments[code] = new_category
-            if previous:
-                previous_by_code.setdefault(code, previous)
-    if category_assignments:
-        try:
-            bundle_sync = _sync_bundle_categories(category_assignments)
-            if bundle_sync.get("updated_codes"):
-                result["bundle_categories_synced"] = list(bundle_sync["updated_codes"])
-                result["message"] = (
-                    "Historical dataset updated successfully. Active model bundle category labels were synced. "
-                    "Trained forecast models were not retrained."
-                )
-        except BundleCategorySyncError as error:
-            for code, new_category in category_assignments.items():
-                restore = previous_by_code.get(code)
-                if not restore:
-                    continue
-                try:
-                    _rollback_master_category(
-                        budget_code=code,
-                        restore_category=restore,
-                        expected_category=new_category,
-                        actor_name=name,
-                        actor_email=email,
-                        actor_tid=actor_tid,
-                        actor_oid=actor_oid,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Upload category sync failed for %s and master rollback also failed",
-                        code,
-                    )
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR,
-                f"The upload was not completed because model bundle category labels could not be updated: {error}",
-            ) from error
+    # Historical Confirm & Save updates master categories only. The active model pickle stays read-only.
 
     if source.exists():
         source.unlink()
