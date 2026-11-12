@@ -24,6 +24,7 @@ from app.services.dataset_workflow import (
     inclusive_months,
     manual_edit_plan,
     next_master_state,
+    plan_category_reassign,
     plan_rollback,
 )
 from app.services.dataset_repository import (
@@ -59,9 +60,76 @@ from app.services.dataset_storage import (
     write_bytes_atomically,
 )
 from app.services.dataset_storage import resolve_stored_path
+from app.services.bundle_category_sync import BundleCategorySyncError, sync_categories_or_raise
 from app.services.system_lock import mutation_scope
 
 logger = logging.getLogger(__name__)
+
+
+def _rollback_master_category(
+    *,
+    budget_code: str,
+    restore_category: str,
+    expected_category: str,
+    actor_name: str,
+    actor_email: str,
+    actor_tid: str,
+    actor_oid: str,
+) -> None:
+    """Best-effort restore of a category when the model bundle sync fails after master commit."""
+    state = load_master_state()
+    plan = plan_category_reassign(
+        budget_code=budget_code,
+        new_category=restore_category,
+        master_records=state["records"],
+        budget_codes=state.get("budget_codes") or [],
+        allowed_categories=_master_category_options(state),
+        master_version=state["version"],
+        expected_category=expected_category,
+        earliest_month=state.get("earliest_month"),
+        latest_month=state.get("latest_month"),
+    )
+    if not plan["can_confirm"]:
+        raise RuntimeError(plan["errors"][0] if plan["errors"] else "Unable to roll back the master category.")
+    now = _utc_now()
+    next_state = next_master_state(state, plan["changes"])
+    next_state["records"] = _stamp_source(next_state["records"], plan["changes"], None, state["records"])
+    prepared = _prepare_from_state(next_state)
+    try:
+        commit_master_state(
+            expected_version=state["version"],
+            next_records=next_state["records"],
+            file_row=None,
+            audit=_revision_audit(
+                None,
+                "Category Reassignment Rollback",
+                "MANUAL_EDIT",
+                actor_name,
+                actor_email,
+                now,
+                plan,
+                reason="Model bundle category sync failed",
+                tid=actor_tid,
+                oid=actor_oid,
+            ),
+            changes=plan["changes"],
+            **_identity_kwargs(next_state),
+        )
+        publish_managed_master(prepared)
+    except Exception:
+        if prepared.exists():
+            prepared.unlink()
+        raise
+    _invalidate_overview()
+
+
+def _sync_bundle_categories(assignments: dict[str, str]) -> dict[str, Any]:
+    try:
+        return sync_categories_or_raise(assignments)
+    except BundleCategorySyncError:
+        raise
+    except Exception as error:
+        raise BundleCategorySyncError(str(error)) from error
 
 
 def _guard_dataset_mutation(func):
@@ -392,14 +460,67 @@ def confirm_upload(preview_id: str, body: dict[str, Any] | None = None, actor=No
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Historical records were saved, but the managed master workbook could not be replaced.",
         ) from error
-    finally:
-        if prepared_master is not None and prepared_master.exists():
-            prepared_master.unlink()
-        if source.exists():
-            source.unlink()
-        delete_preview(preview_id)
-        cleanup_temp_files()
-        _invalidate_overview()
+
+    category_assignments: dict[str, str] = {}
+    previous_by_code: dict[str, str] = {}
+    for item in analysis.get("changes") or []:
+        code = str(item.get("budget_code") or "").strip()
+        previous = str(item.get("previous_category") or "").strip()
+        new_category = str(item.get("new_category") or "").strip()
+        if not code or not new_category or previous == new_category:
+            continue
+        category_assignments[code] = new_category
+        if previous:
+            previous_by_code.setdefault(code, previous)
+    for conflict in analysis.get("metadata_conflicts") or []:
+        if not conflict.get("category_differs"):
+            continue
+        code = str(conflict.get("budget_code") or "").strip()
+        new_category = str(conflict.get("uploaded_category") or "").strip()
+        previous = str(conflict.get("current_category") or "").strip()
+        if code and new_category:
+            category_assignments[code] = new_category
+            if previous:
+                previous_by_code.setdefault(code, previous)
+    if category_assignments:
+        try:
+            bundle_sync = _sync_bundle_categories(category_assignments)
+            if bundle_sync.get("updated_codes"):
+                result["bundle_categories_synced"] = list(bundle_sync["updated_codes"])
+                result["message"] = (
+                    "Historical dataset updated successfully. Active model bundle category labels were synced. "
+                    "Trained forecast models were not retrained."
+                )
+        except BundleCategorySyncError as error:
+            for code, new_category in category_assignments.items():
+                restore = previous_by_code.get(code)
+                if not restore:
+                    continue
+                try:
+                    _rollback_master_category(
+                        budget_code=code,
+                        restore_category=restore,
+                        expected_category=new_category,
+                        actor_name=name,
+                        actor_email=email,
+                        actor_tid=actor_tid,
+                        actor_oid=actor_oid,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Upload category sync failed for %s and master rollback also failed",
+                        code,
+                    )
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"The upload was not completed because model bundle category labels could not be updated: {error}",
+            ) from error
+
+    if source.exists():
+        source.unlink()
+    delete_preview(preview_id)
+    cleanup_temp_files()
+    _invalidate_overview()
     return result
 
 
@@ -627,7 +748,39 @@ def _display_amount(value):
     return display_historical_actual(value)
 
 
-def master_dataset(page: int, page_size: int, search: str | None, revision_filter: str | None, highlight: str | None) -> dict[str, Any]:
+def _master_category_options(state: dict[str, Any]) -> list[str]:
+    """Full active-master category list for UI filters (order preserved; extras appended)."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in state.get("category_order") or []:
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    for item in state.get("budget_codes") or []:
+        name = str(item.get("category") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    for item in state.get("records") or []:
+        name = str(item.get("category") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def master_dataset(
+    page: int,
+    page_size: int,
+    search: str | None,
+    revision_filter: str | None,
+    highlight: str | None,
+    category: str | None = None,
+) -> dict[str, Any]:
     from app.services.dataset_master import _import_engine
 
     _import_engine()
@@ -635,6 +788,7 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
 
     state = load_master_state()
     records, version, source = state["records"], state["version"], state["source"]
+    categories = _master_category_options(state)
     highlights = _highlight_map(highlight)
     grouped: dict[str, dict[str, Any]] = {}
     months: set[str] = set()
@@ -696,7 +850,13 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
     rows = list(grouped.values())
     needle = (search or "").strip().casefold()
     if needle:
-        rows = [row for row in rows if needle in row["budget_code"].casefold() or needle in row["category"].casefold()]
+        rows = [
+            row
+            for row in rows
+            if needle in row["budget_code"].casefold()
+            or needle in str(row.get("description") or "").casefold()
+            or needle in str(row.get("category") or "").casefold()
+        ]
     mode = (revision_filter or "all").strip().lower()
     if mode == "changes":
         rows = [row for row in rows if row["highlights"]]
@@ -713,6 +873,9 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
                 for month in ordered_months
             )
         ]
+    selected_category = str(category or "").strip()
+    if selected_category and selected_category.casefold() not in {"all", "all categories", "*"}:
+        rows = [row for row in rows if str(row.get("category") or "").strip() == selected_category]
     rows.sort(key=lambda item: item["budget_code"])
     size = max(1, min(int(page_size), 50))
     current = max(1, int(page))
@@ -730,6 +893,11 @@ def master_dataset(page: int, page_size: int, search: str | None, revision_filte
         "latest_month": latest,
         "models_retrained": False,
         "actuals_display_label": ACTUALS_DISPLAY_LABEL,
+        # Full master categories for the filter dropdown (not limited to the active tab).
+        "categories": categories,
+        "selected_category": selected_category
+        if selected_category and selected_category.casefold() not in {"all", "all categories", "*"}
+        else "",
     }
 
 
@@ -814,6 +982,115 @@ def confirm_manual_edits(body: dict[str, Any], actor=None) -> dict[str, Any]:
         "inserted": plan["new_count"],
         "changed": plan["changed_count"],
         "message": "Historical dataset updated successfully. Trained forecast models were not updated.",
+        "models_retrained": False,
+    }
+
+
+@_guard_dataset_mutation
+def reassign_master_category(body: dict[str, Any], actor=None) -> dict[str, Any]:
+    """Move one budget code category in Master and sync the active model bundle label."""
+    name, email, actor_tid, actor_oid = _actor(body, actor)
+    state = load_master_state()
+    records, version = state["records"], state["version"]
+    if int(body.get("master_version") or -1) != version:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The historical master changed. Review the category change again.")
+    categories = _master_category_options(state)
+    plan = plan_category_reassign(
+        budget_code=str(body.get("budget_code") or ""),
+        new_category=str(body.get("new_category") or ""),
+        master_records=records,
+        budget_codes=state.get("budget_codes") or [],
+        allowed_categories=categories,
+        master_version=version,
+        expected_category=body.get("expected_category") or body.get("current_category"),
+        earliest_month=state.get("earliest_month"),
+        latest_month=state.get("latest_month"),
+    )
+    if not plan["can_confirm"]:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            plan["errors"][0] if plan["errors"] else "The category change could not be applied.",
+        )
+    now = _utc_now()
+    next_state = next_master_state(state, plan["changes"])
+    next_state["records"] = _stamp_source(next_state["records"], plan["changes"], None, records)
+    next_records = next_state["records"]
+    prepared = _prepare_from_state(next_state)
+    master_committed = False
+    try:
+        result = commit_master_state(
+            expected_version=version,
+            next_records=next_records,
+            file_row=None,
+            audit=_revision_audit(
+                None,
+                "Category Reassignment",
+                "MANUAL_EDIT",
+                name,
+                email,
+                now,
+                plan,
+                reason=None,
+                tid=actor_tid,
+                oid=actor_oid,
+            ),
+            changes=plan["changes"],
+            **_identity_kwargs(next_state),
+        )
+        publish_managed_master(prepared)
+        master_committed = True
+        bundle_sync = _sync_bundle_categories({plan["budget_code"]: plan["new_category"]})
+    except DatasetConflictError as error:
+        if prepared.exists():
+            prepared.unlink()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+    except DatabaseError as error:
+        if prepared.exists():
+            prepared.unlink()
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(error)) from error
+    except BundleCategorySyncError as error:
+        if master_committed:
+            try:
+                _rollback_master_category(
+                    budget_code=plan["budget_code"],
+                    restore_category=plan["previous_category"],
+                    expected_category=plan["new_category"],
+                    actor_name=name,
+                    actor_email=email,
+                    actor_tid=actor_tid,
+                    actor_oid=actor_oid,
+                )
+            except Exception:
+                logger.exception(
+                    "Master category for %s was updated but the model bundle sync failed and rollback also failed",
+                    plan["budget_code"],
+                )
+                raise HTTPException(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    "The category change could not be completed safely. The master and model bundle may be out of sync. Nothing was reported as saved.",
+                ) from error
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"The category change was not saved because the model bundle could not be updated: {error}",
+        ) from error
+    _invalidate_overview()
+    bundle_note = ""
+    if bundle_sync.get("updated_codes"):
+        bundle_note = " The active model bundle category label was synced."
+    elif plan["budget_code"] in (bundle_sync.get("skipped_codes") or []):
+        bundle_note = " No trained model entry exists for this Budget Code; only the Master Dataset was updated."
+    return {
+        "audit_id": result["audit_id"],
+        "revision_id": f"manual-{result['audit_id']}",
+        "budget_code": plan["budget_code"],
+        "previous_category": plan["previous_category"],
+        "new_category": plan["new_category"],
+        "changed": plan["changed_count"],
+        "bundle_updated": bool(bundle_sync.get("updated_codes")),
+        "message": (
+            f"Budget Code {plan['budget_code']} moved from {plan['previous_category']} to "
+            f"{plan['new_category']}.{bundle_note} Fitted models were not retrained."
+        ),
         "models_retrained": False,
     }
 
