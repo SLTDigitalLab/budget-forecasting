@@ -1156,31 +1156,54 @@ def _mean_metric(rows, key):
     return float(np.mean(values))
 
 
-def aggregate_fold_metrics(fold_rows) -> dict:
-    """Average fold metrics only when every fold succeeded.
+def _fold_failure_reasons(fold_rows) -> list[dict]:
+    reasons = []
+    for row in fold_rows or []:
+        if row.get("status") == "success":
+            continue
+        reasons.append({
+            "fold": row.get("name"),
+            "status": row.get("status"),
+            "error": row.get("error"),
+            "exception_type": row.get("exception_type"),
+        })
+    return reasons
 
-    A failed or missing fold is not dropped. Its algorithm stays incomparable
-    so it cannot win on the remaining folds.
+
+def aggregate_fold_metrics(fold_rows) -> dict:
+    """Average metrics across passing folds when at least one fold succeeds.
+
+    Every planned fold is still evaluated and retained. Failed folds stay visible
+    in the output and do not contribute to the averaged validation metric. A
+    candidate with zero passing folds remains ineligible.
     """
     rows = list(fold_rows or [])
+    successful = [row for row in rows if row.get("status") == "success"]
     failed = [row for row in rows if row.get("status") != "success"]
-    if not rows or failed:
+    failure_reasons = _fold_failure_reasons(rows)
+    if not rows or not successful:
         return {
             "comparable": False,
-            "reason": "One or more validation folds failed. Failed folds were not dropped from the comparison.",
+            "reason": (
+                "No validation folds passed. Failed folds were retained and the "
+                "candidate is ineligible for winner selection."
+            ),
             "metrics": {metric: np.nan for metric in EVALUATION_METRICS},
             "mean_error": np.nan,
             "bias_direction": None,
+            "successful_fold_count": 0,
+            "failed_fold_count": len(failed),
+            "fold_failure_reasons": failure_reasons,
         }
     metrics = {
-        "MAE": _mean_metric(rows, "mae"),
-        "RMSE": _mean_metric(rows, "rmse"),
-        "MAPE": _mean_metric(rows, "mape"),
-        "WAPE": _mean_metric(rows, "wape"),
-        "MASE": _mean_metric(rows, "mase"),
-        "R2": _mean_metric(rows, "r2"),
+        "MAE": _mean_metric(successful, "mae"),
+        "RMSE": _mean_metric(successful, "rmse"),
+        "MAPE": _mean_metric(successful, "mape"),
+        "WAPE": _mean_metric(successful, "wape"),
+        "MASE": _mean_metric(successful, "mase"),
+        "R2": _mean_metric(successful, "r2"),
     }
-    bias_values = [row.get("mean_error") for row in rows]
+    bias_values = [row.get("mean_error") for row in successful]
     if any(value is None or not np.isfinite(float(value)) for value in bias_values):
         mean_error = np.nan
         bias_direction = None
@@ -1192,12 +1215,21 @@ def aggregate_fold_metrics(fold_rows) -> dict:
             bias_direction = "underprediction"
         else:
             bias_direction = "none"
+    reason = ""
+    if failed:
+        reason = (
+            f"{len(failed)} fold(s) failed; validation metrics averaged over "
+            f"{len(successful)} passing fold(s)."
+        )
     return {
         "comparable": True,
-        "reason": "",
+        "reason": reason,
         "metrics": metrics,
         "mean_error": mean_error,
         "bias_direction": bias_direction,
+        "successful_fold_count": len(successful),
+        "failed_fold_count": len(failed),
+        "fold_failure_reasons": failure_reasons,
     }
 
 
@@ -1408,19 +1440,29 @@ def evaluate_expanding_specification(
         },
         "summary": {
             "rolling_folds": fold_rows,
-            "rolling_wape_mean": float(np.mean(wapes)) if aggregate["comparable"] and wapes else None,
+            "rolling_wape_mean": float(np.mean(wapes)) if wapes else None,
             "rolling_wape_std": (
-                float(np.std(wapes, ddof=1)) if aggregate["comparable"] and len(wapes) > 1
-                else (0.0 if aggregate["comparable"] and len(wapes) == 1 else None)
+                float(np.std(wapes, ddof=1)) if len(wapes) > 1
+                else (0.0 if len(wapes) == 1 else None)
             ),
-            "rolling_successful_folds": len(successful) if aggregate["comparable"] else 0,
+            "rolling_successful_folds": len(successful),
             "rolling_failed_folds": len(fold_rows) - len(successful),
+            "fold_failure_reasons": aggregate.get("fold_failure_reasons") or [],
+            "aggregate_reason": aggregate.get("reason") or "",
         },
     }
 
 
+def _fold_count_series(frame: pd.DataFrame) -> pd.Series:
+    if "rolling_successful_folds" in frame.columns:
+        return frame["rolling_successful_folds"].fillna(0).astype(int)
+    if "Rolling Successful Folds" in frame.columns:
+        return frame["Rolling Successful Folds"].fillna(0).astype(int)
+    return pd.Series(0, index=frame.index, dtype=int)
+
+
 def ranked_success_algorithms(evaluation_table: pd.DataFrame, code: str) -> list[str]:
-    """Same metric-win order used to select an account winner, including ties."""
+    """Pass-count first, then the existing validation-metric order, including ties."""
     if evaluation_table is None or getattr(evaluation_table, "empty", True):
         return []
     group = evaluation_table[evaluation_table["Budget Code"].astype(str) == str(code)].copy()
@@ -1429,6 +1471,10 @@ def ranked_success_algorithms(evaluation_table: pd.DataFrame, code: str) -> list
         return []
     if "Metric_Wins" not in successful.columns:
         successful["Metric_Wins"] = 0
+    successful["_fold_sort"] = _fold_count_series(successful)
+    successful = successful[successful["_fold_sort"] > 0].copy()
+    if successful.empty:
+        return []
     successful["_wape_sort"] = successful["WAPE"].apply(
         lambda value: float(value) if value is not None and np.isfinite(float(value)) else np.inf
     )
@@ -1439,8 +1485,8 @@ def ranked_success_algorithms(evaluation_table: pd.DataFrame, code: str) -> list
         lambda value: float(value) if value is not None and np.isfinite(float(value)) else np.inf
     )
     successful = successful.sort_values(
-        ["Metric_Wins", "_wape_sort", "_mase_sort", "_rmse_sort", "Algorithm"],
-        ascending=[False, True, True, True, True],
+        ["_fold_sort", "Metric_Wins", "_wape_sort", "_mase_sort", "_rmse_sort", "Algorithm"],
+        ascending=[False, False, True, True, True, True],
         kind="mergesort",
     )
     return [str(algorithm) for algorithm in successful["Algorithm"].tolist()]
@@ -1611,13 +1657,22 @@ def evaluate_rolling(
 
 
 def _candidate_score(holdout_wape, rolling_info):
+    """Lower tuples rank better: more passing folds first, then mean WAPE on those folds."""
     rolling_mean = rolling_info.get("rolling_wape_mean")
-    folds = rolling_info.get("rolling_successful_folds") or 0
-    if folds >= 2 and rolling_mean is not None and np.isfinite(rolling_mean):
-        return (0, float(rolling_mean), float(holdout_wape))
-    if holdout_wape is not None and np.isfinite(holdout_wape):
-        return (1, float(holdout_wape), float(holdout_wape))
-    return (2, float("inf"), float("inf"))
+    folds = int(rolling_info.get("rolling_successful_folds") or 0)
+    if folds < 1:
+        return (1, 0, float("inf"), float("inf"))
+    fold_metric = (
+        float(rolling_mean)
+        if rolling_mean is not None and np.isfinite(float(rolling_mean))
+        else float("inf")
+    )
+    holdout = (
+        float(holdout_wape)
+        if holdout_wape is not None and np.isfinite(float(holdout_wape))
+        else float("inf")
+    )
+    return (0, -folds, fold_metric, holdout)
 
 
 def _summarize_family_failures(failure_log, account_code, model_name) -> str:
@@ -1693,14 +1748,28 @@ def _evaluate_candidate_grid(
                     progress_current=progress_current,
                     progress_total=progress_total,
                 )
-                if not fold_result.get("comparable"):
+                passing_folds = int(
+                    (fold_result.get("summary") or {}).get("rolling_successful_folds")
+                    or fold_result.get("successful_fold_count")
+                    or 0
+                )
+                if passing_folds < 1 or not fold_result.get("comparable"):
                     if failure_log is not None:
                         failure_log.append({
                             "account_code": account_code,
                             "model_family": model_name,
                             "configuration": dict(parameters),
                             "exception_type": "IncompleteFolds",
-                            "reason": fold_result.get("reason") or "Expanding-window folds were not all comparable.",
+                            "reason": (
+                                fold_result.get("reason")
+                                or "No expanding-window validation folds passed."
+                            ),
+                            "fold_failure_reasons": (
+                                (fold_result.get("summary") or {}).get("fold_failure_reasons")
+                                or fold_result.get("fold_failure_reasons")
+                                or []
+                            ),
+                            "rolling_successful_folds": passing_folds,
                         })
                     continue
                 metrics = dict(fold_result["aggregate_metrics"])
@@ -1716,6 +1785,7 @@ def _evaluate_candidate_grid(
                 rolling_info["baseline"] = fold_result.get("baseline")
                 rolling_info["bias_direction"] = fold_result.get("bias_direction")
                 rolling_info["mean_error"] = _to_float_or_none(fold_result.get("mean_error"))
+                rolling_info["rolling_successful_folds"] = passing_folds
                 succeeded += 1
                 score = _candidate_score(holdout_wape if holdout_wape is not None else float("inf"), rolling_info)
                 current = {
@@ -2320,12 +2390,25 @@ def evaluate_seven_models(
 
 def _primary_metric(row) -> tuple:
     rolling_mean = row.get("rolling_wape_mean")
-    folds = row.get("rolling_successful_folds") or 0
-    if row["status"] != "success" or row.get("wape") is None or not np.isfinite(row["wape"]):
-        return (9, float("inf"), float("inf"), float("inf"), row["model_name"])
-    if folds >= 2 and rolling_mean is not None and np.isfinite(rolling_mean):
-        return (0, float(rolling_mean), float(row["wape"]), float(row["rmse"]), row["model_name"])
-    return (1, float(row["wape"]), float(row["wape"]), float(row["rmse"]), row["model_name"])
+    folds = int(row.get("rolling_successful_folds") or 0)
+    if row["status"] != "success" or folds < 1:
+        return (9, 0, float("inf"), float("inf"), float("inf"), row["model_name"])
+    fold_metric = (
+        float(rolling_mean)
+        if rolling_mean is not None and np.isfinite(float(rolling_mean))
+        else float("inf")
+    )
+    holdout = (
+        float(row["wape"])
+        if row.get("wape") is not None and np.isfinite(float(row["wape"]))
+        else float("inf")
+    )
+    rmse = (
+        float(row["rmse"])
+        if row.get("rmse") is not None and np.isfinite(float(row["rmse"]))
+        else float("inf")
+    )
+    return (0, -folds, fold_metric, holdout, rmse, row["model_name"])
 
 
 def select_best_model(evaluation_results, seasonality_diagnostics=None, quiet: bool = False):
@@ -2351,8 +2434,9 @@ def select_best_model(evaluation_results, seasonality_diagnostics=None, quiet: b
     best_metric = _primary_metric(best)
     contenders = [
         row for row in ranked
-        if abs(_primary_metric(row)[1] - best_metric[1]) <= TIE_WAPE_POINTS
-        and _primary_metric(row)[0] == best_metric[0]
+        if _primary_metric(row)[0] == best_metric[0]
+        and _primary_metric(row)[1] == best_metric[1]
+        and abs(_primary_metric(row)[2] - best_metric[2]) <= TIE_WAPE_POINTS
     ]
     selection_notes = []
     if len(contenders) > 1:
@@ -2874,16 +2958,28 @@ def evaluate_selected_accounts(
                     "Metric_Wins": 0,
                     "Won_Metrics": "",
                     "holdout_forecast": forecast,
+                    "rolling_successful_folds": int(row.get("rolling_successful_folds") or 0),
+                    "rolling_failed_folds": int(row.get("rolling_failed_folds") or 0),
+                    "rolling_wape_mean": row.get("rolling_wape_mean"),
+                    "rolling_folds": row.get("rolling_folds") or [],
+                    "fold_failure_reasons": row.get("fold_failure_reasons") or [],
                     **extra,
                 })
             else:
+                fail_extra = {
+                    **extra,
+                    "rolling_successful_folds": int(row.get("rolling_successful_folds") or 0),
+                    "rolling_failed_folds": int(row.get("rolling_failed_folds") or 0),
+                    "rolling_folds": row.get("rolling_folds") or [],
+                    "fold_failure_reasons": row.get("fold_failure_reasons") or [],
+                }
                 evaluation_rows.append(
                     _failed_evaluation_row(
                         code,
                         algorithm,
                         row.get("error") or "Algorithm evaluation failed.",
                         row.get("parameters") or {},
-                        extra=extra,
+                        extra=fail_extra,
                     )
                 )
         for algorithm in requested:
@@ -2971,6 +3067,28 @@ def select_account_winners(evaluation_table: pd.DataFrame) -> pd.DataFrame:
                 "Error": error,
             })
             continue
+        successful["_fold_sort"] = _fold_count_series(successful)
+        successful = successful[successful["_fold_sort"] > 0].copy()
+        if successful.empty:
+            status = next(iter(explicit), STATUS_NO_VALID_WINNER)
+            if status == "FAILED" or not explicit:
+                status = STATUS_NO_VALID_WINNER
+            winners.append({
+                "Budget Code": str(code),
+                "Winning Algorithm": None,
+                "Metric Wins": 0,
+                "Won Metrics": "",
+                "MAE": np.nan,
+                "RMSE": np.nan,
+                "MAPE": np.nan,
+                "WAPE": np.nan,
+                "MASE": np.nan,
+                "R2": np.nan,
+                "Status": status,
+                "Error": "No candidate produced at least one passing validation fold.",
+                "rolling_successful_folds": 0,
+            })
+            continue
         successful["_wape_sort"] = successful["WAPE"].apply(
             lambda value: float(value) if value is not None and np.isfinite(float(value)) else np.inf
         )
@@ -2981,8 +3099,8 @@ def select_account_winners(evaluation_table: pd.DataFrame) -> pd.DataFrame:
             lambda value: float(value) if value is not None and np.isfinite(float(value)) else np.inf
         )
         successful = successful.sort_values(
-            ["Metric_Wins", "_wape_sort", "_mase_sort", "_rmse_sort", "Algorithm"],
-        ascending=[False, True, True, True, True],
+            ["_fold_sort", "Metric_Wins", "_wape_sort", "_mase_sort", "_rmse_sort", "Algorithm"],
+            ascending=[False, False, True, True, True, True],
             kind="mergesort",
         )
         best = successful.iloc[0]
@@ -3000,6 +3118,7 @@ def select_account_winners(evaluation_table: pd.DataFrame) -> pd.DataFrame:
             "Status": "SUCCESS",
             "Error": "",
             "Model specification": best.get("Model specification") or {},
+            "rolling_successful_folds": int(best.get("_fold_sort") or 0),
         })
     return pd.DataFrame(winners)
 

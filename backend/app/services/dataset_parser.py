@@ -30,8 +30,9 @@ from preprocessing import (  # noqa: E402
     KIND_NUMBER,
     assign_categories,
     category_order_from_headings,
+    category_order_from_markers,
     clean_account_code,
-    detect_category_headings_from_workbook,
+    detect_category_markers_from_workbook,
     is_excluded_actuals_column,
     label_key,
     normalize_label,
@@ -560,23 +561,30 @@ def parse_historical_dataset(
         lambda value: "" if _is_blank(value) else str(value).strip()
     )
     category_headings: list[dict] = []
+    self_category_accounts: list[dict] = []
     category_order: list[str] = []
     non_account_rows: set[int] = set()
     end_excel_row = int(header_row_idx) + 1 + len(working)
     if loaded["kind"] == "xlsx":
-        category_headings = detect_category_headings_from_workbook(
+        category_headings, self_category_accounts = detect_category_markers_from_workbook(
             path,
             sheet,
             header_row_idx,
             header_values=raw.iloc[header_row_idx].tolist(),
             end_excel_row=end_excel_row,
         )
-        category_order = category_order_from_headings(category_headings)
+        category_order = category_order_from_markers(category_headings, self_category_accounts)
+        self_category_by_excel_row = {
+            int(item["excel_row"]): str(item["name"])
+            for item in self_category_accounts
+            if str(item.get("name") or "").strip()
+        }
         assigned = assign_categories(
             working,
             code_col,
             name_col,
             category_heading_excel_rows=[int(item["excel_row"]) for item in category_headings],
+            self_category_by_excel_row=self_category_by_excel_row,
         )
         working = assigned
         working["category"] = working["category"].fillna("").astype(str).str.strip()
@@ -799,6 +807,14 @@ def parse_historical_dataset(
         "category_headings": [
             {"name": item.get("name"), "excel_row": item.get("excel_row")}
             for item in category_headings
+        ],
+        "self_category_accounts": [
+            {
+                "name": item.get("name"),
+                "excel_row": item.get("excel_row"),
+                "code": item.get("code"),
+            }
+            for item in self_category_accounts
         ],
         "category_order": category_order,
     }

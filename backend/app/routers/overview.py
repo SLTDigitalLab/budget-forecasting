@@ -448,6 +448,7 @@ def _load_workbook() -> dict:
         loaded["account_code_col"],
         loaded["account_name_col"],
         category_heading_excel_rows=loaded.get("category_heading_excel_rows"),
+        self_category_by_excel_row=loaded.get("self_category_by_excel_row"),
     )
     monthly_columns, month_dates = detect_monthly_columns(assigned.columns.tolist())
     _workbook = {
