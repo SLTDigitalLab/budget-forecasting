@@ -216,7 +216,15 @@ def derive_training_scope_from_snapshot(snapshot_path: str | Path) -> dict:
 
     loaded = _load_original_excel(str(path))
     collected = _collect_accounts(loaded)
-    loaded_codes = [str(code) for code in (collected.get("account_codes") or [])]
+    # _collect_accounts does not emit "account_codes"; IDs live on metadata / raw_matrix index.
+    loaded_codes: list[str] = []
+    metadata = collected.get("metadata")
+    if metadata is not None and getattr(metadata, "index", None) is not None:
+        loaded_codes = [str(code) for code in list(metadata.index)]
+    if not loaded_codes:
+        raw_matrix = collected.get("raw_matrix")
+        if raw_matrix is not None and getattr(raw_matrix, "index", None) is not None:
+            loaded_codes = [str(code) for code in list(raw_matrix.index)]
     if not loaded_codes:
         raise AssertionError("The training snapshot does not contain any Budget Codes.")
     training_scope = exclude_book_entry_codes(loaded_codes)
