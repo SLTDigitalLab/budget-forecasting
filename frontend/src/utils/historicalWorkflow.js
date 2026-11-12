@@ -23,7 +23,6 @@ export function reviewConfirmationState(preview, decisions = {}) {
     };
   }
   const missingDecisions = decisions.missingDecisions || preview.missing_decisions || [];
-  const metadataDecisions = decisions.metadataDecisions || preview.metadata_decisions || [];
   const removed = new Set(decisions.removed || preview.removed_stage_ids || []);
   const reasons = [];
   if (decisions.dirty) {
@@ -38,12 +37,6 @@ export function reviewConfirmationState(preview, decisions = {}) {
   );
   if (openMissing.length) {
     reasons.push("Choose keep, clear, declare missing, or remove for every blank that overlaps a stored value.");
-  }
-  const openMetadata = (preview.metadata_conflicts || []).filter(
-    (item) => !decisionCovers(metadataDecisions, item, ["budget_code"]),
-  );
-  if (openMetadata.length) {
-    reasons.push("Choose keep master or accept upload for every metadata conflict.");
   }
   const openDuplicates = (preview.duplicate_conflicts || []).filter((conflict) =>
     (conflict.records || []).some((record) => !removed.has(record.stage_id)),
@@ -61,7 +54,7 @@ export function reviewConfirmationState(preview, decisions = {}) {
   if ((preview.structural_errors?.length || preview.errors?.length) && reasons.length === 0) {
     reasons.push("Resolve the validation issues listed above.");
   }
-  const hasLocalResolution = missingDecisions.length > 0 || metadataDecisions.length > 0 || removed.size > 0;
+  const hasLocalResolution = missingDecisions.length > 0 || removed.size > 0;
   if (reasons.length === 0 && preview.can_confirm !== true && !hasLocalResolution) {
     reasons.push("This preview has no pending changes that can be saved.");
   }
