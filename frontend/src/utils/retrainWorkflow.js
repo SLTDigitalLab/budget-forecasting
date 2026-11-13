@@ -133,3 +133,69 @@ export function failedResponseError(status, payload) {
   error.code = payload?.code || (status === 423 ? "SYSTEM_LOCKED" : undefined);
   return error;
 }
+
+export const RETRAIN_MANAGE_KINDS = new Set(["save-models", "retry-save", "cancel-job", "retry-training"]);
+
+/**
+ * Decide how a retrain manage click should proceed.
+ * Save Models must request auth with kind "save-models" so the post-login resume
+ * can POST /save exactly once — never a no-op "renew-retrain" placeholder.
+ */
+export function planRetrainManageAction({
+  kind,
+  jobId,
+  flowToken = "",
+  returnedToken = "",
+  returnedExpiresAt = 0,
+  actionPending = false,
+  now = Date.now(),
+} = {}) {
+  const actionKind = String(kind || "").trim();
+  const id = String(jobId || "").trim();
+  if (!RETRAIN_MANAGE_KINDS.has(actionKind)) {
+    return {
+      type: "error",
+      message: "That retraining action is not recognized. Nothing was submitted.",
+    };
+  }
+  if (!id) {
+    return {
+      type: "error",
+      message: "This training job has no ID, so Save Models cannot run. Refresh the page or restart training. Nothing was submitted.",
+    };
+  }
+  const existing = String(flowToken || "").trim();
+  if (existing) {
+    return { type: "execute", token: existing, kind: actionKind, jobId: id };
+  }
+  const returned = String(returnedToken || "").trim();
+  if (returned) {
+    const expiresAt = Number(returnedExpiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+      return {
+        type: "error",
+        message: "Authentication expired. Sign in again before managing this job. Nothing was submitted.",
+      };
+    }
+    return {
+      type: "execute",
+      token: returned,
+      kind: actionKind,
+      jobId: id,
+      grant: { token: returned, expiresAt },
+    };
+  }
+  if (actionPending) {
+    return {
+      type: "error",
+      message: "Sign-in is already in progress. Finish or cancel authentication, then try Save Models again. Nothing was submitted.",
+    };
+  }
+  return {
+    type: "authenticate",
+    kind: actionKind,
+    jobId: id,
+    payload: { jobId: id },
+    destructive: true,
+  };
+}
