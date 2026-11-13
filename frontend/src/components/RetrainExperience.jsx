@@ -7,11 +7,13 @@ import { useForecast } from "../context/ForecastContext";
 import {
   LOCK_MESSAGE,
   READY_TEXT,
+  RETRAIN_MANAGE_KINDS,
   SAVED_TEXT,
   backdropDismisses,
   blocksNavigation,
   countdownSeconds,
   escapeDismisses,
+  planRetrainManageAction,
   progressText,
   restoreRetrainPresentation,
   shouldStickToBottom,
@@ -120,29 +122,28 @@ export default function RetrainExperience() {
     }
   }), []);
 
-  const RETRAIN_ACTION_KINDS = new Set(["save-models", "retry-save", "cancel-job", "retry-training", "renew-retrain"]);
-
   useEffect(() => {
-    const outcome = consumeSettingsActionResume(undefined, RETRAIN_ACTION_KINDS);
+    const outcome = consumeSettingsActionResume(undefined, RETRAIN_MANAGE_KINDS);
     if (!outcome || outcome.mode !== "run") {
       return;
     }
     const payload = outcome.resume.payload || {};
+    const kind = outcome.resume.kind;
     const runners = {
       "save-models": (token) => saveRetrain(payload.jobId, token),
       "retry-save": (token) => saveRetrain(payload.jobId, token),
       "cancel-job": (token) => cancelRetrain(payload.jobId, token),
       "retry-training": (token) => retryRetrain(payload.jobId, token),
     };
-    const action = runners[outcome.resume.kind];
-    if (action) {
-      runAction(outcome.resume.kind, payload.jobId, action);
-    } else {
-      runAction("renew-retrain", payload.jobId, () => Promise.resolve());
+    const action = runners[kind];
+    if (!action) {
+      setActionError("Authentication returned, but the retraining action could not be resumed. Nothing was submitted.");
+      return;
     }
+    runAction(kind, payload.jobId, action);
   }, []);
 
-  function performRetrainAction(token, action, jobId) {
+  function performRetrainAction(token, action, jobId, kind) {
     setWorking(true);
     setActionError("");
     Promise.resolve()
@@ -160,10 +161,14 @@ export default function RetrainExperience() {
         if (isEditorAuthorizationError(cause)) {
           clearFlowAuthorization(RETRAIN_FLOW);
           setActionError("Authentication was rejected. Sign in again before managing this job. Nothing was submitted.");
-          if (!actionGuard.current.pending) {
+          if (!actionGuard.current.pending && RETRAIN_MANAGE_KINDS.has(kind)) {
             actionGuard.current.pending = true;
             setWorking(true);
-            requestSettingsAction({ kind: "renew-retrain", payload: { jobId }, destructive: false });
+            requestSettingsAction({
+              kind,
+              payload: { jobId },
+              destructive: true,
+            });
           }
           return;
         }
@@ -180,29 +185,41 @@ export default function RetrainExperience() {
   }
 
   function runAction(kind, jobId, action) {
-    const existing = readFlowAuthorization(RETRAIN_FLOW, Date.now());
-    if (existing) {
-      performRetrainAction(existing, action, jobId);
+    const flowToken = readFlowAuthorization(RETRAIN_FLOW, Date.now());
+    const returnedToken = flowToken ? "" : claimReturnedActionToken();
+    const returnedExpiresAt = flowToken ? 0 : takeReturnedActionExpiry();
+    const plan = planRetrainManageAction({
+      kind,
+      jobId,
+      flowToken,
+      returnedToken,
+      returnedExpiresAt,
+      actionPending: actionGuard.current.pending,
+      now: Date.now(),
+    });
+    if (plan.type === "error") {
+      setActionError(plan.message);
       return;
     }
-    const returned = claimReturnedActionToken();
-    if (returned) {
-      const expiresAt = takeReturnedActionExpiry();
-      actionGuard.current.pending = false;
-      setWorking(false);
-      if (!grantFlowAuthorization(RETRAIN_FLOW, returned, expiresAt)) {
+    if (plan.type === "authenticate") {
+      actionGuard.current.pending = true;
+      setWorking(true);
+      setActionError("");
+      requestSettingsAction({
+        kind: plan.kind,
+        payload: plan.payload,
+        destructive: plan.destructive,
+      });
+      return;
+    }
+    if (plan.grant) {
+      if (!grantFlowAuthorization(RETRAIN_FLOW, plan.grant.token, plan.grant.expiresAt)) {
         setActionError("Authentication expired. Sign in again before managing this job. Nothing was submitted.");
         return;
       }
-      setActionError("Authentication renewed. Choose the action again. Nothing was submitted.");
-      return;
     }
-    if (actionGuard.current.pending) {
-      return;
-    }
-    actionGuard.current.pending = true;
-    setWorking(true);
-    requestSettingsAction({ kind: "renew-retrain", payload: { jobId }, destructive: false });
+    actionGuard.current.pending = false;
+    performRetrainAction(plan.token, action, plan.jobId, plan.kind);
   }
 
   if (presentation.mode === "hidden") {
@@ -259,14 +276,19 @@ export default function RetrainExperience() {
         </pre>
         <div className="retrain-actions">
           {showSaveModels(status?.state) ? (
-            <button type="button" className="generate-button" disabled={working} onClick={() => runAction("save-models", status.job_id, (token) => saveRetrain(status.job_id, token))}>
-              Save Models
+            <button
+              type="button"
+              className="generate-button"
+              disabled={working}
+              onClick={() => runAction("save-models", status.job_id, (token) => saveRetrain(status.job_id, token))}
+            >
+              {working ? "Saving…" : "Save Models"}
             </button>
           ) : null}
           {showSaveFailureActions(status?.state) ? (
             <>
               <button type="button" className="generate-button" disabled={working} onClick={() => runAction("retry-save", status.job_id, (token) => saveRetrain(status.job_id, token))}>
-                Retry Save
+                {working ? "Saving…" : "Retry Save"}
               </button>
               <button type="button" className="generate-button secondary" disabled={working} onClick={() => runAction("cancel-job", status.job_id, (token) => cancelRetrain(status.job_id, token))}>
                 Cancel
